@@ -1,0 +1,55 @@
+# Continuous Integration Workflow / 持续集成构建与测试工作流
+# Verifies Frontend SPA build (embedded by embed.go) and Go binaries + unit tests on every push and PR.
+# 在每次 Push 与 Pull Request 时自动校验前端 SPA 构建（供 embed.go 内嵌）以及 Go 编译与单元测试。
+
+name: CI / 持续集成
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build Web & Test Go Gateway / 前后端编译与测试
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository / 检出代码
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js / 配置 Node.js 环境
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: "web/package-lock.json"
+
+      - name: Setup Go / 配置 Go 环境
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.x"
+          cache: true
+
+      - name: Install & Build Web Console / 安装依赖并构建前端控制台 (web/dist)
+        working-directory: ./web
+        run: |
+          npm ci
+          npm run build
+
+      - name: Verify Go Vet & Unit Tests / 运行 Go 静态检查与单元测试
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          go vet ./...
+          go test -v -race=false ./...
+
+      - name: Cross-Compile Gateway & Probe Binaries / 编译网关主程序与探测工具
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          go build -trimpath -ldflags="-s -w" -o ./antigravity-gateway ./cmd/gateway
+          go build -trimpath -ldflags="-s -w" -o ./antigravity-probe ./cmd/probe

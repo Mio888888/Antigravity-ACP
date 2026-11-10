@@ -1,0 +1,85 @@
+name: "Bug Report / 缺陷反馈"
+description: "Report a reproducible bug or protocol issue / 报告可复现的程序错误、协议转换异常或部署问题"
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting an issue! Please fill out the sections below in **English or Simplified Chinese**.
+        感谢反馈问题！您可以使用 **简体中文或英文** 填写以下信息。切勿粘贴真实的管理员密码、OAuth 凭据或 `sk-ag-*` 密钥。
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: "Affected Component / 受影响模块"
+      description: "Which part of the gateway is affected? / 问题出现在哪个模块？"
+      options:
+        - "Northbound API: OpenAI Responses (POST /v1/responses)"
+        - "Northbound API: OpenAI Chat Completions (POST /v1/chat/completions)"
+        - "Northbound API: Claude Messages (POST /v1/messages)"
+        - "ACP Worker Pool / Sticky Session / Tool Continuation (进程池与粘性会话)"
+        - "Multi-Account Pool / Headless OAuth / Quota Probe (多账户池与 OAuth 授权)"
+        - "Web Admin Console UI (ReUI 双语管理控制台)"
+        - "Deployment / Docker / Auto-Download ACP Backend (一键部署与容器)"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: backend_type
+    attributes:
+      label: "ACP Backend Engine / ACP 后端引擎类型"
+      description: "Configured `acp_pool.backend_type` / 当前使用的 ACP 后端模式"
+      options:
+        - "cli (Default: official Antigravity CLI `agy acp`)"
+        - "zed / zen (Standalone `agy_acp_server.par`)"
+        - "auto (Auto-discovery)"
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: "OS, Architecture & Deployment Mode / 系统架构与部署方式"
+      description: "e.g., Ubuntu 24.04 ARM64 (systemd), macOS 15 arm64 (local), Docker linux/amd64 / 例如：Ubuntu 24.04 ARM64、macOS arm64、Docker 等"
+      placeholder: "Linux aarch64 / Docker Compose / v1.6.0"
+    validations:
+      required: true
+
+  - type: input
+    id: client
+    attributes:
+      label: "Client Application / 接入客户端"
+      description: "Which client triggered the issue? / 使用哪个客户端触发了该问题？"
+      placeholder: "e.g., Codex CLI / Claude Code CLI / Cursor / Roo Code / curl"
+    validations:
+      required: false
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: "Steps to Reproduce / 复现步骤"
+      description: "Clear steps to reproduce the behavior / 请提供清晰的复现步骤"
+      placeholder: |
+        1. Start gateway with `...`
+        2. Send request via `...`
+        3. Observe error `...`
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: "Expected vs. Actual Behavior / 期望行为与实际结果"
+      description: "What should happen vs. what actually happened? / 期望的正常表现是什么？实际发生了什么？"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: "Sanitized Logs or Screenshots / 脱敏日志或截图"
+      description: "Paste relevant gateway logs or HTTP response payloads (redact all tokens/keys) / 请粘贴相关的网关日志或报错输出（注意脱敏）"
+      render: shell
+    validations:
+      required: false

@@ -1,0 +1,27 @@
+services:
+  antigravity-gateway:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        AG_ACP_BACKEND: ${AG_ACP_BACKEND:-cli}
+    container_name: antigravity-gateway
+    restart: unless-stopped
+    ports:
+      - "${AG_PORT:-8080}:8080"
+    environment:
+      - AGY_ACP_FORCE_FILE_STORAGE=1
+      - AG_ACP_BACKEND=${AG_ACP_BACKEND:-cli}
+      - AG_ACP_BINARY_PATH=${AG_ACP_BINARY_PATH:-}
+      - AG_ADMIN_PASSWORD=${AG_ADMIN_PASSWORD:-}
+      - AG_DATA_DIR=/var/lib/antigravity-gateway
+      - AG_WORKSPACE_DIR=/tmp/antigravity-gateway-workspace
+    volumes:
+      - ../config/config.yaml:/etc/antigravity-gateway/config.yaml:ro
+      - ../bin:/opt/antigravity-acp:ro
+      - gateway-data:/var/lib/antigravity-gateway
+      - gemini-home:/root/.gemini
+
+volumes:
+  gateway-data:
+  gemini-home:

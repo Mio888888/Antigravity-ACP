@@ -1,0 +1,49 @@
+name: "Feature Request / 功能建议"
+description: "Propose a new feature, protocol capability, or UI enhancement / 提议新功能、协议适配能力或控制台交互改进"
+title: "[Feat]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        We welcome feature proposals! Feel free to write in **English or Simplified Chinese**.
+        欢迎提出功能建议！您可以使用 **简体中文或英文** 填写以下表单。
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: "Target Area / 涉及领域"
+      options:
+        - "Northbound Protocol Compatibility (OpenAI / Claude / WebSocket 北向协议)"
+        - "ACP Worker Pool & Sticky Session Routing (ACP 进程池与粘性会话)"
+        - "Multi-Account Isolation, Egress & Quota Monitoring (多账户隔离、出口路由与额度监控)"
+        - "Web Admin Console & Context Observability (ReUI 控制台与上下文可观测性)"
+        - "Deployment, Cross-Platform & Docker (跨平台部署与容器化)"
+        - "Other / 其他"
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: "Problem or Use Case / 问题背景与使用场景"
+      description: "What real-world problem or workflow limitation does this solve? / 该需求旨在解决什么实际场景下的痛点？"
+      placeholder: "When using [Client] with Antigravity ACP Gateway, I need..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: "Proposed Solution / 期望的实现方案"
+      description: "Describe how you envision this feature working (API, config, or UI behavior) / 请描述您期望的接口形态、配置项或界面交互"
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: "Additional Context / 补充信息或参考资料"
+      description: "Links to official protocol specs, client docs, or screenshots / 相关的官方协议文档链接、客户端说明或示意图"
+    validations:
+      required: false

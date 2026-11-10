@@ -1,0 +1,17 @@
+[Unit]
+Description=Antigravity ACP Protocol Gateway & Multi-Account Isolation Platform
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/var/lib/antigravity-gateway
+Environment="AGY_ACP_FORCE_FILE_STORAGE=1"
+ExecStart=/usr/local/bin/antigravity-gateway -config /etc/antigravity-gateway/config.yaml
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

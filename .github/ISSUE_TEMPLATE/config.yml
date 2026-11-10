@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: "Security Vulnerability Report / 私密报告安全漏洞 (SECURITY.md)"
+    url: "../../security/advisories/new"
+    about: "Please do NOT report security vulnerabilities in public issues. Use private reporting instead. / 请勿公开提交安全漏洞，请在此私密报告。"
+  - name: "Documentation & Troubleshooting (English / 简体中文)"
+    url: "../../blob/main/SUPPORT.md"
+    about: "Check SUPPORT.md, README.md, and README_EN.md for deployment and troubleshooting guides. / 查阅部署教程与常见问题排障指南。"

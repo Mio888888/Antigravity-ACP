@@ -1,0 +1,43 @@
+# Build & Runtime Artifacts
+bin/
+data/
+web/node_modules/
+web/dist/
+web/*.tsbuildinfo
+*.db
+*.db-shm
+*.db-wal
+.DS_Store
+
+# AI Directories & Tooling Configs
+.agents/
+.claude/
+.cursor/
+.gemini/
+.opencode/
+.sailry/
+.superpowers/
+.codex/
+.windsurf/
+.aider*
+.mcp.json
+opencode.json
+skills/
+
+# AI Created Documents & Instructions
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+SKILL.md
+antigravity_acp.md
+docs/
+*.md
+!README.md
+!README_EN.md
+!CONTRIBUTING.md
+!CODE_OF_CONDUCT.md
+!SECURITY.md
+!SUPPORT.md
+!CHANGELOG.md
+!.github/
+!.github/**/*.md

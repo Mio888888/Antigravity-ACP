@@ -1,0 +1,45 @@
+server:
+  host: "0.0.0.0"
+  port: 8080
+  public_base_url: "http://localhost:8080"
+  data_dir: "./data"
+  admin_token: "auto"
+  admin_password: "auto"
+  cors_allowed_origins: ["*"]
+  sse_keepalive_sec: 15
+  read_timeout_sec: 600
+  write_timeout_sec: 600
+
+acp_pool:
+  # backend_type: "cli" (default) | "zed" (or "zen") | "auto"
+  # - "cli": uses Antigravity CLI (agy acp / antigravity acp)
+  # - "zed" / "zen": uses standalone Zed/Zen ACP backend package (agy_acp_server.par / agy_acp_server)
+  # - "auto": uses binary_path if present, otherwise auto-discovers Antigravity CLI (agy) or Zed/Zen ACP package
+  backend_type: "cli"
+  binary_path: "auto"
+  workspace_dir: "/tmp/antigravity-gateway-workspace"
+  additional_dirs: []
+  agent_name: ""
+  client_name: "zed"
+  client_version: "0.175.0"
+  process_per_session: true
+  disable_telemetry: true
+  log_file: ""
+  ide_mcp_port: 0
+  min_idle_workers: 1
+  max_workers: 5
+  max_idle_time_sec: 600
+  tool_park_timeout_sec: 180
+  extra_args: []
+  env: {}
+
+prompt_policy:
+  mode: "pure_passthrough"
+  disable_builtin_tools: true
+  global_prepend_prompt: ""
+
+sandbox_policy:
+  session_mode: "yolo"
+  enable_sandbox: false
+  skip_permissions_flag: false
+  internal_approval: "auto_approve"
