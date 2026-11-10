@@ -647,17 +647,27 @@ for line in sys.stdin:
 		t.Fatalf("Sailry Step 1 POST /v1/responses failed: status=%v, err=%v", respS1, err)
 	}
 	var s1JSON struct {
-		ReasoningText string `json:"reasoning_text"`
-		Output        []struct {
-			Type   string `json:"type"`
-			CallID string `json:"call_id"`
-			Name   string `json:"name"`
+		Output []struct {
+			Type    string `json:"type"`
+			CallID  string `json:"call_id"`
+			Name    string `json:"name"`
+			Summary []struct {
+				Text string `json:"text"`
+			} `json:"summary"`
 		} `json:"output"`
 	}
 	_ = json.NewDecoder(respS1.Body).Decode(&s1JSON)
 	_ = respS1.Body.Close()
-	if !strings.Contains(s1JSON.ReasoningText, "先搜索桌面控制工具") {
-		t.Fatalf("expected reasoning_text from ⟦REASONING⟧ on Sailry Step 1, got %q", s1JSON.ReasoningText)
+	var s1Reasoning string
+	for _, out := range s1JSON.Output {
+		if out.Type == "reasoning" {
+			for _, sPart := range out.Summary {
+				s1Reasoning += sPart.Text
+			}
+		}
+	}
+	if !strings.Contains(s1Reasoning, "先搜索桌面控制工具") {
+		t.Fatalf("expected reasoning output item from ⟦REASONING⟧ on Sailry Step 1, got %q", s1Reasoning)
 	}
 	var searchCallID string
 	for _, out := range s1JSON.Output {
@@ -691,16 +701,29 @@ for line in sys.stdin:
 		t.Fatalf("Sailry Step 2 POST /v1/responses failed: status=%v, err=%v", respS2, err)
 	}
 	var s2JSON struct {
-		ReasoningText string `json:"reasoning_text"`
-		OutputText    string `json:"output_text"`
+		OutputText string `json:"output_text"`
+		Output     []struct {
+			Type    string `json:"type"`
+			Summary []struct {
+				Text string `json:"text"`
+			} `json:"summary"`
+		} `json:"output"`
 	}
 	_ = json.NewDecoder(respS2.Body).Decode(&s2JSON)
 	_ = respS2.Body.Close()
 	if !strings.Contains(s2JSON.OutputText, "mcp__desktop__click") {
 		t.Fatalf("expected dynamically added mcp__desktop__click to be registered via tools/list in ACP worker, got %q", s2JSON.OutputText)
 	}
-	if !strings.Contains(s2JSON.ReasoningText, "已获取桌面工具") {
-		t.Fatalf("expected reasoning_text on Sailry Step 2, got %q", s2JSON.ReasoningText)
+	var s2Reasoning string
+	for _, out := range s2JSON.Output {
+		if out.Type == "reasoning" {
+			for _, sPart := range out.Summary {
+				s2Reasoning += sPart.Text
+			}
+		}
+	}
+	if !strings.Contains(s2Reasoning, "已获取桌面工具") {
+		t.Fatalf("expected reasoning output item on Sailry Step 2, got %q", s2Reasoning)
 	}
 
 	// 4b-stream. Test Streaming /v1/responses suppresses intermediate reasoning items on tool-continuation turns

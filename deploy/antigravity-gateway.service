@@ -5,13 +5,51 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=root
+# Dedicated unprivileged user, created by `deploy.sh --mode service`:
+#   useradd --system --user-group --home-dir /var/lib/antigravity-gateway --shell /usr/sbin/nologin antigravity
+# Note: account network_mode "netns" needs CAP_SYS_ADMIN (`ip netns exec`) and is not available
+# under this unit; use "proxy" or "bind_ip" instead.
+User=antigravity
+Group=antigravity
 WorkingDirectory=/var/lib/antigravity-gateway
-Environment="AGY_ACP_FORCE_FILE_STORAGE=1"
+StateDirectory=antigravity-gateway
+StateDirectoryMode=0700
+UMask=0077
+
+Environment=HOME=/var/lib/antigravity-gateway
+Environment=AGY_ACP_FORCE_FILE_STORAGE=1
+Environment=AG_DATA_DIR=/var/lib/antigravity-gateway/data
+# The agent CLI writes its session workspace here; it must stay inside ReadWritePaths.
+Environment=AG_WORKSPACE_DIR=/var/lib/antigravity-gateway/workspace
+# Optional AG_ADMIN_PASSWORD (root:root 0600), written by `deploy.sh --admin-password-stdin`.
+EnvironmentFile=-/etc/antigravity-gateway/env
+
 ExecStart=/usr/local/bin/antigravity-gateway -config /etc/antigravity-gateway/config.yaml
 Restart=on-failure
 RestartSec=3
+TimeoutStopSec=20
 LimitNOFILE=65536
+
+# Hardening
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ReadWritePaths=/var/lib/antigravity-gateway
+ProtectHome=tmpfs
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 
 [Install]
 WantedBy=multi-user.target

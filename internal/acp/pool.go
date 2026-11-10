@@ -70,6 +70,50 @@ type accountSubPool struct {
 	loginStdin       io.WriteCloser
 	loginDoneCh      chan struct{}
 	loginStatus      TerminalLoginStatus
+	// pending counts workers being spawned so max_workers holds across the unlocked spawn.
+	pending int
+	// gen increments on every account config change; workers from older generations
+	// are retired when released.
+	gen uint64
+	// retiredRelays are replaced relays still used by in-flight workers.
+	retiredRelays []*EgressRelay
+}
+
+// accountNetNS returns the network namespace a subprocess for acc must run in.
+func accountNetNS(acc storage.Account) string {
+	if acc.NetworkMode != "netns" {
+		return ""
+	}
+	return strings.TrimSpace(acc.NetNSName)
+}
+
+func sameEgressConfig(a, b storage.Account) bool {
+	return a.NetworkMode == b.NetworkMode &&
+		strings.TrimSpace(a.ProxyURL) == strings.TrimSpace(b.ProxyURL) &&
+		strings.TrimSpace(a.BindIP) == strings.TrimSpace(b.BindIP)
+}
+
+// sweepRetiredRelaysLocked closes replaced relays no live worker still uses.
+func (sp *accountSubPool) sweepRetiredRelaysLocked() {
+	if len(sp.retiredRelays) == 0 {
+		return
+	}
+	kept := sp.retiredRelays[:0]
+	for _, r := range sp.retiredRelays {
+		inUse := false
+		for _, w := range sp.workers {
+			if w.egressRelay == r && w.GetState() != StateDead {
+				inUse = true
+				break
+			}
+		}
+		if inUse {
+			kept = append(kept, r)
+		} else {
+			_ = r.Close()
+		}
+	}
+	sp.retiredRelays = kept
 }
 
 type MultiAccountPool struct {
@@ -168,7 +212,7 @@ func (mp *MultiAccountPool) reapIdleWorkers() {
 		idleCount := 0
 		for id, w := range sp.workers {
 			st := w.GetState()
-			if st == StateDead {
+			if st == StateDead || (st == StateIdle && w.poolGen != sp.gen && w.TryMarkBusy()) {
 				delete(sp.workers, id)
 				toClose = append(toClose, w)
 				continue
@@ -177,6 +221,7 @@ func (mp *MultiAccountPool) reapIdleWorkers() {
 				idleCount++
 			}
 		}
+		sp.sweepRetiredRelaysLocked()
 		if maxIdleSec <= 0 {
 			continue
 		}
@@ -185,7 +230,7 @@ func (mp *MultiAccountPool) reapIdleWorkers() {
 			if idleCount <= minIdle {
 				break
 			}
-			if w.GetState() == StateIdle && w.BoundSessionCount() == 0 && now.Sub(w.LastActiveAt()) > maxIdleDur {
+			if w.GetState() == StateIdle && w.BoundSessionCount() == 0 && now.Sub(w.LastActiveAt()) > maxIdleDur && w.TryMarkBusy() {
 				delete(sp.workers, id)
 				toClose = append(toClose, w)
 				idleCount--
@@ -200,7 +245,7 @@ func (mp *MultiAccountPool) reapIdleWorkers() {
 			if idleCount <= minIdle {
 				break
 			}
-			if w.GetState() == StateIdle && w.BoundSessionCount() > 0 && now.Sub(w.LastActiveAt()) > boundIdleDur {
+			if w.GetState() == StateIdle && w.BoundSessionCount() > 0 && now.Sub(w.LastActiveAt()) > boundIdleDur && w.TryMarkBusy() {
 				delete(sp.workers, id)
 				toClose = append(toClose, w)
 				idleCount--
@@ -218,14 +263,31 @@ func (mp *MultiAccountPool) UpsertAccountPool(acc storage.Account) error {
 	mp.mu.Lock()
 	defer mp.mu.Unlock()
 
-	if existing, ok := mp.subPools[acc.ID]; ok {
-		if existing.relay != nil {
-			_ = existing.relay.Close()
+	existing, hadExisting := mp.subPools[acc.ID]
+
+	// Build the new relay before touching the live one so a bad proxy config leaves
+	// the account running on its previous settings. Proxy/bind_ip egress applies
+	// whether or not credential isolation is enabled.
+	var relay *EgressRelay
+	reuseRelay := hadExisting && existing.relay != nil && sameEgressConfig(existing.account, acc)
+	if reuseRelay {
+		relay = existing.relay
+	} else if acc.NetworkMode == "proxy" || acc.NetworkMode == "bind_ip" {
+		r, err := NewEgressRelay(acc.ID, acc.NetworkMode, acc.ProxyURL, acc.BindIP)
+		if err != nil {
+			return fmt.Errorf("init egress relay for account %s: %w", acc.ID, err)
 		}
-		for _, w := range existing.workers {
-			if w.GetState() == StateIdle {
-				_ = w.Close()
-				delete(existing.workers, w.ID)
+		relay = r
+	}
+
+	if hadExisting {
+		if existing.relay != nil && !reuseRelay {
+			existing.retiredRelays = append(existing.retiredRelays, existing.relay)
+		}
+		for id, w := range existing.workers {
+			if w.TryMarkBusy() {
+				delete(existing.workers, id)
+				go func(w *WorkerClient) { _ = w.Close() }(w)
 			}
 		}
 	}
@@ -267,15 +329,6 @@ func (mp *MultiAccountPool) UpsertAccountPool(acc storage.Account) error {
 		}
 	}
 
-	var relay *EgressRelay
-	if acc.IsolationEnabled && (acc.NetworkMode == "proxy" || acc.NetworkMode == "bind_ip") {
-		r, err := NewEgressRelay(acc.ID, acc.NetworkMode, acc.ProxyURL, acc.BindIP)
-		if err != nil {
-			return fmt.Errorf("init egress relay for account %s: %w", acc.ID, err)
-		}
-		relay = r
-	}
-
 	sp, exists := mp.subPools[acc.ID]
 	if !exists {
 		sp = &accountSubPool{
@@ -287,6 +340,8 @@ func (mp *MultiAccountPool) UpsertAccountPool(acc storage.Account) error {
 	sp.account = acc
 	sp.geminiHome = geminiHome
 	sp.relay = relay
+	sp.gen++
+	sp.sweepRetiredRelaysLocked()
 	return nil
 }
 
@@ -297,14 +352,17 @@ func (mp *MultiAccountPool) RemoveAccountPool(accountID string) error {
 	if !ok {
 		return nil
 	}
-	if sp.relay != nil {
-		_ = sp.relay.Close()
-	}
 	if sp.loginCmd != nil && sp.loginCmd.Process != nil {
 		_ = sp.loginCmd.Process.Kill()
 	}
 	for _, w := range sp.workers {
 		_ = w.Close()
+	}
+	if sp.relay != nil {
+		_ = sp.relay.Close()
+	}
+	for _, r := range sp.retiredRelays {
+		_ = r.Close()
 	}
 	delete(mp.subPools, accountID)
 	return nil
@@ -462,51 +520,66 @@ func (mp *MultiAccountPool) acquireFromSpecificAccount(ctx context.Context, acco
 
 	// Clean dead workers and prefer an unbound idle worker so new requests do not steal
 	// a worker process that already holds a sticky session in memory.
-	var bestIdle *WorkerClient
+	var idle []*WorkerClient
 	for id, w := range sp.workers {
 		st := w.GetState()
 		if st == StateDead {
 			delete(sp.workers, id)
+			go func(w *WorkerClient) { _ = w.Close() }(w)
 			continue
 		}
-		if st == StateIdle {
-			if bestIdle == nil {
-				bestIdle = w
-			} else {
-				wBound := w.BoundSessionCount()
-				bestBound := bestIdle.BoundSessionCount()
-				if wBound < bestBound || (wBound == bestBound && w.LastActiveAt().Before(bestIdle.LastActiveAt())) {
-					bestIdle = w
-				}
-			}
+		if st == StateIdle && w.poolGen == sp.gen {
+			idle = append(idle, w)
 		}
 	}
-	if bestIdle != nil {
-		bestIdle.SetState(StateGenerating)
+	sort.Slice(idle, func(i, j int) bool {
+		bi, bj := idle[i].BoundSessionCount(), idle[j].BoundSessionCount()
+		if bi != bj {
+			return bi < bj
+		}
+		return idle[i].LastActiveAt().Before(idle[j].LastActiveAt())
+	})
+	for _, cand := range idle {
+		// Session-affinity reuse in the handler claims workers without holding mp.mu,
+		// so the Idle->Generating transition must be atomic.
+		if !cand.TryMarkBusy() {
+			continue
+		}
 		acc := sp.account
 		wt := mp.wiretap
 		mp.mu.Unlock()
 		if wt != nil {
-			wt(bestIdle.ID, "STATE", string(StateGenerating))
+			wt(cand.ID, "STATE", string(StateGenerating))
 		}
-		return bestIdle, acc, nil
+		return cand, acc, nil
 	}
 
 	maxW := sp.account.MaxWorkers
 	if maxW <= 0 {
 		maxW = mp.poolCfg.MaxWorkers
 	}
-	if maxW > 0 && len(sp.workers) >= maxW {
+	if maxW > 0 && len(sp.workers)+sp.pending >= maxW {
 		acc := sp.account
 		mp.mu.Unlock()
 		return nil, acc, fmt.Errorf("account %q reached max_workers limit (%d)", accountID, maxW)
 	}
+	sp.pending++
+	reserved := true
+	defer func() {
+		if reserved {
+			mp.mu.Lock()
+			sp.pending--
+			mp.mu.Unlock()
+		}
+	}()
 
 	acc := sp.account
 	geminiHome := sp.geminiHome
+	relay := sp.relay
+	gen := sp.gen
 	var relayURL string
-	if sp.relay != nil {
-		relayURL = sp.relay.ListenURL()
+	if relay != nil {
+		relayURL = relay.ListenURL()
 	}
 	workerID := fmt.Sprintf("w_%s_%d", acc.ID, mp.workerSeq.Add(1))
 	poolCfg := mp.poolCfg
@@ -515,10 +588,7 @@ func (mp *MultiAccountPool) acquireFromSpecificAccount(ctx context.Context, acco
 	mp.mu.Unlock()
 
 	env := BuildIsolatedEnv(poolCfg.Env, acc, geminiHome, relayURL)
-	var netns string
-	if acc.IsolationEnabled && acc.NetworkMode == "netns" {
-		netns = acc.NetNSName
-	}
+	netns := accountNetNS(acc)
 
 	accountWorkDir := EnsureAccountWorkspace(poolCfg.WorkspaceDir, acc.ID)
 
@@ -550,8 +620,12 @@ func (mp *MultiAccountPool) acquireFromSpecificAccount(ctx context.Context, acco
 	}
 
 	w.SetState(StateGenerating)
+	w.poolGen = gen
+	w.egressRelay = relay
 	mp.mu.Lock()
-	if spNow, exists := mp.subPools[accountID]; exists {
+	sp.pending--
+	reserved = false
+	if spNow, exists := mp.subPools[accountID]; exists && spNow == sp {
 		spNow.workers[w.ID] = w
 	}
 	mp.mu.Unlock()
@@ -566,14 +640,26 @@ func (mp *MultiAccountPool) Release(w *WorkerClient) {
 	if w == nil {
 		return
 	}
-	if w.GetState() == StateDead {
-		mp.mu.Lock()
-		if sp, exists := mp.subPools[w.AccountID]; exists {
+	mp.mu.Lock()
+	sp, exists := mp.subPools[w.AccountID]
+	tracked := exists && sp.workers[w.ID] == w
+	// Workers started under an older account config (egress, credentials) are retired.
+	retire := w.GetState() == StateDead || !tracked || w.poolGen != sp.gen
+	if retire {
+		if tracked {
 			delete(sp.workers, w.ID)
 		}
-		wt := mp.wiretap
-		mp.mu.Unlock()
+		w.SetState(StateDead)
+	}
+	wt := mp.wiretap
+	mp.mu.Unlock()
+	if retire {
 		_ = w.Close()
+		if exists {
+			mp.mu.Lock()
+			sp.sweepRetiredRelaysLocked()
+			mp.mu.Unlock()
+		}
 		if wt != nil {
 			wt(w.ID, "STATE", string(StateDead))
 		}
@@ -581,9 +667,6 @@ func (mp *MultiAccountPool) Release(w *WorkerClient) {
 	}
 	w.DrainEvents()
 	w.SetState(StateIdle)
-	mp.mu.Lock()
-	wt := mp.wiretap
-	mp.mu.Unlock()
 	if wt != nil {
 		wt(w.ID, "STATE", string(StateIdle))
 	}
@@ -608,9 +691,9 @@ func (mp *MultiAccountPool) RestartIdleWorkers() int {
 	killed := 0
 	for _, sp := range mp.subPools {
 		for id, w := range sp.workers {
-			if w.GetState() == StateIdle {
-				_ = w.Close()
+			if w.TryMarkBusy() {
 				delete(sp.workers, id)
+				go func(w *WorkerClient) { _ = w.Close() }(w)
 				killed++
 			}
 		}
@@ -886,9 +969,16 @@ func (mp *MultiAccountPool) ProbeAccountNetwork(ctx context.Context, accountID s
 		return "", fmt.Errorf("account %q not found", accountID)
 	}
 	relay := sp.relay
+	netns := accountNetNS(sp.account)
 	mp.mu.Unlock()
 
-	ip, err := relay.ProbeTargetURL(ctx, probeURL)
+	var ip string
+	var err error
+	if netns != "" {
+		ip, err = probeInNetNS(ctx, netns, probeURL)
+	} else {
+		ip, err = relay.ProbeTargetURL(ctx, probeURL)
+	}
 	if err != nil {
 		return "", err
 	}
@@ -897,6 +987,28 @@ func (mp *MultiAccountPool) ProbeAccountNetwork(ctx context.Context, accountID s
 		spNow.account.LastEgressIP = ip
 	}
 	mp.mu.Unlock()
+	return ip, nil
+}
+
+// probeInNetNS measures egress from inside a network namespace, where the
+// gateway's own sockets would not reflect the account's route.
+func probeInNetNS(ctx context.Context, netns, targetURL string) (string, error) {
+	if strings.TrimSpace(targetURL) == "" {
+		targetURL = "https://api.ipify.org"
+	}
+	if err := ValidateProbeURL(targetURL); err != nil {
+		return "", err
+	}
+	cmd := exec.CommandContext(ctx, "ip", "netns", "exec", netns, "curl", "-fsS", "--max-time", "10", "--max-redirs", "0", "--", targetURL)
+	cmd.Env = SanitizedParentEnv()
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("egress probe in netns %q failed: %w", netns, err)
+	}
+	ip := strings.TrimSpace(string(out))
+	if len(ip) > 256 {
+		ip = ip[:256]
+	}
 	return ip, nil
 }
 
@@ -926,9 +1038,10 @@ func (mp *MultiAccountPool) StartTerminalLogin(accountID string) (TerminalLoginS
 		BackendType: mp.poolCfg.BackendType,
 		BinaryPath:  mp.poolCfg.BinaryPath,
 		ExtraArgs:   []string{"--login"},
+		NetNSName:   accountNetNS(sp.account),
 	})
 	cmd := exec.Command(bin, args...)
-	envList := os.Environ()
+	envList := SanitizedParentEnv()
 	for k, v := range env {
 		envList = append(envList, k+"="+v)
 	}
@@ -966,18 +1079,22 @@ func (mp *MultiAccountPool) StartTerminalLogin(accountID string) (TerminalLoginS
 	go func() {
 		defer close(loginDoneCh)
 		scanner := bufio.NewScanner(stdout)
+		// A newer login attempt replaces sp.loginCmd; this goroutine must then stop
+		// writing into the shared status.
 		for scanner.Scan() {
 			line := scanner.Text()
 			mp.mu.Lock()
-			if len(sp.loginStatus.Output) < 32*1024 {
-				sp.loginStatus.Output += line + "\n"
-			}
-			if sp.loginStatus.AuthURL == "" {
-				if match := urlRegex.FindString(line); match != "" {
-					sp.loginStatus.AuthURL = match
-					select {
-					case urlReadyCh <- struct{}{}:
-					default:
+			if sp.loginCmd == cmd {
+				if len(sp.loginStatus.Output) < 32*1024 {
+					sp.loginStatus.Output += line + "\n"
+				}
+				if sp.loginStatus.AuthURL == "" {
+					if match := urlRegex.FindString(line); match != "" {
+						sp.loginStatus.AuthURL = match
+						select {
+						case urlReadyCh <- struct{}{}:
+						default:
+						}
 					}
 				}
 			}
@@ -985,11 +1102,14 @@ func (mp *MultiAccountPool) StartTerminalLogin(accountID string) (TerminalLoginS
 		}
 		err := cmd.Wait()
 		mp.mu.Lock()
-		if err == nil {
-			sp.loginStatus.State = "success"
-			sp.account.Status = "ready"
-		} else if sp.loginStatus.State != "success" {
-			sp.loginStatus.State = "error"
+		if sp.loginCmd == cmd {
+			if err == nil {
+				sp.loginStatus.State = "success"
+				sp.account.Status = "ready"
+			} else if sp.loginStatus.State != "success" {
+				sp.loginStatus.State = "error"
+			}
+			sp.loginStdin = nil
 		}
 		mp.mu.Unlock()
 	}()
@@ -1051,6 +1171,7 @@ func (mp *MultiAccountPool) Snapshot() []WorkerSnapshot {
 			st := w.GetState()
 			if st == StateDead {
 				delete(sp.workers, id)
+				go func(w *WorkerClient) { _ = w.Close() }(w)
 				continue
 			}
 			list = append(list, WorkerSnapshot{
@@ -1074,6 +1195,7 @@ func (mp *MultiAccountPool) buildAccountSnapshotLocked(sp *accountSubPool) Accou
 		st := w.GetState()
 		if st == StateDead {
 			delete(sp.workers, id)
+			go func(w *WorkerClient) { _ = w.Close() }(w)
 			continue
 		}
 		if st == StateGenerating || st == StateParked {
@@ -1145,14 +1267,17 @@ func (mp *MultiAccountPool) Close() error {
 	mp.mu.Lock()
 	defer mp.mu.Unlock()
 	for _, sp := range mp.subPools {
-		if sp.relay != nil {
-			_ = sp.relay.Close()
-		}
 		if sp.loginCmd != nil && sp.loginCmd.Process != nil {
 			_ = sp.loginCmd.Process.Kill()
 		}
 		for _, w := range sp.workers {
 			_ = w.Close()
+		}
+		if sp.relay != nil {
+			_ = sp.relay.Close()
+		}
+		for _, r := range sp.retiredRelays {
+			_ = r.Close()
 		}
 	}
 	return nil
@@ -1375,7 +1500,7 @@ func (mp *MultiAccountPool) tryFetchQuotaViaCLIPrint(ctx context.Context, accoun
 		relayURL = sp.relay.ListenURL()
 	}
 	env := BuildIsolatedEnv(mp.poolCfg.Env, sp.account, sp.geminiHome, relayURL)
-	netNS := strings.TrimSpace(sp.account.NetNSName)
+	netNS := accountNetNS(sp.account)
 	needModelDiscovery := len(sp.discoveredModels) == 0 && len(mp.discoveredModels) == 0
 	mp.mu.Unlock()
 
@@ -1386,7 +1511,7 @@ func (mp *MultiAccountPool) tryFetchQuotaViaCLIPrint(ctx context.Context, accoun
 		cmdArgs = []string{"netns", "exec", netNS, resolvedBin, "-p", "/usage"}
 	}
 	cmd := exec.CommandContext(ctx, cmdBin, cmdArgs...)
-	envList := os.Environ()
+	envList := SanitizedParentEnv()
 	for k, v := range env {
 		envList = append(envList, k+"="+v)
 	}

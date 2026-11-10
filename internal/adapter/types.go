@@ -45,6 +45,17 @@ type CanonicalRequest struct {
 	ToolResults       []CanonicalToolResult `json:"tool_results"`
 	HistoryHashBefore string                `json:"history_hash_before"`
 	HistoryHashFull   string                `json:"history_hash_full"`
+	// SessionNamespace scopes session keys and history hashes (e.g. per API key) so
+	// different callers can never match each other's sessions. Set by the server.
+	SessionNamespace string `json:"-"`
+}
+
+// ScopedSessionKey prefixes a session key or history hash with the request's namespace.
+func (r *CanonicalRequest) ScopedSessionKey(key string) string {
+	if r == nil || key == "" || r.SessionNamespace == "" {
+		return key
+	}
+	return r.SessionNamespace + key
 }
 
 func ExtractClientSessionID(sessionHeader string, meta map[string]any, directCandidates ...string) string {

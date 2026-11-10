@@ -1,6 +1,7 @@
 # Build & Runtime Artifacts
 bin/
 data/
+dist/
 web/node_modules/
 web/dist/
 web/*.tsbuildinfo
@@ -8,6 +9,12 @@ web/*.tsbuildinfo
 *.db-shm
 *.db-wal
 .DS_Store
+
+# Local secrets (env files); examples stay tracked
+.env
+*.env
+deploy/*.env
+!*.env.example
 
 # AI Directories & Tooling Configs
 .agents/

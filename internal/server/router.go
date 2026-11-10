@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/pbkdf2"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -12,8 +13,10 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -30,8 +33,13 @@ const (
 	adminSessionCookie               = "ag_admin_session"
 	adminPassSettingKey              = "admin_password_sha256"
 	adminTokenSettingKey             = "admin_token_sha256"
+	adminPassHashSettingKey          = "admin_password_pbkdf2"
+	adminTokenHashSettingKey         = "admin_token_pbkdf2"
 	adminCredentialsLockedKey        = "admin_credentials_locked"
 	adminCredentialsFileName         = "admin_credentials.txt"
+	adminPasswordMinLen              = 8
+	adminTokenMinLen                 = 12
+	pbkdf2Iterations                 = 600000
 )
 
 type rateWindow struct {
@@ -62,6 +70,9 @@ type GatewayServer struct {
 	authMu             sync.Mutex
 	adminSessions      map[string]time.Time
 	loginAttempts      map[string]*loginAttemptWindow
+	// verifiedTokenSHA caches sha256 of the admin token after it matched the stored
+	// PBKDF2 hash, so per-request bearer checks don't pay the KDF cost.
+	verifiedTokenSHA string
 }
 
 func NewGatewayServer(
@@ -153,7 +164,15 @@ func (gs *GatewayServer) Handler() http.Handler {
 	if gs.hub != nil {
 		wt = gs.hub.Broadcast
 	}
-	mux.Handle("/mcp/sessions/", acp.MCPBridgeHandler(gs.sm, wt))
+	// Only local agent subprocesses may reach the bridge; bridge IDs are not credentials.
+	mcpBridge := acp.MCPBridgeHandler(gs.sm, wt)
+	mux.HandleFunc("/mcp/sessions/", func(w http.ResponseWriter, r *http.Request) {
+		if !isLoopbackRequest(r) {
+			writeJSONError(w, http.StatusForbidden, "MCP bridge is only reachable from the gateway host")
+			return
+		}
+		mcpBridge.ServeHTTP(w, r)
+	})
 
 	// Northbound API endpoints (3 core session protocols + model listing/lookup + ACP WS)
 	mux.HandleFunc("/v1/models", gs.withNorthboundAuth(gs.handleModels))
@@ -266,7 +285,10 @@ func (gs *GatewayServer) withCORS(next http.Handler) http.Handler {
 	})
 }
 
-func extractToken(r *http.Request) string {
+// extractToken returns the credential carried by the request. The `?key=` query
+// parameter (Gemini-style clients) is only honoured when allowQueryKey is set,
+// i.e. for the northbound API; admin endpoints never read credentials from URLs.
+func extractToken(r *http.Request, allowQueryKey bool) string {
 	auth := strings.TrimSpace(r.Header.Get("Authorization"))
 	if strings.HasPrefix(strings.ToLower(auth), "bearer ") {
 		return strings.TrimSpace(auth[7:])
@@ -277,11 +299,10 @@ func extractToken(r *http.Request) string {
 	if gKey := strings.TrimSpace(r.Header.Get("x-goog-api-key")); gKey != "" {
 		return gKey
 	}
-	if qToken := strings.TrimSpace(r.URL.Query().Get("token")); qToken != "" {
-		return qToken
-	}
-	if qKey := strings.TrimSpace(r.URL.Query().Get("key")); qKey != "" {
-		return qKey
+	if allowQueryKey {
+		if qKey := strings.TrimSpace(r.URL.Query().Get("key")); qKey != "" {
+			return qKey
+		}
 	}
 	if c, err := r.Cookie(adminSessionCookie); err == nil {
 		if val := strings.TrimSpace(c.Value); val != "" {
@@ -294,6 +315,84 @@ func extractToken(r *http.Request) string {
 func sha256Hex(s string) string {
 	sum := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(sum[:])
+}
+
+// hashAdminSecret encodes a salted PBKDF2-SHA256 hash as
+// "pbkdf2-sha256$<iterations>$<salt hex>$<hash hex>".
+func hashAdminSecret(secret string) (string, error) {
+	salt := make([]byte, 16)
+	if _, err := rand.Read(salt); err != nil {
+		return "", err
+	}
+	dk, err := pbkdf2.Key(sha256.New, secret, salt, pbkdf2Iterations, 32)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("pbkdf2-sha256$%d$%s$%s", pbkdf2Iterations, hex.EncodeToString(salt), hex.EncodeToString(dk)), nil
+}
+
+func verifyAdminSecretHash(secret, encoded string) bool {
+	parts := strings.Split(strings.TrimSpace(encoded), "$")
+	if len(parts) != 4 || parts[0] != "pbkdf2-sha256" {
+		return false
+	}
+	iter, err := strconv.Atoi(parts[1])
+	if err != nil || iter <= 0 || iter > 10_000_000 {
+		return false
+	}
+	salt, err := hex.DecodeString(parts[2])
+	if err != nil {
+		return false
+	}
+	want, err := hex.DecodeString(parts[3])
+	if err != nil || len(want) == 0 {
+		return false
+	}
+	got, err := pbkdf2.Key(sha256.New, secret, salt, iter, len(want))
+	if err != nil {
+		return false
+	}
+	return subtle.ConstantTimeCompare(got, want) == 1
+}
+
+// isLoopbackRequest reports whether the request came directly from this host
+// (no proxy forwarding headers).
+func isLoopbackRequest(r *http.Request) bool {
+	if r.Header.Get("X-Forwarded-For") != "" || r.Header.Get("X-Real-IP") != "" || r.Header.Get("Forwarded") != "" {
+		return false
+	}
+	ip := net.ParseIP(clientIPFromRequest(r))
+	return ip != nil && ip.IsLoopback()
+}
+
+// isSameOriginRequest is true when the request has no Origin header (non-browser
+// clients) or the Origin's host matches the Host the request was sent to.
+func isSameOriginRequest(r *http.Request) bool {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return !strings.EqualFold(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")), "cross-site")
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	return strings.EqualFold(u.Host, r.Host)
+}
+
+// isOriginAllowedForAPI accepts same-origin requests and origins explicitly listed
+// in server.cors_allowed_origins (including "*").
+func (gs *GatewayServer) isOriginAllowedForAPI(r *http.Request) bool {
+	if isSameOriginRequest(r) {
+		return true
+	}
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	for _, a := range gs.cfg.Server.CORSAllowedOrigins {
+		a = strings.TrimSpace(a)
+		if a == "*" || (origin != "" && strings.EqualFold(a, origin)) {
+			return true
+		}
+	}
+	return false
 }
 
 func generateRandomCredential(prefix string, byteLen int) string {
@@ -319,15 +418,17 @@ func (gs *GatewayServer) isAdminCredentialsLocked() bool {
 	if locked, ok := gs.store.GetSetting(adminCredentialsLockedKey); ok && strings.TrimSpace(locked) == "1" {
 		return true
 	}
-	if savedPassHash, ok := gs.store.GetSetting(adminPassSettingKey); ok && strings.TrimSpace(savedPassHash) != "" {
-		return true
+	for _, k := range []string{adminPassHashSettingKey, adminPassSettingKey} {
+		if saved, ok := gs.store.GetSetting(k); ok && strings.TrimSpace(saved) != "" {
+			return true
+		}
 	}
 	return false
 }
 
 func (gs *GatewayServer) writeAdminCredentialsFile(password, token string, locked bool) {
 	filePath := gs.AdminCredentialsFilePath()
-	_ = os.MkdirAll(filepath.Dir(filePath), 0755)
+	_ = os.MkdirAll(filepath.Dir(filePath), 0700)
 	var content string
 	nowStr := time.Now().Format(time.RFC3339)
 	if locked {
@@ -335,7 +436,7 @@ func (gs *GatewayServer) writeAdminCredentialsFile(password, token string, locke
 			"# Antigravity ACP Gateway — Admin Credentials\n"+
 				"STATUS=LOCKED_BY_USER\n"+
 				"UPDATED_AT=%s\n"+
-				"NOTE=管理员密码与 Token 已由用户主动修改并永久固定（SHA-256 哈希存储于 gateway.db settings 表），重部署不会再重置。\n",
+				"NOTE=管理员密码与 Token 已由用户主动修改并永久固定（加盐 PBKDF2-SHA256 哈希存储于 gateway.db settings 表），重部署不会再重置。\n",
 			nowStr,
 		)
 	} else {
@@ -352,6 +453,7 @@ func (gs *GatewayServer) writeAdminCredentialsFile(password, token string, locke
 		)
 	}
 	_ = os.WriteFile(filePath, []byte(content), 0600)
+	_ = os.Chmod(filePath, 0600)
 }
 
 // InitOrRotateAdminCredentials dynamically generates a fresh admin_password and admin_token
@@ -394,54 +496,116 @@ func (gs *GatewayServer) LogStartupAdminCredentials() {
 		log.Printf("[Admin Auth] 管理员密码与 Token 已由用户主动修改并固定 (状态文件: %s)", credFile)
 		return
 	}
-	pwd := strings.TrimSpace(gs.cfg.GetAdminPassword())
-	tok := strings.TrimSpace(gs.cfg.GetAdminToken())
-	log.Printf("==============================================================================")
-	log.Printf("[Admin Auth] 本次部署已动态生成管理凭证 (用户主动修改后将永久固定):")
-	log.Printf("  -> Web 登录密码 (Admin Password) : %s", pwd)
-	log.Printf("  -> API 管理令牌 (Admin Token)    : %s", tok)
-	log.Printf("  -> 凭证保存位置 (Credentials File): %s", credFile)
-	log.Printf("  -> 提示: 登录 Web 控制台点击右上角「修改密码」主动修改后即永久固定，重部署不再变更。")
-	log.Printf("==============================================================================")
+	log.Printf("[Admin Auth] 本次启动已动态生成管理密码与 Token，已写入 %s (权限 0600)；登录 Web 控制台「修改密码」后即永久固定。", credFile)
 }
 
-func (gs *GatewayServer) verifyAdminCredential(candidate string) bool {
+// verifyStoredSecret checks candidate against the PBKDF2 hash under hashKey, falling
+// back to a legacy unsalted sha256 hash under legacyKey (migrated on success).
+func (gs *GatewayServer) verifyStoredSecret(candidate, hashKey, legacyKey string) bool {
+	if gs.store == nil {
+		return false
+	}
+	if enc, ok := gs.store.GetSetting(hashKey); ok && strings.TrimSpace(enc) != "" {
+		return verifyAdminSecretHash(candidate, enc)
+	}
+	legacy, ok := gs.store.GetSetting(legacyKey)
+	if !ok || strings.TrimSpace(legacy) == "" {
+		return false
+	}
+	if subtle.ConstantTimeCompare([]byte(sha256Hex(candidate)), []byte(strings.TrimSpace(legacy))) != 1 {
+		return false
+	}
+	if enc, err := hashAdminSecret(candidate); err == nil {
+		if gs.store.SetSetting(hashKey, enc) == nil {
+			_ = gs.store.SetSetting(legacyKey, "")
+		}
+	}
+	return true
+}
+
+// verifyAdminPassword checks the console login password (never accepted as a bearer token).
+func (gs *GatewayServer) verifyAdminPassword(candidate string) bool {
 	candidate = strings.TrimSpace(candidate)
 	if candidate == "" {
 		return false
 	}
-	candHash := sha256Hex(candidate)
-
-	// 1. If the user has actively modified and locked credentials in SQLite, strictly verify against DB hashes only
 	if gs.store != nil && gs.isAdminCredentialsLocked() {
-		if savedPassHash, ok := gs.store.GetSetting(adminPassSettingKey); ok && savedPassHash != "" {
-			if subtle.ConstantTimeCompare([]byte(candHash), []byte(savedPassHash)) == 1 {
-				return true
-			}
-		}
-		if savedTokHash, ok := gs.store.GetSetting(adminTokenSettingKey); ok && savedTokHash != "" {
-			if subtle.ConstantTimeCompare([]byte(candHash), []byte(savedTokHash)) == 1 {
-				return true
-			}
-		}
+		return gs.verifyStoredSecret(candidate, adminPassHashSettingKey, adminPassSettingKey)
+	}
+	expected := strings.TrimSpace(gs.cfg.GetAdminPassword())
+	return expected != "" && !config.IsDynamicCredentialValue(expected) &&
+		subtle.ConstantTimeCompare([]byte(sha256Hex(candidate)), []byte(sha256Hex(expected))) == 1
+}
+
+// verifyAdminToken checks the static admin API token.
+func (gs *GatewayServer) verifyAdminToken(candidate string) bool {
+	candidate = strings.TrimSpace(candidate)
+	if candidate == "" {
 		return false
 	}
-
-	// 2. Otherwise check active runtime AdminPassword (dynamically generated on deployment)
-	expectedPwd := strings.TrimSpace(gs.cfg.GetAdminPassword())
-	if expectedPwd != "" && !config.IsDynamicCredentialValue(expectedPwd) &&
-		subtle.ConstantTimeCompare([]byte(candHash), []byte(sha256Hex(expectedPwd))) == 1 {
+	candSHA := sha256Hex(candidate)
+	if gs.store != nil && gs.isAdminCredentialsLocked() {
+		gs.authMu.Lock()
+		cached := gs.verifiedTokenSHA
+		gs.authMu.Unlock()
+		if cached != "" && subtle.ConstantTimeCompare([]byte(candSHA), []byte(cached)) == 1 {
+			return true
+		}
+		if !gs.verifyStoredSecret(candidate, adminTokenHashSettingKey, adminTokenSettingKey) {
+			return false
+		}
+		gs.authMu.Lock()
+		gs.verifiedTokenSHA = candSHA
+		gs.authMu.Unlock()
 		return true
 	}
+	expected := strings.TrimSpace(gs.cfg.GetAdminToken())
+	return expected != "" && !config.IsDynamicCredentialValue(expected) &&
+		subtle.ConstantTimeCompare([]byte(candSHA), []byte(sha256Hex(expected))) == 1
+}
 
-	// 3. Check active runtime AdminToken (dynamically generated on deployment)
-	expectedToken := strings.TrimSpace(gs.cfg.GetAdminToken())
-	if expectedToken != "" && !config.IsDynamicCredentialValue(expectedToken) &&
-		subtle.ConstantTimeCompare([]byte(candHash), []byte(sha256Hex(expectedToken))) == 1 {
-		return true
+// persistAdminCredentials stores salted hashes of the new password (and token, if
+// given) and locks credentials so restarts no longer rotate them.
+func (gs *GatewayServer) persistAdminCredentials(newPwd, newToken string) error {
+	passHash, err := hashAdminSecret(newPwd)
+	if err != nil {
+		return err
 	}
+	tokenToStore := strings.TrimSpace(newToken)
+	if tokenToStore == "" {
+		_, hasNew := gs.store.GetSetting(adminTokenHashSettingKey)
+		_, hasLegacy := gs.store.GetSetting(adminTokenSettingKey)
+		if !hasNew && !hasLegacy {
+			tokenToStore = strings.TrimSpace(gs.cfg.GetAdminToken())
+			if config.IsDynamicCredentialValue(tokenToStore) {
+				tokenToStore = generateRandomCredential("agt-", 24)
+			}
+		}
+	}
+	if err := gs.store.SetSetting(adminPassHashSettingKey, passHash); err != nil {
+		return err
+	}
+	_ = gs.store.SetSetting(adminPassSettingKey, "")
+	if tokenToStore != "" {
+		tokHash, err := hashAdminSecret(tokenToStore)
+		if err != nil {
+			return err
+		}
+		if err := gs.store.SetSetting(adminTokenHashSettingKey, tokHash); err != nil {
+			return err
+		}
+		_ = gs.store.SetSetting(adminTokenSettingKey, "")
+	}
+	gs.authMu.Lock()
+	gs.verifiedTokenSHA = ""
+	gs.authMu.Unlock()
+	return gs.store.SetSetting(adminCredentialsLockedKey, "1")
+}
 
-	return false
+// verifyAdminLoginCredential is used by the login and change-password endpoints,
+// which accept either the password or the admin token.
+func (gs *GatewayServer) verifyAdminLoginCredential(candidate string) bool {
+	return gs.verifyAdminPassword(candidate) || gs.verifyAdminToken(candidate)
 }
 
 func (gs *GatewayServer) isValidAdminSession(token string) bool {
@@ -558,37 +722,80 @@ func (gs *GatewayServer) clearLoginFailures(ip string) {
 	delete(gs.loginAttempts, ip)
 }
 
-func (gs *GatewayServer) isAdminAuthenticated(r *http.Request) bool {
-	token := extractToken(r)
-	if token != "" {
-		if gs.isValidAdminSession(token) || gs.verifyAdminCredential(token) {
-			return true
-		}
+type adminAuthResult int
+
+const (
+	adminAuthMissing adminAuthResult = iota
+	adminAuthOK
+	adminAuthInvalid
+	adminAuthRateLimited
+)
+
+// authenticateAdmin accepts a valid admin session (header or cookie) or the admin
+// token. Token guesses are rate-limited per client IP; session tokens are random
+// 256-bit values and are always checked so a locked-out IP keeps working sessions.
+func (gs *GatewayServer) authenticateAdmin(r *http.Request, bucket string) adminAuthResult {
+	candidates := make([]string, 0, 2)
+	if token := extractToken(r, false); token != "" {
+		candidates = append(candidates, token)
 	}
 	if c, err := r.Cookie(adminSessionCookie); err == nil {
-		cookieToken := strings.TrimSpace(c.Value)
-		if cookieToken != "" && cookieToken != token {
-			if gs.isValidAdminSession(cookieToken) || gs.verifyAdminCredential(cookieToken) {
-				return true
-			}
+		if v := strings.TrimSpace(c.Value); v != "" && (len(candidates) == 0 || candidates[0] != v) {
+			candidates = append(candidates, v)
 		}
 	}
-	return false
+	if len(candidates) == 0 {
+		return adminAuthMissing
+	}
+	for _, c := range candidates {
+		if gs.isValidAdminSession(c) {
+			return adminAuthOK
+		}
+	}
+	if !gs.checkLoginRateLimit(bucket) {
+		return adminAuthRateLimited
+	}
+	for _, c := range candidates {
+		if !strings.HasPrefix(c, "ag_sess_") && gs.verifyAdminToken(c) {
+			return adminAuthOK
+		}
+	}
+	gs.recordLoginFailure(bucket)
+	return adminAuthInvalid
+}
+
+func (gs *GatewayServer) isAdminAuthenticated(r *http.Request) bool {
+	return gs.authenticateAdmin(r, clientIPFromRequest(r)) == adminAuthOK
+}
+
+func isStateChangingMethod(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return false
+	}
+	return true
 }
 
 func (gs *GatewayServer) withAdminAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !gs.isAdminAuthenticated(r) {
-			writeJSONError(w, http.StatusUnauthorized, "未登录或管理会话已过期，请先登录")
+		if isStateChangingMethod(r.Method) && !isSameOriginRequest(r) {
+			writeJSONError(w, http.StatusForbidden, "cross-origin admin request rejected")
 			return
 		}
-		next(w, r)
+		switch gs.authenticateAdmin(r, clientIPFromRequest(r)) {
+		case adminAuthOK:
+			next(w, r)
+		case adminAuthRateLimited:
+			writeJSONError(w, http.StatusTooManyRequests, "认证失败次数过多，请 5 分钟后再试")
+		default:
+			writeJSONError(w, http.StatusUnauthorized, "未登录或管理会话已过期，请先登录")
+		}
 	}
 }
 
 func (gs *GatewayServer) withNorthboundAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		token := extractToken(r)
+		token := extractToken(r, true)
 		// Fast path for standard API keys (cached in memory) before checking admin credentials
 		if gs.store != nil && token != "" && !strings.HasPrefix(token, "ag_sess_") {
 			if rec, ok := gs.store.ValidateAPIKey(token); ok {
@@ -601,13 +808,27 @@ func (gs *GatewayServer) withNorthboundAuth(next http.HandlerFunc) http.HandlerF
 				return
 			}
 		}
-		// Allow admin token/session directly
-		if token != "" && (gs.isValidAdminSession(token) || gs.verifyAdminCredential(token)) {
-			next(w, r)
+		if token != "" {
+			bucket := "nb:" + clientIPFromRequest(r)
+			if gs.isValidAdminSession(token) {
+				next(w, r)
+				return
+			}
+			if !gs.checkLoginRateLimit(bucket) {
+				writeJSONError(w, http.StatusTooManyRequests, "too many invalid API key attempts, retry in 5 minutes")
+				return
+			}
+			if !strings.HasPrefix(token, "ag_sess_") && gs.verifyAdminToken(token) {
+				next(w, r)
+				return
+			}
+			gs.recordLoginFailure(bucket)
+			writeJSONError(w, http.StatusUnauthorized, "invalid or missing API key")
 			return
 		}
-		// If no API keys exist in DB yet, allow unauthenticated local bootstrap
-		if gs.store != nil && !gs.store.HasAnyAPIKeys() && token == "" {
+		// Before the first API key is created, allow unauthenticated bootstrap only from
+		// this host; remote callers must use an API key or the admin token.
+		if gs.store != nil && !gs.store.HasAnyAPIKeys() && isLoopbackRequest(r) {
 			next(w, r)
 			return
 		}
@@ -619,6 +840,34 @@ func writeJSON(w http.ResponseWriter, status int, data any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(data)
+}
+
+// writeProtocolError writes an error body in the shape the northbound protocol's
+// SDKs parse (Anthropic uses a top-level "type":"error" envelope).
+func writeProtocolError(w http.ResponseWriter, protocol string, status int, message string) {
+	if protocol != "claude" {
+		writeJSONError(w, status, message)
+		return
+	}
+	errType := "api_error"
+	switch status {
+	case http.StatusBadRequest:
+		errType = "invalid_request_error"
+	case http.StatusUnauthorized:
+		errType = "authentication_error"
+	case http.StatusForbidden:
+		errType = "permission_error"
+	case http.StatusNotFound:
+		errType = "not_found_error"
+	case http.StatusTooManyRequests:
+		errType = "rate_limit_error"
+	case http.StatusServiceUnavailable:
+		errType = "overloaded_error"
+	}
+	writeJSON(w, status, map[string]any{
+		"type":  "error",
+		"error": map[string]any{"type": errType, "message": message},
+	})
 }
 
 func writeJSONError(w http.ResponseWriter, status int, message string) {

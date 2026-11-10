@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"net/url"
 	"strings"
 	"time"
 )
@@ -23,8 +24,64 @@ type Account struct {
 	Status           string    `json:"status"` // "ready" | "auth_required" | "error"
 	LastEgressIP     string    `json:"last_egress_ip,omitempty"`
 	DisabledModels   []string  `json:"disabled_models"`
-	CreatedAt        time.Time `json:"created_at"`
-	UpdatedAt        time.Time `json:"updated_at"`
+	// HasAPIKey is set on redacted copies so clients can tell a key is stored.
+	HasAPIKey bool      `json:"has_api_key"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// MaskedSecret replaces secrets in admin API output; sending it back means "unchanged".
+const MaskedSecret = "********"
+
+// Redacted returns a copy safe to return from admin APIs: the API key is dropped
+// and any proxy password is masked.
+func (a Account) Redacted() Account {
+	a.HasAPIKey = strings.TrimSpace(a.APIKey) != ""
+	a.APIKey = ""
+	a.ProxyURL = MaskProxyURL(a.ProxyURL)
+	return a
+}
+
+// MaskProxyURL replaces the password component of a proxy URL with MaskedSecret.
+func MaskProxyURL(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.User == nil {
+		return raw
+	}
+	if _, hasPwd := u.User.Password(); !hasPwd {
+		return raw
+	}
+	user := url.User(u.User.Username()).String()
+	rest := *u
+	rest.User = nil
+	s := rest.String()
+	prefix := u.Scheme + "://"
+	if !strings.HasPrefix(s, prefix) {
+		return raw
+	}
+	return prefix + user + ":" + MaskedSecret + "@" + strings.TrimPrefix(s, prefix)
+}
+
+// RestoreMaskedProxyURL returns incoming with the masked password replaced by the
+// password from existing, when both point at the same proxy user and host.
+func RestoreMaskedProxyURL(incoming, existing string) string {
+	in, err := url.Parse(strings.TrimSpace(incoming))
+	if err != nil || in.User == nil {
+		return incoming
+	}
+	if pwd, ok := in.User.Password(); !ok || pwd != MaskedSecret {
+		return incoming
+	}
+	ex, err := url.Parse(strings.TrimSpace(existing))
+	if err != nil || ex.User == nil {
+		return incoming
+	}
+	exPwd, ok := ex.User.Password()
+	if !ok || ex.User.Username() != in.User.Username() || !strings.EqualFold(ex.Host, in.Host) || !strings.EqualFold(ex.Scheme, in.Scheme) {
+		return incoming
+	}
+	in.User = url.UserPassword(in.User.Username(), exPwd)
+	return in.String()
 }
 
 func (a Account) IsModelDisabled(modelID string) bool {

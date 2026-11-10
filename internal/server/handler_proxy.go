@@ -348,7 +348,13 @@ func IsPostCompactionResumeRequest(canReq *adapter.CanonicalRequest) bool {
 	if canReq == nil || len(canReq.ToolResults) > 0 {
 		return false
 	}
-	for _, m := range canReq.Messages {
+	// Only the first turn after the summary counts: once an assistant reply follows
+	// the handoff summary, the conversation has already resumed.
+	for i := len(canReq.Messages) - 1; i >= 0; i-- {
+		m := canReq.Messages[i]
+		if m.Role == "assistant" {
+			break
+		}
 		if strings.Contains(m.Content, "# Resuming from a compaction") ||
 			strings.Contains(m.Content, "# Handoff Summary") {
 			return true
@@ -976,19 +982,19 @@ func (gs *GatewayServer) handleOpenAIChatCompletions(w http.ResponseWriter, r *h
 
 func (gs *GatewayServer) handleClaudeMessages(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		writeProtocolError(w, "claude", http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 64*1024*1024)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		writeJSONError(w, http.StatusBadRequest, err.Error())
+		writeProtocolError(w, "claude", http.StatusBadRequest, err.Error())
 		return
 	}
 	sessionHeader := extractClientSessionHeader(r)
 	canReq, err := adapter.ParseClaudeRequest(body, sessionHeader)
 	if err != nil {
-		writeJSONError(w, http.StatusBadRequest, err.Error())
+		writeProtocolError(w, "claude", http.StatusBadRequest, err.Error())
 		return
 	}
 	if canReq.SessionTitle == "" {
@@ -997,15 +1003,25 @@ func (gs *GatewayServer) handleClaudeMessages(w http.ResponseWriter, r *http.Req
 	gs.executeNorthboundTurn(w, r, canReq)
 }
 
+// resolvePreferredAccount picks the account for a request. An API key bound to an
+// account always wins; clients can only choose an account (X-ACP-Account-ID header
+// or ?account_id=) when their key is unbound or they use admin credentials.
 func (gs *GatewayServer) resolvePreferredAccount(r *http.Request) (preferred string, allowFailover bool) {
-	if hdr := strings.TrimSpace(r.Header.Get("X-ACP-Account-ID")); hdr != "" {
-		return hdr, hdr == "auto"
-	}
-	if keyRec, ok := r.Context().Value(ctxKeyAPIKey).(*storage.APIKey); ok && keyRec != nil {
-		if strings.TrimSpace(keyRec.BoundAccountID) != "" && keyRec.BoundAccountID != "auto" {
-			return strings.TrimSpace(keyRec.BoundAccountID), false
+	keyRec, hasKey := r.Context().Value(ctxKeyAPIKey).(*storage.APIKey)
+	hasKey = hasKey && keyRec != nil
+	if hasKey {
+		if bound := strings.TrimSpace(keyRec.BoundAccountID); bound != "" && bound != "auto" {
+			return bound, false
 		}
-	} else if gs.store != nil {
+	}
+	requested := strings.TrimSpace(r.Header.Get("X-ACP-Account-ID"))
+	if requested == "" {
+		requested = strings.TrimSpace(r.URL.Query().Get("account_id"))
+	}
+	if requested != "" {
+		return requested, requested == "auto"
+	}
+	if !hasKey && gs.store != nil {
 		if primaryKey, ok := gs.store.GetPrimaryAPIKey(); ok && primaryKey != nil {
 			if strings.TrimSpace(primaryKey.BoundAccountID) != "" && primaryKey.BoundAccountID != "auto" {
 				return strings.TrimSpace(primaryKey.BoundAccountID), false
@@ -1125,6 +1141,71 @@ func (gs *GatewayServer) resolveRequestPolicy(r *http.Request) (config.PromptPol
 	return policy, sessionMode, keyName
 }
 
+var thinkingLevelOrder = []string{"minimal", "low", "medium", "high", "extra_high"}
+
+func thinkingLevelRank(level string) int {
+	l := strings.ToLower(strings.TrimSpace(level))
+	if l == "max" || l == "xhigh" {
+		l = "extra_high"
+	}
+	for i, v := range thinkingLevelOrder {
+		if v == l {
+			return i
+		}
+	}
+	return -1
+}
+
+// resolveThinkingLevel honours the client's requested level. Unset defaults to
+// "high"; a level the model does not offer maps to the nearest supported one
+// (preferring higher).
+func (gs *GatewayServer) resolveThinkingLevel(model, requested string) string {
+	requested = strings.ToLower(strings.TrimSpace(requested))
+	if requested == "" {
+		return "high"
+	}
+	var supported []string
+	if gs.pool != nil && model != "" {
+		for _, m := range gs.pool.ListModels() {
+			if strings.EqualFold(m.ModelID, model) {
+				supported = m.ThinkingLevels
+				break
+			}
+		}
+	}
+	if len(supported) == 0 {
+		if requested == "medium" && strings.HasPrefix(strings.ToLower(model), "gemini-") {
+			return "high"
+		}
+		return requested
+	}
+	want := thinkingLevelRank(requested)
+	best, bestRank := "", -1
+	below, belowRank := "", -1
+	for _, s := range supported {
+		if strings.EqualFold(s, requested) {
+			return s
+		}
+		r := thinkingLevelRank(s)
+		if r < 0 || want < 0 {
+			continue
+		}
+		if r > want && (bestRank < 0 || r < bestRank) {
+			best, bestRank = s, r
+		}
+		if r < want && r > belowRank {
+			below, belowRank = s, r
+		}
+	}
+	if best != "" {
+		return best
+	}
+	if below != "" {
+		return below
+	}
+	return requested
+}
+
 func (gs *GatewayServer) executeNorthboundTurn(w http.ResponseWriter, r *http.Request, canReq *adapter.CanonicalRequest) {
 	startTime := time.Now()
 	idPrefix := "req_"
@@ -1133,6 +1214,9 @@ func (gs *GatewayServer) executeNorthboundTurn(w http.ResponseWriter, r *http.Re
 	}
 	reqID := genReqID(idPrefix)
 	ctx := r.Context()
+	if keyRec, ok := ctx.Value(ctxKeyAPIKey).(*storage.APIKey); ok && keyRec != nil {
+		canReq.SessionNamespace = fmt.Sprintf("k%d:", keyRec.ID)
+	}
 
 	preferredAccID, allowFailover := gs.resolvePreferredAccount(r)
 	if canReq.ContextWindow <= 0 {
@@ -1171,12 +1255,7 @@ func (gs *GatewayServer) executeNorthboundTurn(w http.ResponseWriter, r *http.Re
 	if isClientCompaction {
 		effectiveThinking = "low"
 	} else {
-		if effectiveThinking == "" || effectiveThinking == "low" {
-			effectiveThinking = "high"
-		}
-		if strings.HasPrefix(strings.ToLower(canReq.Model), "gemini-") && effectiveThinking == "medium" {
-			effectiveThinking = "high"
-		}
+		effectiveThinking = gs.resolveThinkingLevel(canReq.Model, effectiveThinking)
 	}
 	if canReq.ThinkingLevel == "" {
 		canReq.ThinkingLevel = effectiveThinking
@@ -1262,9 +1341,9 @@ func (gs *GatewayServer) executeNorthboundTurn(w http.ResponseWriter, r *http.Re
 				if canReq.SessionTitle != "" {
 					resumedSess.SetSessionTitle(canReq.SessionTitle)
 				}
-				gs.sm.UpdateSessionHash(resumedSess, canReq.HistoryHashFull)
+				gs.sm.UpdateSessionHash(resumedSess, canReq.ScopedSessionKey(canReq.HistoryHashFull))
 				if canReq.Protocol == "openai_responses" {
-					gs.sm.BindExplicitKey(resumedSess, reqID)
+					gs.sm.BindExplicitKey(resumedSess, canReq.ScopedSessionKey(reqID))
 				}
 				if v, ok := activeReqTurnMeta.Load(reqID); ok {
 					if m, ok2 := v.(reqTurnMeta); ok2 {
@@ -1311,17 +1390,24 @@ func (gs *GatewayServer) executeNorthboundTurn(w http.ResponseWriter, r *http.Re
 	if effectiveSessionKey == "" && strings.TrimSpace(canReq.ClientSessionID) != "" {
 		effectiveSessionKey = strings.TrimSpace(canReq.ClientSessionID)
 	}
+	effectiveSessionKey = canReq.ScopedSessionKey(effectiveSessionKey)
+	scopedHashBefore := canReq.ScopedSessionKey(canReq.HistoryHashBefore)
+	scopedHashFull := canReq.ScopedSessionKey(canReq.HistoryHashFull)
 	// If the client initiated context compaction (or sent a new non-tool-result turn while
 	// the session still had parked tool calls), immediately abort any parked tool calls so
 	// the worker is freed in <50ms instead of hanging for parkTimeout (180s).
 	if isClientCompaction || isPostCompactionResume {
 		var priorSess *acp.ManagedSession
 		if effectiveSessionKey != "" {
-			priorSess, _ = gs.sm.LookupSession(preferredAccID, effectiveSessionKey, canReq.HistoryHashBefore)
+			priorSess, _ = gs.sm.LookupSession(preferredAccID, effectiveSessionKey, scopedHashBefore)
 		}
-		gs.sm.AbortParkedCallsForSession(priorSess, preferredAccID, "Error: tool call aborted because client initiated context compaction")
-		if priorSess != nil && isPostCompactionResume {
-			priorSess.SetACPSession("", -1)
+		// Without an identified prior session, aborting by account would cancel other
+		// clients' tool calls, so only the matched session is touched.
+		if priorSess != nil {
+			gs.sm.AbortParkedCallsForSession(priorSess, priorSess.AccountID, "Error: tool call aborted because client initiated context compaction")
+			if isPostCompactionResume {
+				priorSess.SetACPSession("", -1)
+			}
 		}
 	}
 	if sess == nil {
@@ -1334,7 +1420,7 @@ func (gs *GatewayServer) executeNorthboundTurn(w http.ResponseWriter, r *http.Re
 				sess, found = gs.sm.LookupSession(preferredAccID, effectiveSessionKey, "")
 			}
 		default:
-			sess, found = gs.sm.LookupSession(preferredAccID, effectiveSessionKey, canReq.HistoryHashBefore)
+			sess, found = gs.sm.LookupSession(preferredAccID, effectiveSessionKey, scopedHashBefore)
 		}
 		if found && sess != nil && gs.sm.HasParkedCallsForSession(sess.BridgeID) {
 			gs.sm.AbortParkedCallsForSession(sess, sess.AccountID, "Error: tool call superseded by new user turn")
@@ -1343,9 +1429,9 @@ func (gs *GatewayServer) executeNorthboundTurn(w http.ResponseWriter, r *http.Re
 			found = false
 			sess = nil
 		}
-		if found && sess != nil && sess.GetWorker() != nil && sess.GetWorker().GetState() == acp.StateIdle {
+		forkedHistory := found && sess != nil && sessionMode != "sticky_conversation" && gs.sm.IsStaleHistoryHash(sess, scopedHashBefore)
+		if found && sess != nil && sess.GetWorker().TryMarkBusy() {
 			worker = sess.GetWorker()
-			worker.SetState(acp.StateGenerating)
 			acc.ID = sess.AccountID
 			sameWorker = true
 		} else {
@@ -1356,7 +1442,7 @@ func (gs *GatewayServer) executeNorthboundTurn(w http.ResponseWriter, r *http.Re
 					status = http.StatusForbidden
 				}
 				gs.recordAudit(reqID, canReq, preferredAccID, "", 0, promptTokens, 0, startTime, status, err.Error(), "", "", "")
-				writeJSONError(w, status, fmt.Sprintf("acquire ACP worker failed: %v", err))
+				writeProtocolError(w, canReq.Protocol, status, fmt.Sprintf("acquire ACP worker failed: %v", err))
 				return
 			}
 		}
@@ -1370,7 +1456,9 @@ func (gs *GatewayServer) executeNorthboundTurn(w http.ResponseWriter, r *http.Re
 			lastIn, _ := sess.GetLastTokenUsage()
 			clientTruncatedHistory := compReq && len(canReq.Messages) > 0 && lastIn > 0 && promptTokens < (lastIn*55)/100
 			needACPCompactionFallback := false
-			if isPostCompactionResume || clientTruncatedHistory {
+			if isPostCompactionResume || clientTruncatedHistory || forkedHistory {
+				// The live ACP session holds turns the client no longer has; rebuild it
+				// from the client's history.
 				sess.SetACPSession("", -1)
 				sysDelta = ""
 			} else if compReq {
@@ -1390,24 +1478,24 @@ func (gs *GatewayServer) executeNorthboundTurn(w http.ResponseWriter, r *http.Re
 				sysDelta = ""
 			}
 			sess = gs.sm.RebindSession(sess, acc.ID, effectiveSessionKey, sess.HistoryHash, worker, sess.GetACPSessionID(), canReq.Tools)
-			gs.sm.UpdateSessionHash(sess, canReq.HistoryHashFull)
+			gs.sm.UpdateSessionHash(sess, scopedHashFull)
 		} else {
 			sess = gs.sm.RegisterOrMatchSession(acc.ID, effectiveSessionKey, "", worker, "", canReq.Tools)
 			_, _ = gs.sm.UpdateSessionToolsAndSystem(sess, canReq.Tools, acpSessionSys)
-			gs.sm.UpdateSessionHash(sess, canReq.HistoryHashFull)
+			gs.sm.UpdateSessionHash(sess, scopedHashFull)
 		}
 	} else {
 		if effectiveSessionKey != "" {
 			gs.sm.BindExplicitKey(sess, effectiveSessionKey)
 		}
-		gs.sm.UpdateSessionHash(sess, canReq.HistoryHashFull)
+		gs.sm.UpdateSessionHash(sess, scopedHashFull)
 	}
 
 	if canReq.SessionTitle != "" && sess != nil {
 		sess.SetSessionTitle(canReq.SessionTitle)
 	}
 	if canReq.Protocol == "openai_responses" {
-		gs.sm.BindExplicitKey(sess, reqID)
+		gs.sm.BindExplicitKey(sess, canReq.ScopedSessionKey(reqID))
 	}
 	loopbackBase := gs.getLoopbackBaseURL(r)
 	mcpServers := gs.buildSessionMCPServers(loopbackBase, sess.BridgeID)
@@ -1455,11 +1543,11 @@ func (gs *GatewayServer) executeNorthboundTurn(w http.ResponseWriter, r *http.Re
 			if err2 == nil {
 				worker = worker2
 				acc = acc2
-				sess = gs.sm.RegisterOrMatchSession(acc.ID, canReq.SessionHeader, "", worker, "", canReq.Tools)
+				sess = gs.sm.RegisterOrMatchSession(acc.ID, effectiveSessionKey, "", worker, "", canReq.Tools)
 				_, _ = gs.sm.UpdateSessionToolsAndSystem(sess, canReq.Tools, acpSessionSys)
-				gs.sm.UpdateSessionHash(sess, canReq.HistoryHashFull)
+				gs.sm.UpdateSessionHash(sess, scopedHashFull)
 				if canReq.Protocol == "openai_responses" {
-					gs.sm.BindExplicitKey(sess, reqID)
+					gs.sm.BindExplicitKey(sess, canReq.ScopedSessionKey(reqID))
 				}
 				mcpServers = gs.buildSessionMCPServers(loopbackBase, sess.BridgeID)
 				sessionRes, err = worker.NewSession(ctx, acp.NewSessionParams{
@@ -1479,7 +1567,7 @@ func (gs *GatewayServer) executeNorthboundTurn(w http.ResponseWriter, r *http.Re
 				_ = gs.store.UpdateAccountStatus(acc.ID, "auth_required", "")
 			}
 			gs.recordAudit(reqID, canReq, acc.ID, "", worker.PID, promptTokens, 0, startTime, status, err.Error(), "", "", "")
-			writeJSONError(w, status, err.Error())
+			writeProtocolError(w, canReq.Protocol, status, err.Error())
 			return
 		}
 		sess.SetACPSession(sessionRes.SessionID, -1)
@@ -1537,6 +1625,7 @@ func (gs *GatewayServer) executeNorthboundTurn(w http.ResponseWriter, r *http.Re
 			activeReqTurnMeta.Store(reqID, m)
 		}
 	}
+	sess.SetLastStopReason("")
 	go func(sID string) {
 		resp, pErr := worker.Call(context.Background(), "session/prompt", acp.PromptParams{
 			SessionID: sID,
@@ -1544,8 +1633,11 @@ func (gs *GatewayServer) executeNorthboundTurn(w http.ResponseWriter, r *http.Re
 		})
 		if pErr == nil && resp != nil && len(resp.Result) > 0 {
 			var pr acp.PromptResult
-			if json.Unmarshal(resp.Result, &pr) == nil && pr.Usage != nil {
-				sess.SetLastPromptUsage(pr.Usage)
+			if json.Unmarshal(resp.Result, &pr) == nil {
+				if pr.Usage != nil {
+					sess.SetLastPromptUsage(pr.Usage)
+				}
+				sess.SetLastStopReason(pr.StopReason)
 			}
 		}
 		promptDoneCh <- pErr
@@ -2134,6 +2226,7 @@ func (gs *GatewayServer) streamOrCollectWorkerOutput(
 			oaRespSSE.WriteStart()
 		default:
 			clSSE = adapter.NewClaudeSSEWriter(w, reqID, canReq.Model)
+			clSSE.SetInputTokens(promptTokens)
 			clSSE.WriteStart()
 		}
 	}
@@ -2525,7 +2618,7 @@ func (gs *GatewayServer) streamOrCollectWorkerOutput(
 					Content: fullText.String(),
 				})
 				_, hashWithReply := adapter.ComputeHistoryHashes(canReq.SystemPrompt, msgsWithReply)
-				gs.sm.UpdateSessionHash(sess, hashWithReply)
+				gs.sm.UpdateSessionHash(sess, canReq.ScopedSessionKey(hashWithReply))
 			}
 
 			lastStepIdx := sess.GetLastTranscriptStep()
@@ -2590,8 +2683,15 @@ func (gs *GatewayServer) streamOrCollectWorkerOutput(
 			}
 			if err != nil {
 				gs.recordAuditWithContext(reqID, canReq, sess.AccountID, acpSessID, worker.PID, effectivePromptTokens, effectivePromptTokens, cachedTokens, compTokens, effectiveFirstByteMs, startTime, http.StatusBadGateway, err.Error(), fullThinking.String(), fullText.String(), "")
-				if !canReq.Stream {
-					writeJSONError(w, http.StatusBadGateway, err.Error())
+				switch {
+				case oaSSE != nil:
+					oaSSE.WriteError(err.Error())
+				case oaRespSSE != nil:
+					oaRespSSE.WriteError(err.Error())
+				case clSSE != nil:
+					clSSE.WriteError(err.Error())
+				default:
+					writeProtocolError(w, canReq.Protocol, http.StatusBadGateway, err.Error())
 				}
 				return
 			}
@@ -2602,27 +2702,31 @@ func (gs *GatewayServer) streamOrCollectWorkerOutput(
 			if needAsyncTranscriptSync {
 				go gs.reconcileAuditWithTranscript(reqID, canReq, savedMeta, sess, sess.AccountID, acpSessID, lastStepIdx, compTokens, effectiveFirstByteMs, "")
 			}
+			stopReason := sess.LastStopReason()
 			if canReq.Stream {
 				clientThinking := fullThinking.String()
 				if suppressClientThinking {
 					clientThinking = ""
 				}
 				if oaSSE != nil {
+					oaSSE.SetStopReason(stopReason)
 					oaSSE.WriteStopWithUsage(clientInputTokens, clientCachedTokens, compTokens)
 				} else if oaRespSSE != nil {
+					oaRespSSE.SetStopReason(stopReason)
 					oaRespSSE.WriteStopWithCache(clientThinking, fullText.String(), clientInputTokens, clientCachedTokens, compTokens)
 				} else if clSSE != nil {
+					clSSE.SetStopReason(stopReason)
 					clSSE.WriteStopWithUsage(clientInputTokens, clientCachedTokens, compTokens)
 				}
 				return
 			}
 			switch canReq.Protocol {
 			case "openai":
-				writeJSON(w, http.StatusOK, adapter.BuildOpenAIJSONResponseMulti(reqID, canReq.Model, fullThinking.String(), fullText.String(), nil, clientInputTokens, clientCachedTokens, compTokens))
+				writeJSON(w, http.StatusOK, adapter.ApplyOpenAIStopReason(adapter.BuildOpenAIJSONResponseMulti(reqID, canReq.Model, fullThinking.String(), fullText.String(), nil, clientInputTokens, clientCachedTokens, compTokens), stopReason))
 			case "openai_responses":
-				writeJSON(w, http.StatusOK, adapter.BuildOpenAIResponsesJSONResponseMulti(reqID, canReq.Model, fullThinking.String(), fullText.String(), nil, clientInputTokens, clientCachedTokens, compTokens))
+				writeJSON(w, http.StatusOK, adapter.ApplyResponsesStopReason(adapter.BuildOpenAIResponsesJSONResponseMulti(reqID, canReq.Model, fullThinking.String(), fullText.String(), nil, clientInputTokens, clientCachedTokens, compTokens), stopReason))
 			default:
-				writeJSON(w, http.StatusOK, adapter.BuildClaudeJSONResponseMulti(reqID, canReq.Model, fullThinking.String(), fullText.String(), nil, clientInputTokens, clientCachedTokens, compTokens))
+				writeJSON(w, http.StatusOK, adapter.ApplyClaudeStopReason(adapter.BuildClaudeJSONResponseMulti(reqID, canReq.Model, fullThinking.String(), fullText.String(), nil, clientInputTokens, clientCachedTokens, compTokens), stopReason))
 			}
 			return
 

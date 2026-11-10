@@ -16,21 +16,21 @@ type claudeRawRequest struct {
 	ReasoningEffort string          `json:"reasoning_effort"`
 	Effort          string          `json:"effort"`
 	Reasoning       *struct {
-		Effort    string `json:"effort"`
-		MaxTokens int    `json:"max_tokens"`
+		Effort    string    `json:"effort"`
+		MaxTokens flexInt64 `json:"max_tokens"`
 	} `json:"reasoning"`
 	Thinking *struct {
-		Type         string `json:"type"`
-		BudgetTokens int    `json:"budget_tokens"`
-		Effort       string `json:"effort"`
+		Type         string    `json:"type"`
+		BudgetTokens flexInt64 `json:"budget_tokens"`
+		Effort       string    `json:"effort"`
 	} `json:"thinking"`
 	OutputConfig *struct {
 		Effort string `json:"effort"`
 	} `json:"output_config"`
-	ContextWindow      int64              `json:"context_window"`
-	ModelContextWindow int64              `json:"model_context_window"`
-	MaxInputTokens     int64              `json:"max_input_tokens"`
-	MaxContextTokens   int64              `json:"max_context_tokens"`
+	ContextWindow      flexInt64          `json:"context_window"`
+	ModelContextWindow flexInt64          `json:"model_context_window"`
+	MaxInputTokens     flexInt64          `json:"max_input_tokens"`
+	MaxContextTokens   flexInt64          `json:"max_context_tokens"`
 	SessionID          string             `json:"session_id"`
 	ConversationID     string             `json:"conversation_id"`
 	Metadata           map[string]any     `json:"metadata"`
@@ -71,7 +71,7 @@ func ParseClaudeRequest(body []byte, sessionHeader string) (*CanonicalRequest, e
 			effort = strings.TrimSpace(raw.Reasoning.Effort)
 		}
 		if budget == 0 && raw.Reasoning.MaxTokens > 0 {
-			budget = raw.Reasoning.MaxTokens
+			budget = int(raw.Reasoning.MaxTokens)
 		}
 	}
 	if raw.Thinking != nil {
@@ -79,7 +79,7 @@ func ParseClaudeRequest(body []byte, sessionHeader string) (*CanonicalRequest, e
 			effort = strings.TrimSpace(raw.Thinking.Effort)
 		}
 		if budget == 0 && raw.Thinking.BudgetTokens > 0 {
-			budget = raw.Thinking.BudgetTokens
+			budget = int(raw.Thinking.BudgetTokens)
 		}
 		if effort == "" && budget == 0 && strings.TrimSpace(raw.Thinking.Type) != "" {
 			effort = strings.TrimSpace(raw.Thinking.Type)
@@ -100,7 +100,7 @@ func ParseClaudeRequest(body []byte, sessionHeader string) (*CanonicalRequest, e
 		Model:           cleanModel,
 		Stream:          raw.Stream,
 		ThinkingLevel:   finalThinking,
-		ContextWindow:   ExtractContextWindowFromMetadata(raw.Metadata, raw.ContextWindow, raw.ModelContextWindow, raw.MaxContextTokens, raw.MaxInputTokens),
+		ContextWindow:   ExtractContextWindowFromMetadata(raw.Metadata, int64(raw.ContextWindow), int64(raw.ModelContextWindow), int64(raw.MaxContextTokens), int64(raw.MaxInputTokens)),
 		SessionHeader:   effSession,
 		ClientSessionID: clientSessID,
 		SystemPrompt:    parseClaudeSystemField(raw.System),
@@ -113,24 +113,17 @@ func ParseClaudeRequest(body []byte, sessionHeader string) (*CanonicalRequest, e
 	}
 
 	var lastUserBlocks []acp.PromptBlock
-	lastHadToolResults := false
 	for _, m := range raw.Messages {
 		text, blocks, toolResults := parseClaudeContentBlocks(m.Content)
-		if len(toolResults) > 0 {
+		switch {
+		case len(toolResults) > 0:
 			req.ToolResults = append(req.ToolResults, toolResults...)
-			lastHadToolResults = true
-		} else if m.Role == "user" && lastHadToolResults && len(req.ToolResults) > 0 {
-			if text != "" {
-				lastIdx := len(req.ToolResults) - 1
-				if req.ToolResults[lastIdx].Content != "" {
-					req.ToolResults[lastIdx].Content += "\n\n" + text
-				} else {
-					req.ToolResults[lastIdx].Content = text
-				}
-			}
-		} else {
+		case m.Role == "user" && len(req.ToolResults) > 0:
+			// A user message directly following tool results (e.g. injected <turn-context>)
+			// belongs to the same turn and is carried along with the last tool result.
+			appendToLastToolResult(req.ToolResults, blocksAsToolResultText(blocks))
+		default:
 			req.ToolResults = nil
-			lastHadToolResults = false
 		}
 		req.Messages = append(req.Messages, CanonicalMessage{
 			Role:    m.Role,
@@ -148,6 +141,9 @@ func ParseClaudeRequest(body []byte, sessionHeader string) (*CanonicalRequest, e
 		}
 	}
 	req.PromptBlocks = lastUserBlocks
+	if len(req.ToolResults) > 0 {
+		req.PromptBlocks = toolResultsPromptBlocks(req.ToolResults)
+	}
 	req.SessionTitle = ExtractSessionTitleFromMessages(raw.Metadata, req.SystemPrompt, req.Messages)
 	req.HistoryHashBefore, req.HistoryHashFull = ComputeHistoryHashes(req.SystemPrompt, req.Messages)
 	return req, nil
@@ -177,6 +173,9 @@ func parseClaudeSystemField(raw json.RawMessage) string {
 	return ""
 }
 
+// parseClaudeContentBlocks returns the history text, the prompt blocks and the tool results
+// of a message. Text, image and document blocks that sit next to tool_result blocks are
+// appended to the last tool result so they survive the tool-resume path.
 func parseClaudeContentBlocks(raw json.RawMessage) (string, []acp.PromptBlock, []CanonicalToolResult) {
 	if len(raw) == 0 {
 		return "", nil, nil
@@ -209,9 +208,8 @@ func parseClaudeContentBlocks(raw json.RawMessage) (string, []acp.PromptBlock, [
 			}
 		case "tool_use":
 			tName, _ := item["name"].(string)
-			inRaw, _ := json.Marshal(item["input"])
 			if tName != "" {
-				texts = append(texts, tName+"("+string(inRaw)+")")
+				texts = append(texts, tName+"("+normalizeToolArgs(argsToJSONString(item["input"]))+")")
 			}
 		case "image":
 			if src, ok := item["source"].(map[string]any); ok {
@@ -237,28 +235,7 @@ func parseClaudeContentBlocks(raw json.RawMessage) (string, []acp.PromptBlock, [
 				}
 			}
 		case "document":
-			title, _ := item["title"].(string)
-			if title == "" {
-				title = "document.txt"
-			}
-			if src, ok := item["source"].(map[string]any); ok {
-				srcType, _ := src["type"].(string)
-				mediaType, _ := src["media_type"].(string)
-				data, _ := src["data"].(string)
-				res := &acp.EmbeddedResource{
-					URI:      "file:///" + title,
-					MimeType: mediaType,
-				}
-				if srcType == "base64" {
-					res.Blob = data
-				} else {
-					res.Text = data
-				}
-				blocks = append(blocks, acp.PromptBlock{
-					Type:     "resource",
-					Resource: res,
-				})
-			}
+			blocks = append(blocks, claudeDocumentBlock(item))
 		case "tool_result":
 			callID, _ := item["tool_use_id"].(string)
 			isErr, _ := item["is_error"].(bool)
@@ -271,26 +248,128 @@ func parseClaudeContentBlocks(raw json.RawMessage) (string, []acp.PromptBlock, [
 			texts = append(texts, contentStr)
 		}
 	}
+	if len(results) > 0 {
+		appendToLastToolResult(results, blocksAsToolResultText(blocks))
+	}
 	return strings.Join(texts, "\n"), blocks, results
+}
+
+func claudeDocumentBlock(item map[string]any) acp.PromptBlock {
+	title, _ := item["title"].(string)
+	name := strings.TrimSpace(title)
+	if name == "" {
+		name = "document"
+	}
+	placeholder := func(label string) acp.PromptBlock {
+		return acp.PromptBlock{Type: "text", Text: fmt.Sprintf("[document attachment: %s not available]", label)}
+	}
+	src, ok := item["source"].(map[string]any)
+	if !ok {
+		return placeholder(name)
+	}
+	srcType, _ := src["type"].(string)
+	mediaType, _ := src["media_type"].(string)
+	data, _ := src["data"].(string)
+	switch srcType {
+	case "base64":
+		if data == "" {
+			return placeholder(name)
+		}
+		return acp.PromptBlock{
+			Type:     "resource",
+			Resource: &acp.EmbeddedResource{URI: fileURI(name), MimeType: mediaType, Blob: data},
+		}
+	case "text":
+		if data == "" {
+			return placeholder(name)
+		}
+		if mediaType == "" {
+			mediaType = "text/plain"
+		}
+		return acp.PromptBlock{
+			Type:     "resource",
+			Resource: &acp.EmbeddedResource{URI: fileURI(name), MimeType: mediaType, Text: data},
+		}
+	case "content":
+		text := extractClaudeToolResultContent(src["content"])
+		if strings.TrimSpace(text) == "" {
+			return placeholder(name)
+		}
+		return acp.PromptBlock{
+			Type:     "resource",
+			Resource: &acp.EmbeddedResource{URI: fileURI(name), MimeType: "text/plain", Text: text},
+		}
+	case "url":
+		urlStr, _ := src["url"].(string)
+		if strings.TrimSpace(urlStr) == "" {
+			return placeholder(name)
+		}
+		return acp.PromptBlock{Type: "resource_link", URI: strings.TrimSpace(urlStr), Name: name, MimeType: mediaType}
+	case "file":
+		if fid, _ := src["file_id"].(string); strings.TrimSpace(fid) != "" {
+			return placeholder(strings.TrimSpace(fid))
+		}
+	}
+	return placeholder(name)
 }
 
 func extractClaudeToolResultContent(v any) string {
 	switch val := v.(type) {
+	case nil:
+		return ""
 	case string:
 		return val
 	case []any:
 		var parts []string
 		for _, elem := range val {
-			if m, ok := elem.(map[string]any); ok {
-				if t, ok := m["text"].(string); ok {
-					parts = append(parts, t)
+			switch e := elem.(type) {
+			case string:
+				parts = append(parts, e)
+			case map[string]any:
+				typ, _ := e["type"].(string)
+				switch typ {
+				case "image":
+					mediaType := "image"
+					if src, ok := e["source"].(map[string]any); ok {
+						if mt, _ := src["media_type"].(string); mt != "" {
+							mediaType = mt
+						}
+					}
+					parts = append(parts, fmt.Sprintf("[image omitted: %s]", mediaType))
+				case "document":
+					if b := claudeDocumentBlock(e); b.Type == "text" {
+						parts = append(parts, b.Text)
+					} else if d := describeNonTextBlock(b); d != "" {
+						parts = append(parts, d)
+					}
+				default:
+					if t, ok := e["text"].(string); ok {
+						parts = append(parts, t)
+					}
 				}
 			}
 		}
 		return strings.Join(parts, "\n")
+	case map[string]any:
+		if t, ok := val["text"].(string); ok {
+			return t
+		}
+		raw, _ := json.Marshal(val)
+		return string(raw)
 	default:
 		raw, _ := json.Marshal(v)
 		return string(raw)
+	}
+}
+
+func claudeStopReasonForStop(acpStopReason string) string {
+	switch normalizeACPStopReason(acpStopReason) {
+	case "max_tokens", "max_turn_requests":
+		return "max_tokens"
+	case "refusal":
+		return "refusal"
+	default:
+		return "end_turn"
 	}
 }
 
@@ -302,7 +381,11 @@ type ClaudeSSEWriter struct {
 	currentBlock string // "" | "thinking" | "text"
 	blockIdx     int
 	hasOpenBlock bool
+	anyBlock     bool
 	textStarted  bool
+	finished     bool
+	stopReason   string
+	inputTokens  int64
 }
 
 func NewClaudeSSEWriter(w http.ResponseWriter, msgID, model string) *ClaudeSSEWriter {
@@ -329,7 +412,24 @@ func (c *ClaudeSSEWriter) writeEvent(event string, data any) {
 	}
 }
 
+// SetInputTokens sets the input token count reported in message_start; it only takes
+// effect when called before WriteStart.
+func (c *ClaudeSSEWriter) SetInputTokens(n int64) {
+	if n < 0 {
+		n = 0
+	}
+	c.inputTokens = n
+}
+
+// SetStopReason records the ACP stop reason used by subsequent non-tool finish writes.
+func (c *ClaudeSSEWriter) SetStopReason(acpStopReason string) {
+	c.stopReason = acpStopReason
+}
+
 func (c *ClaudeSSEWriter) WriteStart() {
+	if c.finished {
+		return
+	}
 	c.writeEvent("message_start", map[string]any{
 		"type": "message_start",
 		"message": map[string]any{
@@ -341,7 +441,7 @@ func (c *ClaudeSSEWriter) WriteStart() {
 			"stop_reason":   nil,
 			"stop_sequence": nil,
 			"usage": map[string]any{
-				"input_tokens":  0,
+				"input_tokens":  c.inputTokens,
 				"output_tokens": 0,
 			},
 		},
@@ -349,25 +449,44 @@ func (c *ClaudeSSEWriter) WriteStart() {
 }
 
 func (c *ClaudeSSEWriter) WriteKeepAlive() {
+	if c.finished {
+		return
+	}
 	c.writeEvent("ping", map[string]any{"type": "ping"})
+}
+
+func (c *ClaudeSSEWriter) closeOpenBlock() {
+	if !c.hasOpenBlock {
+		return
+	}
+	if c.currentBlock == "thinking" {
+		c.writeEvent("content_block_delta", map[string]any{
+			"type":  "content_block_delta",
+			"index": c.blockIdx,
+			"delta": map[string]any{
+				"type":      "signature_delta",
+				"signature": "",
+			},
+		})
+	}
+	c.writeEvent("content_block_stop", map[string]any{
+		"type":  "content_block_stop",
+		"index": c.blockIdx,
+	})
+	c.blockIdx++
+	c.hasOpenBlock = false
+	c.currentBlock = ""
 }
 
 func (c *ClaudeSSEWriter) ensureBlockType(blockType string) {
 	if c.hasOpenBlock && c.currentBlock == blockType {
 		return
 	}
-	if c.hasOpenBlock {
-		c.writeEvent("content_block_stop", map[string]any{
-			"type":  "content_block_stop",
-			"index": c.blockIdx,
-		})
-		c.blockIdx++
-		c.hasOpenBlock = false
-	}
+	c.closeOpenBlock()
 
 	var contentBlock map[string]any
 	if blockType == "thinking" {
-		contentBlock = map[string]any{"type": "thinking", "thinking": ""}
+		contentBlock = map[string]any{"type": "thinking", "thinking": "", "signature": ""}
 	} else {
 		contentBlock = map[string]any{"type": "text", "text": ""}
 	}
@@ -378,10 +497,11 @@ func (c *ClaudeSSEWriter) ensureBlockType(blockType string) {
 	})
 	c.currentBlock = blockType
 	c.hasOpenBlock = true
+	c.anyBlock = true
 }
 
 func (c *ClaudeSSEWriter) WriteThinkingDelta(thinking string) {
-	if thinking == "" || c.textStarted {
+	if thinking == "" || c.textStarted || c.finished {
 		return
 	}
 	c.ensureBlockType("thinking")
@@ -396,7 +516,7 @@ func (c *ClaudeSSEWriter) WriteThinkingDelta(thinking string) {
 }
 
 func (c *ClaudeSSEWriter) WriteTextDelta(text string) {
-	if text == "" {
+	if text == "" || c.finished {
 		return
 	}
 	c.textStarted = true
@@ -432,20 +552,31 @@ func buildClaudeUsageMap(inputTokens, cachedTokens, outputTokens int64) map[stri
 	}
 }
 
-func (c *ClaudeSSEWriter) WriteToolUsesAndStopWithUsage(calls []CanonicalToolCall, inputTokens, cachedTokens, outputTokens int64) {
-	if c.hasOpenBlock {
-		c.writeEvent("content_block_stop", map[string]any{
-			"type":  "content_block_stop",
-			"index": c.blockIdx,
-		})
-		c.blockIdx++
-		c.hasOpenBlock = false
-	}
+func (c *ClaudeSSEWriter) writeMessageEnd(stopReason string, inputTokens, cachedTokens, outputTokens int64) {
+	c.writeEvent("message_delta", map[string]any{
+		"type": "message_delta",
+		"delta": map[string]any{
+			"stop_reason":   stopReason,
+			"stop_sequence": nil,
+		},
+		"usage": buildClaudeUsageMap(inputTokens, cachedTokens, outputTokens),
+	})
+	c.writeEvent("message_stop", map[string]any{"type": "message_stop"})
+	c.finished = true
+}
 
-	for _, call := range calls {
-		if call.CallID == "" || call.ToolName == "" {
-			continue
-		}
+func (c *ClaudeSSEWriter) WriteToolUsesAndStopWithUsage(calls []CanonicalToolCall, inputTokens, cachedTokens, outputTokens int64) {
+	if c.finished {
+		return
+	}
+	valid := validToolCalls(calls)
+	if len(valid) == 0 {
+		c.WriteStopWithUsage(inputTokens, cachedTokens, outputTokens)
+		return
+	}
+	c.closeOpenBlock()
+
+	for _, call := range valid {
 		c.writeEvent("content_block_start", map[string]any{
 			"type":  "content_block_start",
 			"index": c.blockIdx,
@@ -469,16 +600,9 @@ func (c *ClaudeSSEWriter) WriteToolUsesAndStopWithUsage(calls []CanonicalToolCal
 			"index": c.blockIdx,
 		})
 		c.blockIdx++
+		c.anyBlock = true
 	}
-	c.writeEvent("message_delta", map[string]any{
-		"type": "message_delta",
-		"delta": map[string]any{
-			"stop_reason":   "tool_use",
-			"stop_sequence": nil,
-		},
-		"usage": buildClaudeUsageMap(inputTokens, cachedTokens, outputTokens),
-	})
-	c.writeEvent("message_stop", map[string]any{"type": "message_stop"})
+	c.writeMessageEnd("tool_use", inputTokens, cachedTokens, outputTokens)
 }
 
 func (c *ClaudeSSEWriter) WriteToolUsesAndStop(calls []CanonicalToolCall) {
@@ -492,27 +616,35 @@ func (c *ClaudeSSEWriter) WriteToolUseAndStop(callID, toolName, argsJSON string)
 }
 
 func (c *ClaudeSSEWriter) WriteStopWithUsage(inputTokens, cachedTokens, outputTokens int64) {
-	if !c.hasOpenBlock {
+	if c.finished {
+		return
+	}
+	if !c.anyBlock {
 		c.ensureBlockType("text")
 	}
-	c.writeEvent("content_block_stop", map[string]any{
-		"type":  "content_block_stop",
-		"index": c.blockIdx,
-	})
-	c.hasOpenBlock = false
-	c.writeEvent("message_delta", map[string]any{
-		"type": "message_delta",
-		"delta": map[string]any{
-			"stop_reason":   "end_turn",
-			"stop_sequence": nil,
-		},
-		"usage": buildClaudeUsageMap(inputTokens, cachedTokens, outputTokens),
-	})
-	c.writeEvent("message_stop", map[string]any{"type": "message_stop"})
+	c.closeOpenBlock()
+	c.writeMessageEnd(claudeStopReasonForStop(c.stopReason), inputTokens, cachedTokens, outputTokens)
 }
 
 func (c *ClaudeSSEWriter) WriteStop() {
 	c.WriteStopWithUsage(0, 0, 1)
+}
+
+// WriteError closes any open content block and terminates the stream with an `error`
+// event. It is a no-op once the stream has already been finished.
+func (c *ClaudeSSEWriter) WriteError(message string) {
+	if c.finished {
+		return
+	}
+	c.closeOpenBlock()
+	c.writeEvent("error", map[string]any{
+		"type": "error",
+		"error": map[string]any{
+			"type":    "api_error",
+			"message": message,
+		},
+	})
+	c.finished = true
 }
 
 func BuildClaudeJSONResponse(msgID, model, thinking, text, toolCallID, toolName, toolArgs string) map[string]any {
@@ -524,35 +656,35 @@ func BuildClaudeJSONResponse(msgID, model, thinking, text, toolCallID, toolName,
 }
 
 func BuildClaudeJSONResponseMulti(msgID, model, thinking, text string, calls []CanonicalToolCall, usageOverride ...int64) map[string]any {
-	var content []map[string]any
+	valid := validToolCalls(calls)
+	content := []map[string]any{}
 	if thinking != "" {
 		content = append(content, map[string]any{
-			"type":     "thinking",
-			"thinking": thinking,
+			"type":      "thinking",
+			"thinking":  thinking,
+			"signature": "",
 		})
 	}
-	if text != "" || (len(calls) == 0 && len(content) == 0) {
+	if text != "" || (len(valid) == 0 && len(content) == 0) {
 		content = append(content, map[string]any{
 			"type": "text",
 			"text": text,
 		})
 	}
 	stopReason := "end_turn"
-	for _, call := range calls {
-		if call.CallID != "" && call.ToolName != "" {
-			stopReason = "tool_use"
-			var inputObj map[string]any
-			_ = json.Unmarshal([]byte(call.ArgsJSON), &inputObj)
-			if inputObj == nil {
-				inputObj = map[string]any{}
-			}
-			content = append(content, map[string]any{
-				"type":  "tool_use",
-				"id":    call.CallID,
-				"name":  call.ToolName,
-				"input": inputObj,
-			})
+	for _, call := range valid {
+		stopReason = "tool_use"
+		var inputObj map[string]any
+		_ = json.Unmarshal([]byte(call.ArgsJSON), &inputObj)
+		if inputObj == nil {
+			inputObj = map[string]any{}
 		}
+		content = append(content, map[string]any{
+			"type":  "tool_use",
+			"id":    call.CallID,
+			"name":  call.ToolName,
+			"input": inputObj,
+		})
 	}
 	var inputTok, cachedTok, outputTok int64
 	if len(usageOverride) >= 1 && usageOverride[0] > 0 {
@@ -574,4 +706,14 @@ func BuildClaudeJSONResponseMulti(msgID, model, thinking, text string, calls []C
 		"stop_sequence": nil,
 		"usage":         buildClaudeUsageMap(inputTok, cachedTok, outputTok),
 	}
+}
+
+// ApplyClaudeStopReason maps an ACP stop reason onto a response built by
+// BuildClaudeJSONResponseMulti. A `tool_use` stop reason is left untouched.
+func ApplyClaudeStopReason(resp map[string]any, acpStopReason string) map[string]any {
+	if resp == nil || resp["stop_reason"] == "tool_use" {
+		return resp
+	}
+	resp["stop_reason"] = claudeStopReasonForStop(acpStopReason)
+	return resp
 }

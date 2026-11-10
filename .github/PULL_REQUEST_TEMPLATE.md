@@ -29,10 +29,10 @@
 
 ## Verification & Self-Check / 测试验证与自检清单
 
-- [ ] **Go Tests / 后端测试**: `go test ./...` passes cleanly / 全部通过
+- [ ] **Go Tests / 后端测试**: `go test -race ./...` passes cleanly / 全部通过
 - [ ] **Web Build / 前端构建**: `cd web && npm run build` succeeds with zero TypeScript errors / 零错误通过构建
 - [ ] **No Fallback Workarounds / 无兜底硬编码逻辑**: Confirmed the change fixes the root cause directly without silent fallbacks or fabricated defaults / 确认直击根因，未引入静默降级或伪造默认值
-- [ ] **Bilingual Sync / 中英双语同步**: Updated both Chinese and English UI strings (`web/src/i18n.tsx`) and docs (`README.md` & `README_EN.md`) where applicable / 界面文案与文档已保持中英双语同步
-- [ ] **ReUI Design Rules / ReUI 规范检查**: If `web/` was modified, verified compliance with `AGENTS.md` (semantic tokens, `gap-*` spacing, empty/loading/error states) / 前端修改已符合 `AGENTS.md` 中的 ReUI 设计规范
+- [ ] **Bilingual Sync / 中英双语同步**: Updated both Chinese and English UI strings (`web/src/i18n.ts`) and docs (`README.md` & `README_EN.md`) where applicable / 界面文案与文档已保持中英双语同步
+- [ ] **ReUI Design Rules / ReUI 规范检查**: If `web/` was modified, verified ReUI compliance (installed components, semantic tokens, `gap-*` spacing, empty/loading/error states; see `CONTRIBUTING.md`) / 前端修改已符合 `CONTRIBUTING.md` 中的 ReUI 设计规范
 - [ ] **Security & Credentials / 安全脱敏**: No real API keys (`sk-ag-*`), OAuth tokens, or `data/` files are included / 未包含任何真实密钥或凭据文件
 - [ ] **License / 开源协议**: I agree that my contribution is licensed under the [GNU GPL v3.0](./LICENSE) / 我同意所提交的代码按本项目 [GNU GPL v3.0](./LICENSE) 协议开源授权

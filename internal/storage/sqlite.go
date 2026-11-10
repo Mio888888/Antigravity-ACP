@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,6 +21,8 @@ import (
 
 	_ "modernc.org/sqlite"
 )
+
+var accountIDPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
 
 type Store struct {
 	db            *sql.DB
@@ -204,6 +207,9 @@ func ValidateAccount(acc *Account) error {
 	if acc.ID == "" {
 		return fmt.Errorf("account id is required")
 	}
+	if !accountIDPattern.MatchString(acc.ID) || acc.ID == "." || acc.ID == ".." {
+		return fmt.Errorf("invalid account id %q (allowed: letters, digits, '.', '_', '-', 1-64 chars)", acc.ID)
+	}
 	if acc.Name == "" {
 		acc.Name = acc.ID
 	}
@@ -302,10 +308,12 @@ func unmarshalDisabledModels(raw string) []string {
 }
 
 func (s *Store) UpsertAccount(acc Account) (*Account, error) {
-	if acc.DisabledModels == nil {
-		if existing, err := s.GetAccount(acc.ID); err == nil && existing != nil {
+	acc.ID = strings.TrimSpace(acc.ID)
+	if existing, err := s.GetAccount(acc.ID); err == nil && existing != nil {
+		if acc.DisabledModels == nil {
 			acc.DisabledModels = existing.DisabledModels
 		}
+		acc.ProxyURL = RestoreMaskedProxyURL(acc.ProxyURL, existing.ProxyURL)
 	}
 	if err := ValidateAccount(&acc); err != nil {
 		return nil, err
@@ -595,27 +603,36 @@ SELECT id, key_hash, key_prefix, name, bound_account_id, rate_limit_rpm,
        COALESCE(disable_builtin_tools, 1),
        enabled, created_at
 FROM api_keys WHERE enabled = 1`)
-	if err == nil {
-		defer rows.Close()
-		for rows.Next() {
-			var rec APIKey
-			if rows.Scan(
-				&rec.ID, &rec.KeyHash, &rec.KeyPrefix, &rec.Name, &rec.BoundAccountID, &rec.RateLimitRPM,
-				&rec.PromptMode, &rec.SessionMode, &rec.GlobalPrependPrompt, &rec.DisableBuiltinTools,
-				&rec.Enabled, &rec.CreatedAt,
-			) == nil {
-				m[rec.KeyHash] = rec
-			}
-		}
-		s.apiKeysByHash = m
-		s.apiKeysLoaded = true
+	if err != nil {
+		return
 	}
+	defer rows.Close()
+	for rows.Next() {
+		var rec APIKey
+		if rows.Scan(
+			&rec.ID, &rec.KeyHash, &rec.KeyPrefix, &rec.Name, &rec.BoundAccountID, &rec.RateLimitRPM,
+			&rec.PromptMode, &rec.SessionMode, &rec.GlobalPrependPrompt, &rec.DisableBuiltinTools,
+			&rec.Enabled, &rec.CreatedAt,
+		) == nil {
+			m[rec.KeyHash] = rec
+		}
+	}
+	if rows.Err() != nil {
+		return
+	}
+	s.apiKeysByHash = m
+	s.apiKeysLoaded = true
 }
 
+// HasAnyAPIKeys reports whether at least one enabled API key exists. It fails
+// closed (returns true) if the key table could not be read.
 func (s *Store) HasAnyAPIKeys() bool {
 	s.ensureAPIKeysCacheLoaded()
 	s.cacheMu.RLock()
 	defer s.cacheMu.RUnlock()
+	if !s.apiKeysLoaded {
+		return true
+	}
 	return len(s.apiKeysByHash) > 0
 }
 

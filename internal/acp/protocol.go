@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -22,15 +23,37 @@ func (e *RPCError) Error() string {
 	return fmt.Sprintf("acp rpc error (%d): %s", e.Code, e.Message)
 }
 
+// authMessageKeywords are matched against -32000 messages, which the agent also uses
+// for generic server errors.
+var authMessageKeywords = []string{"auth", "login", "log in", "logged in", "credential", "sign in", "sign-in", "signin", "unauthenticated"}
+
+var authErrorPhrases = []string{"authentication required", "not logged in", "please log in", "unauthenticated"}
+
+// IsAuthRequiredError reports whether err means the agent account needs (re-)login.
+// Proxy authentication failures are never classified as account auth errors.
 func IsAuthRequiredError(err error) bool {
 	if err == nil {
 		return false
 	}
+	full := strings.ToLower(err.Error())
+	if strings.Contains(full, "proxy authentication") {
+		return false
+	}
 	var rpcErr *RPCError
 	if errors.As(err, &rpcErr) && rpcErr.Code == ErrCodeAuthRequired {
-		return true
+		msg := strings.ToLower(rpcErr.Message)
+		for _, kw := range authMessageKeywords {
+			if strings.Contains(msg, kw) {
+				return true
+			}
+		}
 	}
-	return strings.Contains(strings.ToLower(err.Error()), "authentication required")
+	for _, phrase := range authErrorPhrases {
+		if strings.Contains(full, phrase) {
+			return true
+		}
+	}
+	return false
 }
 
 func IsResourceNotFoundError(err error) bool {
@@ -340,6 +363,12 @@ func ExtractModelsFromSessionResult(res *NewSessionResult) []ModelInfo {
 
 	if res.Models != nil {
 		baseVariantCounts := make(map[string]int)
+		availableIDs := make(map[string]bool)
+		for _, m := range res.Models.AvailableModels {
+			if rawID := strings.TrimSpace(m.ModelID); rawID != "" {
+				availableIDs[rawID] = true
+			}
+		}
 		for _, m := range res.Models.AvailableModels {
 			rawID := strings.TrimSpace(m.ModelID)
 			if base, lv, ok := splitThinkingSuffix(rawID, globalThinkingLevels); ok {
@@ -357,8 +386,9 @@ func ExtractModelsFromSessionResult(res *NewSessionResult) []ModelInfo {
 				continue
 			}
 			if base, _, ok := splitThinkingSuffix(rawID, globalThinkingLevels); ok {
-				if _, baseExists := seen[base]; baseExists {
-					// Already have the clean base model from configOptions[id="model"]; ignore suffixed duplicate.
+				if _, baseExists := seen[base]; baseExists || availableIDs[base] {
+					// The clean base model comes from configOptions[id="model"] or is itself listed in
+					// availableModels (possibly later); ignore the suffixed duplicate either way.
 					continue
 				}
 				if baseVariantCounts[base] > 1 {
@@ -382,29 +412,30 @@ func ExtractModelsFromSessionResult(res *NewSessionResult) []ModelInfo {
 			return levels
 		}
 		canonicalOrder := map[string]int{
-			"minimal": 1,
-			"low":     2,
-			"medium":  3,
-			"high":    4,
-			"xhigh":   5,
-			"max":     6,
+			"minimal":    1,
+			"low":        2,
+			"medium":     3,
+			"high":       4,
+			"xhigh":      5,
+			"extra_high": 5,
+			"max":        6,
 		}
-		sorted := make([]string, len(levels))
-		copy(sorted, levels)
-		for i := 0; i < len(sorted); i++ {
-			for j := i + 1; j < len(sorted); j++ {
-				oi, okI := canonicalOrder[sorted[i]]
-				if !okI {
-					oi = 100 + i
-				}
-				oj, okJ := canonicalOrder[sorted[j]]
-				if !okJ {
-					oj = 100 + j
-				}
-				if oi > oj {
-					sorted[i], sorted[j] = sorted[j], sorted[i]
-				}
+		type rankedLevel struct {
+			level string
+			rank  int
+		}
+		ranked := make([]rankedLevel, len(levels))
+		for i, lv := range levels {
+			rank, ok := canonicalOrder[strings.ToLower(strings.TrimSpace(lv))]
+			if !ok {
+				rank = 100 + i
 			}
+			ranked[i] = rankedLevel{level: lv, rank: rank}
+		}
+		sort.SliceStable(ranked, func(i, j int) bool { return ranked[i].rank < ranked[j].rank })
+		sorted := make([]string, len(ranked))
+		for i, r := range ranked {
+			sorted[i] = r.level
 		}
 		return sorted
 	}
@@ -522,6 +553,14 @@ func (c *ContentBlock) UnmarshalJSON(data []byte) error {
 			text = plain.Content.Text
 		}
 		*c = ContentBlock{Type: plain.Type, Text: text}
+		return nil
+	}
+	if strings.HasPrefix(trimmed, `"`) {
+		var s string
+		if err := json.Unmarshal(data, &s); err != nil {
+			return err
+		}
+		*c = ContentBlock{Type: "text", Text: s}
 		return nil
 	}
 	if strings.HasPrefix(trimmed, "[") {

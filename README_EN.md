@@ -16,8 +16,8 @@
    - **Native ACP WebSocket Bridge**: `WS /v1/acp/ws`.
 
 2. **Selectable Dual ACP Backend Engine with Auto-Download (Default: `cli`)**
-   - **`cli` Mode (Default)**: Runs the official Antigravity CLI (`agy acp` / `antigravity acp`) with full CLI flag support (`--process-per-session`, `--sandbox`, etc.). One-click deployment automatically downloads and **SHA-512 verifies** the native `agy` binary for your OS/Arch (`darwin/linux/windows`, `amd64/arm64`) if not already installed.
-   - **`zed` / `zen` Mode**: Runs Zed's standalone Antigravity ACP server package (`agy_acp_server.par` / `agy_acp_server` / `agy_acp_server.exe`), also supporting automatic download and **SHA-256 verification** from the ACP Registry when missing.
+   - **`cli` Mode (Default)**: Runs the official Antigravity CLI (`agy acp` / `antigravity acp`) with full CLI flag support (`--process-per-session`, `--sandbox`, etc.). One-click deployment automatically downloads and **SHA-512 verifies** the native `agy` binary for your OS/Arch (`darwin/linux/windows`, `amd64/arm64`) from the official manifest if not already installed. Verification **fails closed**: a missing hash, missing hashing tool or unreachable manifest is an error, and a hash mismatch is always fatal.
+   - **`zed` / `zen` Mode**: Runs Zed's standalone Antigravity ACP server package (`agy_acp_server.par` / `agy_acp_server` / `agy_acp_server.exe`). Automatic download requires a **pinned SHA-256** via `ZED_ACP_SHA256` (or `--zed-sha256`); without it the scripts refuse to install.
    - **`auto` Discovery Mode**: Automatically locates the installed `agy` CLI or Zed ACP extension package across macOS, Windows, Linux, and Docker containers, with built-in binary header (ELF / Mach-O / PE) validation to prevent cross-OS mount conflicts.
 
 3. **4-Layer Sticky Session & Worker Process Affinity**
@@ -49,9 +49,11 @@ The gateway uses a pure-Go SQLite engine (`CGO_ENABLED=0`) and embeds the compil
 | **Windows** | `x64 (amd64)`, `ARM64` | Official `windows_amd64` / `windows_arm64` manifest (SHA-512 verified) | Local background, Scheduled Task service, Docker Desktop |
 | **Docker** | `linux/amd64`, `linux/arm64` | Auto-downloaded & verified during `docker build` per container arch | `deploy.sh --mode docker` or `docker compose` |
 
-- **Source Build Prerequisites**: `Go >= 1.23`, `Node.js >= 20` (with `npm`), `python3`, `curl`.
-- **Docker Prerequisites**: Only `Docker` and `Docker Compose` (no Go or Node.js needed on the host).
-- **Prebuilt Binary Prerequisites**: Only `curl` and `python3` (for auto-downloading the ACP backend, or zero dependencies if copying the binary directly).
+- **Source Build Prerequisites**: `Go >= 1.27.3` (as pinned in `go.mod`), `Node.js >= 20` (with `npm`), `curl`, and one of `sha512sum` / `shasum` / `openssl` for hash verification; the Zed backend also needs `unzip`.
+- **Docker Prerequisites**: `Docker` and `Docker Compose v2.24+` (no Go or Node.js needed on the host).
+- **Prebuilt Binary Prerequisites**: Only `curl` and one of the hashing tools above (for auto-downloading the ACP backend, or zero dependencies if copying the binary directly).
+
+> **Building from source**: build the console first (`cd web && npm ci && npm run build`), then `go build -tags webui ./cmd/gateway` to embed `web/dist`. A plain `go build ./...` (no `webui` tag) also works on a fresh clone but embeds only a placeholder page saying the console was not built. The deploy scripts, Dockerfile and CI pass the tag automatically.
 
 ---
 
@@ -64,91 +66,140 @@ chmod +x deploy/deploy.sh
 ```
 
 #### A. One-Click Build & Local Background Start (Quickest)
-Defaults to `cli` mode (`agy acp`). If `agy` is not found on the machine, the script automatically detects your OS and CPU architecture (`linux_arm64`, `linux_amd64`, `darwin_arm64`, etc.), downloads the official release package, verifies its SHA-512 checksum, and installs it to `./bin/agy`:
+Defaults to `cli` mode (`agy acp`). If `agy` is not found on the machine, the script automatically detects your OS and CPU architecture (`linux_arm64`, `linux_amd64`, `darwin_arm64`, etc.), downloads the official release package, verifies its SHA-512 checksum, and installs it to `./bin/agy`. After launching, the script polls `/healthz` for up to 20 seconds and only reports success once the gateway is healthy:
 
 ```bash
-./deploy/deploy.sh --mode local --port 8080 --admin-password "your-strong-password" --lang en
+./deploy/deploy.sh --mode local --port 8080 --admin-password-stdin --lang en   # prompts for an initial admin password (optional; omit to auto-generate)
 ```
+
+- The admin password is **never written** to `config/config.yaml`; it is passed to the gateway process only via the `AG_ADMIN_PASSWORD` environment variable. `--admin-password <pwd>` still works but is visible in shell history and `ps`, so the script warns about it.
+- Local mode starts with `umask 077`; the data directory is `0700` and `data/gateway.log` is `0600`.
 
 #### B. Install as a System Service (Linux `systemd` / macOS `launchd` — Recommended for Production)
-On Linux servers (both `x86_64` and `ARM64`), this builds the frontend and Go binaries, auto-downloads the ACP backend, installs binaries to `/usr/local/bin` and config to `/etc/antigravity-gateway/config.yaml`, and enables + starts `antigravity-gateway.service`:
+On Linux servers (both `x86_64` and `ARM64`), this builds the frontend and Go binaries, auto-downloads the ACP backend, and then:
+- creates a dedicated system user `antigravity` (`useradd --system`, home `/var/lib/antigravity-gateway`, `nologin` shell) — the service **no longer runs as root**;
+- installs the gateway and ACP backend into `/usr/local/bin` as root-owned `0755` files (the service always uses `/usr/local/bin/agy`, never a binary from your checkout);
+- installs the config to `/etc/antigravity-gateway/config.yaml` (the previous one is backed up) and writes the admin password to `/etc/antigravity-gateway/env` (`root:root 0600`, loaded via `EnvironmentFile=`);
+- runs `systemctl daemon-reload`, `enable` and `restart` (so redeploys take effect) and waits for `/healthz`.
 
 ```bash
-./deploy/deploy.sh --mode service --port 8080 --admin-password "your-strong-password" --lang en
+./deploy/deploy.sh --mode service --port 8080 --admin-password-stdin --lang en
 ```
 
-Common Linux `systemd` management commands:
+`deploy/antigravity-gateway.service` is sandboxed: `NoNewPrivileges`, `ProtectSystem=strict` (only `/var/lib/antigravity-gateway` is writable), `ProtectHome=tmpfs`, `PrivateTmp`, `PrivateDevices`, `ProtectKernelTunables/Modules/Logs`, `ProtectControlGroups`, `RestrictSUIDSGID`, `LockPersonality`, an empty capability set and `UMask=0077`. Service layout:
+
+| Path | Purpose |
+| :--- | :--- |
+| `/var/lib/antigravity-gateway/data` | `AG_DATA_DIR`: `gateway.db`, `admin_credentials.txt`, per-account directories |
+| `/var/lib/antigravity-gateway/workspace` | `AG_WORKSPACE_DIR`: ACP session workspace (the agent CLI writes here) |
+| `/var/lib/antigravity-gateway/.gemini` | Default account credentials of the service user (`HOME`) |
+
+> Account network mode `netns` relies on `ip netns exec` (needs `CAP_SYS_ADMIN`) and is not available under this hardened unit; use `proxy` or `bind_ip` instead.
+
+Common Linux `systemd` management commands (or `./deploy/deploy.sh --mode service --action start|stop|restart|status`):
 ```bash
 sudo systemctl status antigravity-gateway.service     # Check service status
 sudo journalctl -u antigravity-gateway.service -f     # Tail live gateway logs
 sudo systemctl restart antigravity-gateway.service    # Restart service
-sudo systemctl stop antigravity-gateway.service       # Stop service
+sudo cat /var/lib/antigravity-gateway/data/admin_credentials.txt   # Show the generated admin credentials
 ```
+
+On macOS, `--mode service` registers a per-user launchd agent at `~/Library/LaunchAgents/com.antigravity.gateway.plist` (mode `0600`).
 
 #### C. Switch or Standalone Download/Update ACP Backend Engine
 ```bash
 # Download or update the default CLI backend (./bin/agy) only
 ./deploy/deploy.sh --action install-acp --backend cli --lang en
 
-# Use Zed/Zen's standalone ACP backend package (auto-downloads agy_acp_server.par with SHA-256 verification if missing)
-./deploy/deploy.sh --mode local --backend zed --lang en
+# Use Zed/Zen's standalone ACP backend package: a pinned SHA-256 from a trusted source is required
+ZED_ACP_SHA256="<sha256 of agy-acp-server-1.4.5-<os>-<arch>.zip>" ./deploy/deploy.sh --mode local --backend zed --lang en
 
 # Offline deployment (use an existing binary path and skip auto-download)
 ./deploy/deploy.sh --mode local --backend cli --acp-bin "/path/to/agy" --no-download --lang en
 ```
 
-#### D. Local Background Process Management
+Download integrity rules (identical in `deploy.sh`, `deploy.ps1` and the `Dockerfile`):
+- **CLI**: uses the SHA-512 from the official manifest. An unreachable manifest, a missing hash or a missing hashing tool is an error; only an explicit `--insecure-skip-verify` lets the "missing hash/tool" cases continue.
+- **Zed package**: the expected SHA-256 must be supplied via `ZED_ACP_SHA256` or `--zed-sha256` (for example from `distribution.binary.<target>.sha256` of the `antigravity-acp` entry in the ACP Registry, or another trusted source), otherwise the script errors out. `ZED_ACP_VERSION` overrides the version (default `1.4.5`).
+- **A hash mismatch is always fatal**; there is no fallback to another download method.
+- The official installer `https://antigravity.google/cli/install.sh` is only used when the manifest is unavailable **and** `--allow-install-script` is passed. It is downloaded to a temp file and shown in full first (with a confirmation prompt on a terminal); it is never piped into `bash`.
+
+#### D. Process Management (routed by `--mode`)
 ```bash
-./deploy/deploy.sh --action status --lang en    # Check running status & PID
-./deploy/deploy.sh --action restart --lang en   # Graceful restart
-./deploy/deploy.sh --action stop --lang en      # Stop background gateway
+./deploy/deploy.sh --action status --lang en                    # Local: running status & PID
+./deploy/deploy.sh --action restart --lang en                   # Local: graceful restart (waits up to 15s for the old process)
+./deploy/deploy.sh --action stop --lang en                      # Local: stop background gateway
+./deploy/deploy.sh --mode service --action restart --lang en    # systemctl restart / launchctl reload
+./deploy/deploy.sh --mode docker --action status --lang en      # docker compose ps
 ```
+
+In local mode, `stop` / `restart` only terminate the PID recorded in the pid file, and only after confirming its command line is this checkout's `bin/antigravity-gateway`. If another process holds the port, the script just reports "port busy by PID X (not ours)" and never kills it. When `--backend` / `--port` are omitted, `start` / `restart` keep the values from `config.yaml` instead of silently resetting them to `cli` / `8080`.
 
 #### E. `deploy/deploy.sh` Options Reference
 
 | Flag | Values | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `--action` | `install` \| `install-acp` \| `start` \| `stop` \| `restart` \| `status` \| `build` \| `build-all` | `install` | Action to run (`install-acp` downloads ACP backend only; `build-all` cross-compiles all platforms) |
-| `--mode` | `local` \| `service` \| `docker` | `local` | Deployment target: local background daemon, OS service, or Docker Compose |
-| `--backend` | `cli` \| `zed` \| `zen` \| `auto` | `cli` | ACP backend engine (defaults to `cli`) |
+| `--mode` | `local` \| `service` \| `docker` | `local` | Deployment target: local background daemon, OS service, or Docker Compose; lifecycle actions are routed accordingly |
+| `--backend` | `cli` \| `zed` \| `zen` \| `auto` | Keep `config.yaml` value | ACP backend engine (repository default `cli`) |
 | `--acp-bin` | File path | Empty (auto) | Explicit path to `agy` or `agy_acp_server.par` |
 | `--no-download` | Flag | Off (auto-download on) | Disable automatic ACP backend download when missing |
-| `--port` | Port number | `8080` | Gateway HTTP listen port |
-| `--admin-password` | String | Keeps config value | Set Web Admin Console login password |
+| `--port` | Port number | `AG_PORT`, else `config.yaml` (docker: `8080`) | Listen port in local/service mode; host-side published port in docker mode (the container always listens on `8080`) |
+| `--admin-password-stdin` | Flag | Off | Read the initial admin password (min. 8 chars) from stdin or an interactive prompt |
+| `--admin-password` | String | Empty (auto-generated) | Same, but on the command line (discouraged); only applies until the password is changed in the console |
+| `--zed-sha256` | 64 hex chars | `ZED_ACP_SHA256` | Expected SHA-256 of the Zed ACP archive |
+| `--insecure-skip-verify` | Flag | Off | Continue when no expected hash or hashing tool is available (a mismatch still fails) |
+| `--allow-install-script` | Flag | Off | Allow downloading and running the official installer when the manifest is unavailable (shown first) |
 | `--lang` | `zh` \| `en` | `zh` | Script terminal output language |
 
 ---
 
 ### 3. Docker & Docker Compose Deployment (`linux/amd64` & `linux/arm64`)
 
-`deploy/Dockerfile` uses a multi-stage build and automatically detects the container architecture (`x86_64` or `aarch64`) to download and verify the matching Linux ACP backend (`/usr/local/bin/agy` or `agy_acp_server.par`) during image build—no manual binary preparation required.
+`deploy/Dockerfile` uses a multi-stage build (base images pinned to exact version tags and tracked by Dependabot), installs frontend dependencies with `npm ci` from the lockfile, and automatically detects the container architecture (`x86_64` or `aarch64`) to download and verify the matching Linux ACP backend (`/usr/local/bin/agy` or `agy_acp_server.par`) during image build. The runtime image runs as the non-root user `agy` (UID `10001`) and ships a `HEALTHCHECK` against `/healthz`.
 
 #### A. One-Command Docker Launch via `deploy.sh`
 ```bash
-# Build and start container with default `cli` backend
-./deploy/deploy.sh --mode docker --port 8080 --admin-password "your-strong-password" --lang en
+# Build and start container with default `cli` backend (published on 127.0.0.1 only by default)
+./deploy/deploy.sh --mode docker --port 8080 --admin-password-stdin --lang en
 
-# Or build and start container with Zed standalone ACP package
-./deploy/deploy.sh --mode docker --backend zed --port 8080 --admin-password "your-strong-password" --lang en
+# Explicitly publish on all interfaces
+AG_BIND=0.0.0.0 ./deploy/deploy.sh --mode docker --port 8080 --lang en
+
+# Or build with the Zed standalone ACP package (a pinned SHA-256 is required and passed as a build arg)
+ZED_ACP_SHA256="<sha256 of agy-acp-server-1.4.5-linux-<arch>.zip>" ./deploy/deploy.sh --mode docker --backend zed --port 8080 --lang en
 ```
+
+In docker mode `--port` only changes the host-side port (`AG_PORT`); the container always listens on `8080` and the mounted `config.yaml` is not rewritten.
 
 #### B. Direct `docker compose` Launch & Management
 ```bash
-# Build and start in background (defaults to AG_ACP_BACKEND=cli, works on both x86_64 and ARM64 Docker hosts)
-AG_ACP_BACKEND=cli AG_PORT=8080 AG_ADMIN_PASSWORD="your-strong-password" \
-  docker compose -f deploy/docker-compose.yml up -d --build
+# Optional: set an initial admin password (deploy/gateway.env is gitignored)
+cp deploy/gateway.env.example deploy/gateway.env && chmod 600 deploy/gateway.env   # edit and uncomment AG_ADMIN_PASSWORD
 
-# Follow container logs
+# Build and start in background (defaults to AG_ACP_BACKEND=cli, works on both x86_64 and ARM64 Docker hosts)
+AG_ACP_BACKEND=cli AG_PORT=8080 docker compose -f deploy/docker-compose.yml up -d --build
+
+# Publish on all interfaces when other machines need access
+AG_BIND=0.0.0.0 docker compose -f deploy/docker-compose.yml up -d
+
+# Follow container logs / show the generated admin credentials
 docker compose -f deploy/docker-compose.yml logs -f
+docker exec antigravity-gateway cat /var/lib/antigravity-gateway/admin_credentials.txt
 
 # Stop and remove container (persistent volumes are preserved)
 docker compose -f deploy/docker-compose.yml down
 ```
 
+Compose variables: `AG_BIND` (default `127.0.0.1`), `AG_PORT` (default `8080`), `AG_ACP_BACKEND`, `AG_ACP_BINARY_PATH` (default `auto`), and the build args `ZED_ACP_SHA256` / `ZED_ACP_VERSION` / `AG_INSECURE_SKIP_VERIFY` (set to `1` only to build without an expected hash). Requests reaching the container do not come from loopback, so the northbound API requires an API key created in the console first.
+
 #### C. Persistent Volumes
-- `gateway-data` (mounted at `/var/lib/antigravity-gateway`): Persists the SQLite database (`gateway.db`) and isolated per-account credential directories (`accounts/<id>/.gemini`).
-- `gemini-home` (mounted at `/root/.gemini`): Default root credential directory.
-- `../bin` (mounted read-only at `/opt/antigravity-acp`): Optional custom ACP binary directory. Built-in ELF/Mach-O/PE magic-byte checking automatically skips incompatible host binaries (e.g., macOS binaries in `./bin`) and uses the container's native Linux `/usr/local/bin/agy`.
+- `gateway-data` (mounted at `/var/lib/antigravity-gateway`): Persists the SQLite database (`gateway.db`), `admin_credentials.txt`, and isolated per-account credential directories (`accounts/<id>/.gemini`).
+- `gemini-home` (mounted at `/home/agy/.gemini`; previously `/root/.gemini`): Default account credential directory.
+- `../bin` (mounted read-only at `/opt/antigravity-acp`): Optional custom ACP binary directory (`deploy.sh` creates `./bin`). Built-in ELF/Mach-O/PE magic-byte checking automatically skips incompatible host binaries (e.g., macOS binaries in `./bin`) and uses the container's native Linux `/usr/local/bin/agy`.
+
+> **Upgrading from the old root container**: files in existing volumes are owned by root; fix ownership once:
+> `docker compose -f deploy/docker-compose.yml run --rm --user root --entrypoint chown antigravity-gateway -R 10001:10001 /var/lib/antigravity-gateway /home/agy/.gemini`
 
 ---
 
@@ -161,7 +212,7 @@ If your production server does not have Go or Node.js installed, you can cross-c
 ./deploy/deploy.sh --action build-all --lang en
 ```
 
-This produces self-contained release directories (with the frontend SPA embedded) under `./dist/`:
+This produces self-contained release directories (with the frontend SPA embedded) under `./dist/` (gitignored; each bundle's `config/config.yaml` is the pristine tracked version, without local edits):
 - `dist/antigravity-gateway-linux-arm64/` (for ARM64 / aarch64 Linux servers such as AWS Graviton, Oracle Ampere, Raspberry Pi)
 - `dist/antigravity-gateway-linux-amd64/` (for x86_64 Linux servers)
 - `dist/antigravity-gateway-darwin-arm64/`, `dist/antigravity-gateway-darwin-amd64/`
@@ -169,14 +220,16 @@ This produces self-contained release directories (with the frontend SPA embedded
 
 ```bash
 # 2. Upload the target bundle to your Linux server
-scp -r ./dist/antigravity-gateway-linux-arm64 root@your-server:/opt/antigravity-gateway
+scp -r ./dist/antigravity-gateway-linux-arm64 deploy@your-server:/opt/antigravity-gateway
 
-# 3. SSH into the server, auto-download the native ACP backend, and launch
-ssh root@your-server
+# 3. SSH into the server (preferably as a non-root user), auto-download the native ACP backend, and launch
+ssh deploy@your-server
 cd /opt/antigravity-gateway
 chmod +x antigravity-gateway antigravity-probe deploy/deploy.sh
 ./deploy/deploy.sh --action install-acp --backend cli --lang en
-nohup ./antigravity-gateway -config ./config/config.yaml -backend cli > gateway.log 2>&1 &
+mkdir -p -m 700 data && umask 077
+nohup ./antigravity-gateway -config ./config/config.yaml >> data/gateway.log 2>&1 &
+cat data/admin_credentials.txt   # generated admin credentials for this start
 ```
 
 ---
@@ -187,29 +240,33 @@ Run in PowerShell on Windows 10/11 or Windows Server (`x64` or `ARM64`):
 
 ```powershell
 # Option A: Build & start locally in background (defaults to `cli` mode, auto-downloading `agy.exe` with SHA-512 verification if missing)
-.\deploy\deploy.ps1 -Mode local -Port 8080 -AdminPassword "your-strong-password" -Lang en
+.\deploy\deploy.ps1 -Mode local -Port 8080 -AdminPasswordStdin -Lang en
 
-# Option B: Explicitly use Zed/Zen ACP package (auto-downloads with SHA-256 verification if missing)
-.\deploy\deploy.ps1 -Mode local -Backend zed -Lang en
+# Option B: Explicitly use Zed/Zen ACP package (a pinned SHA-256 is required)
+.\deploy\deploy.ps1 -Mode local -Backend zed -ZedSha256 "<sha256 of agy-acp-server-1.4.5-windows-<arch>.zip>" -Lang en
 
 # Option C: Download/update ACP backend binary into .\bin only
 .\deploy\deploy.ps1 -Action install-acp -Backend cli -Lang en
 
-# Option D: Register as a Windows background Scheduled Task service
-.\deploy\deploy.ps1 -Mode service -Port 8080 -AdminPassword "your-strong-password" -Lang en
+# Option D: Register a Windows Scheduled Task that starts at boot (run from an elevated PowerShell)
+.\deploy\deploy.ps1 -Mode service -Port 8080 -AdminPasswordStdin -Lang en
 
-# Lifecycle management
+# Lifecycle management (also routed by -Mode)
 .\deploy\deploy.ps1 -Action status -Lang en
 .\deploy\deploy.ps1 -Action restart -Lang en
-.\deploy\deploy.ps1 -Action stop -Lang en
+.\deploy\deploy.ps1 -Mode service -Action stop -Lang en
 ```
+
+- Same rules as `deploy.sh`: a missing hash fails (`-InsecureSkipVerify` only allows the "missing hash" case; a mismatch always fails), the password is never written to `config.yaml`, `stop` only terminates a process whose path is verified to be `bin\antigravity-gateway.exe`, and `-Backend` / `-Port` default to the config file values.
+- Service mode uses `Register-ScheduledTask` with an **at-startup** trigger (`AtStartup`, `S4U` for the current user, no execution time limit) for the task `AntigravityACPGateway`. A small `data\run-gateway.cmd` wrapper sets the working directory and writes output to `data\gateway.log`; the `data` ACL is restricted to the current user.
 
 ---
 
 ### 6. Post-Deployment Initialization (Admin Console -> OAuth Sign-In -> API Key Issuance)
 
 1. **Sign In to the Web Admin Console**
-   - Open `http://<server-ip>:8080` in your browser and sign in with your admin password (defaults to `ag-admin-secret-key` in `config/config.yaml`).
+   - Open `http://<server-ip>:8080` in your browser and sign in with the admin password. With the default `admin_password: "auto"` / `admin_token: "auto"`, a random password and token are generated on every start and written to `<data_dir>/admin_credentials.txt` (mode `0600`, **never printed to logs**); the deploy scripts show the file and the command to read it when they finish.
+   - Click **Change Password** (top right; minimum 8 characters, custom token minimum 12) to make the credentials permanent. They are then stored as a salted PBKDF2-SHA256 hash in `gateway.db`, and passwords supplied via `AG_ADMIN_PASSWORD` / `--admin-password-stdin` no longer apply.
 2. **Add an Account & Complete Headless OAuth Sign-In**
    - Navigate to the **Account Pool** tab. Select the `default` account or click **New Isolated Account** (each account can be configured with Direct, SOCKS5/HTTP Proxy, Source IP Binding, or Linux NetNS egress).
    - Click **Terminal Login (OAuth)** on the account card. The gateway spawns an isolated login session and extracts the Google OAuth URL.
@@ -217,6 +274,7 @@ Run in PowerShell on Windows 10/11 or Windows Server (`x64` or `ARM64`):
    - Once authenticated, the account status transitions to `ready`. Click **Refresh Quota** to inspect real-time 5-hour and weekly quota percentages across Gemini and Claude/GPT model groups.
 3. **Issue Northbound API Keys**
    - Open the **API Keys** tab to create or copy your `sk-ag-...` key (bound to a specific account or `auto` load-balancing).
+   - Until at least one API key exists, `/v1/*` only accepts unauthenticated requests from loopback (`127.0.0.1` / `::1`); remote clients and Docker hosts need an API key. A key bound to an account cannot be redirected to another account via `X-ACP-Account-ID` or `?account_id=`.
 
 ---
 
@@ -227,9 +285,9 @@ server:
   host: "0.0.0.0"
   port: 8080
   public_base_url: "http://localhost:8080"
-  data_dir: "./data"
-  admin_token: "ag-admin-secret-key"
-  admin_password: "ag-admin-secret-key"
+  data_dir: "./data"            # created with mode 0700 at startup
+  admin_token: "auto"           # "auto": random per start, written to <data_dir>/admin_credentials.txt
+  admin_password: "auto"        # do not put a real password here (tracked by git); use AG_ADMIN_PASSWORD
 
 acp_pool:
   # backend_type options:
@@ -237,7 +295,7 @@ acp_pool:
   # - "zed" / "zen"   : Uses standalone Zed/Zen ACP backend package (agy_acp_server.par / agy_acp_server)
   # - "auto"          : Uses binary_path if present; otherwise auto-discovers agy CLI or Zed/Zen ACP package
   backend_type: "cli"
-  binary_path: "auto"
+  binary_path: "./bin/agy"      # falls back to auto-discovery per backend_type when missing; "auto" also works
   workspace_dir: "/tmp/antigravity-gateway-workspace"
   min_idle_workers: 1
   max_workers: 5
@@ -258,7 +316,21 @@ Supported Environment Variable Overrides:
 - `AG_ACP_BINARY_PATH`: Explicit path to `agy` or `agy_acp_server.par` binary
 - `AG_HOST` / `AG_PORT`: Listen host and port
 - `AG_DATA_DIR` / `AG_WORKSPACE_DIR`: Persistent SQLite/account data directory and workspace directory
-- `AG_ADMIN_PASSWORD` / `AG_ADMIN_TOKEN`: Admin console password and API token
+- `AG_ADMIN_PASSWORD` / `AG_ADMIN_TOKEN`: Initial admin password (min. 8 chars) and admin token (min. 12 chars); they only apply until the password is changed in the console
+- `AG_WEB_DIR`: Optional; serve static files from this directory first (for frontend development). Without it the embedded assets are always used
+
+---
+
+## Secure Defaults
+
+- **Northbound API authentication**: while no API key exists, `/v1/*` only accepts unauthenticated requests from loopback (`127.0.0.1` / `::1`). Create an API key in the console first. The `?key=` query parameter is still accepted for the northbound API; `?token=` is no longer accepted anywhere.
+- **Account & session isolation**: an API key bound to an account cannot be redirected to another account via `X-ACP-Account-ID` or `?account_id=`; sessions are isolated per API key.
+- **ACP WebSocket workspace**: `/v1/acp/ws` sessions always run inside a gateway-managed workspace directory; a client-provided `cwd` outside it is rewritten.
+- **Admin credentials**: the admin password and token are no longer printed to logs; read `<data_dir>/admin_credentials.txt`. The password is stored as salted PBKDF2-SHA256 (minimum 8 characters; custom admin token minimum 12). `Authorization: Bearer` on admin APIs accepts the admin token or a session token, not the password. Failed credential attempts are rate-limited per IP on all endpoints.
+- **Admin API hardening**: state-changing admin endpoints require POST/PUT/DELETE, cross-origin state-changing requests are rejected, the session cookie is `SameSite=Strict`, and WebSocket upgrades check `Origin`. Admin API responses no longer include account `api_key`, and proxy passwords are masked as `********`.
+- **Internal MCP bridge**: `/mcp/sessions/*` only accepts loopback connections.
+- **Subprocess environment**: ACP agent subprocesses no longer inherit `AG_*` environment variables.
+- **Account IDs**: restricted to `[A-Za-z0-9._-]`, 1–64 characters.
 
 ---
 
@@ -287,7 +359,7 @@ Open `http://localhost:8080` in your browser to sign in to the Web Admin Console
 - **Cursor / Cline / Roo Code / Cherry Studio**:
   - Base URL: `http://localhost:8080/v1`
   - API Key: `sk-ag-your-issued-key`
-  - Optional Custom Headers: `X-ACP-Context-Window: 1048576`, `X-ACP-Account-ID: auto`
+  - Optional Custom Headers: `X-ACP-Context-Window: 1048576`, `X-ACP-Account-ID: auto` (only honoured for API keys not bound to an account)
 
 ---
 

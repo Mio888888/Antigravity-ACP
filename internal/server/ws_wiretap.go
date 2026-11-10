@@ -120,7 +120,7 @@ func (h *WiretapHub) Broadcast(workerID, direction, rawLine string) {
 }
 
 var wsUpgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
+	CheckOrigin: isSameOriginRequest,
 }
 
 func (h *WiretapHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {

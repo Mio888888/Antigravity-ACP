@@ -2,9 +2,9 @@
 # ==============================================================================
 # Antigravity ACP Gateway — Unified Cross-Platform Deployment Script
 # Supports: macOS (darwin), Linux (x86_64 / arm64, systemd / direct), Docker Compose, Cross-Build
-# Supports Automatic ACP Backend Download & Installation:
-#   - cli (default) : Antigravity CLI (agy acp / antigravity acp)
-#   - zed / zen     : Zed/Zen standalone ACP backend package (agy_acp_server.par)
+# Supports Automatic ACP Backend Download & Installation (fail-closed hash verification):
+#   - cli (default) : Antigravity CLI (agy acp / antigravity acp), SHA-512 from the official manifest
+#   - zed / zen     : Zed/Zen standalone ACP backend package (agy_acp_server.par), pinned SHA-256 (ZED_ACP_SHA256)
 #   - auto          : Auto-discover CLI (agy) or Zed/Zen ACP package, auto-installing CLI if missing
 # ==============================================================================
 set -euo pipefail
@@ -13,13 +13,42 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 ACTION="install"
-MODE="local"          # local | service | docker | build-all
-BACKEND="cli"         # cli (default) | zed | zen | auto
+MODE="local"          # local | service | docker
+BACKEND=""            # cli | zed | zen | auto (empty = keep config.yaml value)
+BACKEND_SET="0"
 ACP_BIN=""
-PORT="8080"
+PORT=""
+PORT_SET="0"
 ADMIN_PASSWORD=""
+ADMIN_PASSWORD_SOURCE=""   # "" | flag | stdin
 LANG_CHOICE="zh"      # zh | en
 AUTO_DOWNLOAD="1"
+INSECURE_SKIP_VERIFY="0"
+ALLOW_INSTALL_SCRIPT="0"
+ZED_ACP_VERSION="${ZED_ACP_VERSION:-1.4.5}"
+ZED_ACP_SHA256="${ZED_ACP_SHA256:-}"
+
+CFG_PATH="$ROOT_DIR/config/config.yaml"
+GATEWAY_BIN="$ROOT_DIR/bin/antigravity-gateway"
+PROBE_BIN="$ROOT_DIR/bin/antigravity-probe"
+COMPOSE_FILE="$ROOT_DIR/deploy/docker-compose.yml"
+DOCKER_ENV_FILE="$ROOT_DIR/deploy/gateway.env"
+CLI_MANIFEST_BASE="https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests"
+CLI_INSTALL_SCRIPT_URL="https://antigravity.google/cli/install.sh"
+
+SERVICE_NAME="antigravity-gateway"
+SERVICE_USER="antigravity"
+SERVICE_STATE_DIR="/var/lib/antigravity-gateway"
+SERVICE_DATA_DIR="$SERVICE_STATE_DIR/data"
+SERVICE_WORKSPACE_DIR="$SERVICE_STATE_DIR/workspace"
+SERVICE_CONFIG_DIR="/etc/antigravity-gateway"
+SERVICE_ENV_FILE="$SERVICE_CONFIG_DIR/env"
+SERVICE_BIN_DIR="/usr/local/bin"
+LAUNCHD_LABEL="com.antigravity.gateway"
+LAUNCHD_PLIST="$HOME/Library/LaunchAgents/${LAUNCHD_LABEL}.plist"
+
+SCRIPT_TMP="$(mktemp -d "${TMPDIR:-/tmp}/ag-deploy.XXXXXX")"
+trap 'rm -rf "$SCRIPT_TMP"' EXIT
 
 msg() {
   local zh="$1"
@@ -31,6 +60,19 @@ msg() {
   fi
 }
 
+warn() {
+  msg "$1" "$2" >&2
+}
+
+die() {
+  msg ">>> [错误] $1" ">>> [ERROR] $2" >&2
+  exit 1
+}
+
+lower() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
 usage() {
   if [[ "$LANG_CHOICE" == "en" ]]; then
     cat <<EOF
@@ -38,21 +80,33 @@ Usage: ./deploy/deploy.sh [options]
 
 Options:
   --action <install|install-acp|start|stop|restart|status|build|build-all>  Action to execute (default: install)
-  --mode <local|service|docker>                                             Deployment target (default: local)
-  --backend <cli|zed|zen|auto>                                              ACP backend engine (default: cli)
-  --acp-bin <path>                                                          Explicit path to agy CLI or agy_acp_server.par
-  --no-download                                                             Disable automatic ACP backend download
-  --port <port>                                                             Gateway listen port (default: 8080)
-  --admin-password <pwd>                                                    Admin Console login password
-  --lang <zh|en>                                                            Output language: zh or en (default: zh)
-  -h, --help                                                                Show this help message
+  --mode <local|service|docker>                 Deployment target; lifecycle actions follow it too (default: local)
+  --backend <cli|zed|zen|auto>                  ACP backend engine (default: keep acp_pool.backend_type from config.yaml)
+  --acp-bin <path>                              Explicit path to agy CLI or agy_acp_server.par
+  --no-download                                 Disable automatic ACP backend download
+  --port <port>                                 Listen port (local/service) or published host port (docker).
+                                                Default: AG_PORT, else server.port from config.yaml (docker: 8080)
+  --admin-password-stdin                        Read the initial admin password from stdin / an interactive prompt
+  --admin-password <pwd>                        Same, but on the command line (visible in shell history and ps; discouraged)
+  --zed-sha256 <hex>                            Expected SHA-256 of the Zed ACP zip (or set ZED_ACP_SHA256)
+  --insecure-skip-verify                        Allow installs when no expected hash or hashing tool is available
+                                                (a hash MISMATCH is always fatal)
+  --allow-install-script                        If the CLI manifest is unavailable, download and run the official
+                                                install script (shown first; never piped into bash)
+  --lang <zh|en>                                Output language: zh or en (default: zh)
+  -h, --help                                    Show this help message
+
+The admin password is never written to config/config.yaml. It is passed as AG_ADMIN_PASSWORD
+(local: process environment; service: /etc/antigravity-gateway/env, mode 0600; docker: deploy/gateway.env,
+mode 0600, gitignored). It only applies until the password is changed in the Web Console.
 
 Examples:
-  ./deploy/deploy.sh                                              # One-click build, auto-install CLI (agy) & start locally
+  ./deploy/deploy.sh                                              # Build, auto-install CLI (agy) & start locally
   ./deploy/deploy.sh --mode local --backend cli --port 8080
-  ./deploy/deploy.sh --mode local --backend zed                   # Auto-download Zed ACP package if missing
-  ./deploy/deploy.sh --mode service --admin-password "your-pwd"   # Install systemd / launchd service (default: cli)
-  ./deploy/deploy.sh --mode docker --port 8080                    # Build & run Docker container (auto-installs Linux ACP)
+  ZED_ACP_SHA256=<sha256> ./deploy/deploy.sh --backend zed        # Zed ACP package with pinned SHA-256
+  ./deploy/deploy.sh --mode service --admin-password-stdin        # systemd (dedicated user) / launchd service
+  ./deploy/deploy.sh --mode service --action restart              # systemctl restart antigravity-gateway
+  AG_BIND=0.0.0.0 ./deploy/deploy.sh --mode docker --port 8080    # Docker; publish on all interfaces explicitly
   ./deploy/deploy.sh --action install-acp --backend cli           # Download/update ACP backend binary only
   ./deploy/deploy.sh --action build-all                           # Cross-compile for macOS/Linux/Windows (amd64 & arm64)
 EOF
@@ -62,50 +116,221 @@ EOF
 
 选项:
   --action <install|install-acp|start|stop|restart|status|build|build-all>  执行动作 (默认: install)
-  --mode <local|service|docker>                                             部署模式: local(本地后台) | service(系统服务) | docker(容器)
-  --backend <cli|zed|zen|auto>                                              ACP 后端类型 (默认: cli，缺失时自动下载安装)
-  --acp-bin <path>                                                          显式指定 agy 或 agy_acp_server.par 可执行文件路径
-  --no-download                                                             禁用缺失 ACP 后端时的自动下载安装
-  --port <port>                                                             网关监听端口 (默认: 8080)
-  --admin-password <pwd>                                                    设置 Web 管理控制台登录密码
-  --lang <zh|en>                                                            脚本输出语言: zh 或 en (默认: zh)
-  -h, --help                                                                显示帮助信息
+  --mode <local|service|docker>                 部署模式；start/stop/restart/status 同样按模式路由 (默认: local)
+  --backend <cli|zed|zen|auto>                  ACP 后端类型 (默认: 沿用 config.yaml 中的 acp_pool.backend_type)
+  --acp-bin <path>                              显式指定 agy 或 agy_acp_server.par 可执行文件路径
+  --no-download                                 禁用缺失 ACP 后端时的自动下载安装
+  --port <port>                                 监听端口 (local/service) 或宿主机映射端口 (docker)
+                                                默认: 环境变量 AG_PORT，否则读取 config.yaml 的 server.port (docker 为 8080)
+  --admin-password-stdin                        从标准输入 / 交互提示读取初始管理员密码 (推荐)
+  --admin-password <pwd>                        直接在命令行传入密码 (会留在 shell 历史与 ps 中，不推荐)
+  --zed-sha256 <hex>                            Zed ACP 压缩包的预期 SHA-256 (或设置环境变量 ZED_ACP_SHA256)
+  --insecure-skip-verify                        缺少预期哈希或哈希工具时仍允许安装 (哈希不匹配始终报错)
+  --allow-install-script                        CLI 清单不可用时，下载并展示官方安装脚本后再执行 (不会 curl | bash)
+  --lang <zh|en>                                脚本输出语言: zh 或 en (默认: zh)
+  -h, --help                                    显示帮助信息
+
+管理员密码不会写入 config/config.yaml，而是通过 AG_ADMIN_PASSWORD 传递
+(local: 进程环境变量; service: /etc/antigravity-gateway/env，权限 0600; docker: deploy/gateway.env，权限 0600 且已被 git 忽略)。
+该密码仅在 Web 控制台修改密码之前生效。
 
 示例:
   ./deploy/deploy.sh                                              # 一键编译、自动下载安装 agy CLI 并在本地后台启动
   ./deploy/deploy.sh --mode local --backend cli --port 8080
-  ./deploy/deploy.sh --mode local --backend zed                   # 使用 Zed ACP 独立包（缺失时自动从官方源下载）
-  ./deploy/deploy.sh --mode service --admin-password "your-pwd"   # 注册为 systemd / launchd 系统服务（默认 cli）
-  ./deploy/deploy.sh --mode docker --port 8080                    # 构建并启动 Docker 容器（镜像内自动安装对应架构 ACP）
+  ZED_ACP_SHA256=<sha256> ./deploy/deploy.sh --backend zed        # 使用 Zed ACP 独立包（必须提供固定 SHA-256）
+  ./deploy/deploy.sh --mode service --admin-password-stdin        # 注册为 systemd（专用低权限用户）/ launchd 服务
+  ./deploy/deploy.sh --mode service --action restart              # 等价于 systemctl restart antigravity-gateway
+  AG_BIND=0.0.0.0 ./deploy/deploy.sh --mode docker --port 8080    # Docker 部署；显式对所有网卡开放端口
   ./deploy/deploy.sh --action install-acp --backend cli           # 仅自动下载/更新 ACP 后端二进制到 ./bin
   ./deploy/deploy.sh --action build-all                           # 交叉编译全平台发行包 (macOS/Linux/Windows, amd64 & arm64)
 EOF
   fi
 }
 
+require_value() {
+  if [[ $# -lt 2 || -z "$2" || "$2" == --* ]]; then
+    echo "Missing value for $1" >&2
+    usage
+    exit 1
+  fi
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --action) ACTION="$2"; shift 2 ;;
-    --mode) MODE="$2"; shift 2 ;;
-    --backend) BACKEND="$2"; shift 2 ;;
-    --acp-bin) ACP_BIN="$2"; shift 2 ;;
+    --action) require_value "$1" "${2-}"; ACTION="$2"; shift 2 ;;
+    --mode) require_value "$1" "${2-}"; MODE="$2"; shift 2 ;;
+    --backend) require_value "$1" "${2-}"; BACKEND="$2"; BACKEND_SET="1"; shift 2 ;;
+    --acp-bin) require_value "$1" "${2-}"; ACP_BIN="$2"; shift 2 ;;
     --no-download) AUTO_DOWNLOAD="0"; shift 1 ;;
-    --port) PORT="$2"; shift 2 ;;
-    --admin-password) ADMIN_PASSWORD="$2"; shift 2 ;;
-    --lang) LANG_CHOICE="$2"; shift 2 ;;
+    --port) require_value "$1" "${2-}"; PORT="$2"; PORT_SET="1"; shift 2 ;;
+    --admin-password) require_value "$1" "${2-}"; ADMIN_PASSWORD="$2"; ADMIN_PASSWORD_SOURCE="flag"; shift 2 ;;
+    --admin-password-stdin) ADMIN_PASSWORD_SOURCE="stdin"; shift 1 ;;
+    --zed-sha256) require_value "$1" "${2-}"; ZED_ACP_SHA256="$2"; shift 2 ;;
+    --insecure-skip-verify) INSECURE_SKIP_VERIFY="1"; shift 1 ;;
+    --allow-install-script) ALLOW_INSTALL_SCRIPT="1"; shift 1 ;;
+    --lang) require_value "$1" "${2-}"; LANG_CHOICE="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
-    *) echo "Unknown argument: $1"; usage; exit 1 ;;
+    *) echo "Unknown argument: $1" >&2; usage; exit 1 ;;
   esac
 done
 
-# Normalize backend alias ("zen" -> "zed")
-BACKEND_NORM="$(echo "$BACKEND" | tr '[:upper:]' '[:lower:]')"
-if [[ "$BACKEND_NORM" == "zen" ]]; then
-  BACKEND_NORM="zed"
-fi
+case "$MODE" in
+  local|service|docker) ;;
+  *) die "无效的 --mode: $MODE" "Invalid --mode: $MODE" ;;
+esac
 
 OS_NAME="$(uname -s)"
 ARCH_NAME="$(uname -m)"
+
+# ------------------------------------------------------------------------------
+# config.yaml helpers (non-secret keys only)
+# ------------------------------------------------------------------------------
+
+# read_config_value <key> [file]: first scalar value of <key>, unquoted, comments stripped.
+read_config_value() {
+  local key="$1"
+  local file="${2:-$CFG_PATH}"
+  [[ -r "$file" ]] || return 0
+  awk -v k="$key" '
+    $0 ~ ("^[[:space:]]*" k "[[:space:]]*:") {
+      sub("^[[:space:]]*" k "[[:space:]]*:[[:space:]]*", "")
+      sub(/[[:space:]]+#.*$/, "")
+      sub(/[[:space:]]+$/, "")
+      if ($0 ~ /^".*"$/ || $0 ~ /^\047.*\047$/) { $0 = substr($0, 2, length($0) - 2) }
+      print
+      exit
+    }' "$file" 2>/dev/null || true
+}
+
+yaml_quote() {
+  printf '"%s"' "$(printf '%s' "$1" | sed -e 's/[\\"]/\\&/g')"
+}
+
+# set_yaml_value <file> <section> <key> <rendered-value>: replace <key> inside top-level <section>,
+# inserting it at the end of the section if missing. Values are passed via ENVIRON, so no awk
+# escape processing or "&" substitution happens.
+set_yaml_value() {
+  local file="$1" section="$2" key="$3" value="$4"
+  local tmp="$SCRIPT_TMP/yaml.$$"
+  YAML_SECTION="$section" YAML_KEY="$key" YAML_VAL="$value" awk '
+    BEGIN { s = ENVIRON["YAML_SECTION"]; k = ENVIRON["YAML_KEY"]; v = ENVIRON["YAML_VAL"]; insec = 0; done = 0 }
+    /^[^[:space:]#][^:]*:/ {
+      if (insec && !done) { print "  " k ": " v; done = 1 }
+      insec = ($0 ~ ("^" s "[[:space:]]*:"))
+      print
+      next
+    }
+    insec && !done && $0 ~ ("^[[:space:]]+" k "[[:space:]]*:") {
+      indent = $0
+      sub(/[^[:space:]].*$/, "", indent)
+      print indent k ": " v
+      done = 1
+      next
+    }
+    { print }
+    END { if (insec && !done) print "  " k ": " v }
+  ' "$file" >"$tmp"
+  cat "$tmp" >"$file"
+  rm -f "$tmp"
+}
+
+# Resolve a path from config.yaml relative to the repo root (the gateway is launched from there).
+resolve_root_path() {
+  local p="$1"
+  case "$p" in
+    /*) printf '%s' "$p" ;;
+    ./*) printf '%s/%s' "$ROOT_DIR" "${p#./}" ;;
+    *) printf '%s/%s' "$ROOT_DIR" "$p" ;;
+  esac
+}
+
+local_data_dir() {
+  local d
+  d="$(read_config_value data_dir)"
+  resolve_root_path "${d:-./data}"
+}
+
+health_host() {
+  local file="${1:-$CFG_PATH}"
+  local h
+  h="$(read_config_value host "$file")"
+  case "$h" in
+    ""|0.0.0.0|"::"|"[::]") echo "127.0.0.1" ;;
+    *:*) echo "[${h#[}" | sed 's/]*$/]/' ;;
+    *) echo "$h" ;;
+  esac
+}
+
+# ------------------------------------------------------------------------------
+# Resolve backend / port / admin password
+# ------------------------------------------------------------------------------
+
+if [[ "$BACKEND_SET" == "1" ]]; then
+  BACKEND_NORM="$(lower "$BACKEND")"
+else
+  BACKEND_NORM="$(lower "$(read_config_value backend_type)")"
+  [[ -n "$BACKEND_NORM" ]] || BACKEND_NORM="cli"
+fi
+[[ "$BACKEND_NORM" == "zen" ]] && BACKEND_NORM="zed"
+case "$BACKEND_NORM" in
+  cli|zed|auto) ;;
+  *) die "无效的 --backend: $BACKEND_NORM" "Invalid --backend: $BACKEND_NORM" ;;
+esac
+
+if [[ "$PORT_SET" != "1" ]]; then
+  if [[ -n "${AG_PORT:-}" ]]; then
+    PORT="$AG_PORT"
+  elif [[ "$MODE" == "docker" ]]; then
+    PORT="8080"
+  elif [[ "$MODE" == "service" && "$OS_NAME" == "Linux" && "$ACTION" != "install" && -r "$SERVICE_CONFIG_DIR/config.yaml" ]]; then
+    PORT="$(read_config_value port "$SERVICE_CONFIG_DIR/config.yaml")"
+    [[ -n "$PORT" ]] || PORT="8080"
+  else
+    PORT="$(read_config_value port)"
+    [[ -n "$PORT" ]] || PORT="8080"
+  fi
+fi
+if ! [[ "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
+  die "无效的端口: $PORT" "Invalid port: $PORT"
+fi
+
+for secret_key in admin_password admin_token; do
+  secret_val="$(read_config_value "$secret_key")"
+  if [[ -n "$secret_val" && "$(lower "$secret_val")" != "auto" ]]; then
+    warn ">>> [警告] config/config.yaml 中的 ${secret_key} 不是 \"auto\"。该文件受 git 跟踪，请改回 \"auto\" 并改用 --admin-password-stdin / AG_ADMIN_PASSWORD。" \
+         ">>> [WARN] ${secret_key} in config/config.yaml is not \"auto\". The file is tracked by git; reset it to \"auto\" and use --admin-password-stdin / AG_ADMIN_PASSWORD instead."
+  fi
+done
+
+if [[ -n "$ACP_BIN" && ! -f "$ACP_BIN" ]]; then
+  die "--acp-bin 指定的文件不存在: $ACP_BIN" "--acp-bin file does not exist: $ACP_BIN"
+fi
+
+if [[ "$ADMIN_PASSWORD_SOURCE" == "stdin" ]]; then
+  if [[ -t 0 ]]; then
+    read -r -s -p "Admin password / 管理员密码: " ADMIN_PASSWORD
+    echo >&2
+  else
+    IFS= read -r ADMIN_PASSWORD || true
+  fi
+elif [[ "$ADMIN_PASSWORD_SOURCE" == "flag" ]]; then
+  warn ">>> [警告] --admin-password 会出现在 shell 历史与进程列表中，建议改用 --admin-password-stdin。" \
+       ">>> [WARN] --admin-password is visible in shell history and the process list; prefer --admin-password-stdin."
+fi
+if [[ -n "$ADMIN_PASSWORD_SOURCE" ]]; then
+  if [[ ${#ADMIN_PASSWORD} -lt 8 ]]; then
+    die "管理员密码至少需要 8 个字符" "Admin password must be at least 8 characters"
+  fi
+  case "$ADMIN_PASSWORD" in
+    *$'\n'*|*$'\r'*) die "管理员密码不能包含换行符" "Admin password must not contain newlines" ;;
+  esac
+  msg ">>> 提示: 该密码仅在 Web 控制台「修改密码」之前生效；修改后以数据库中的哈希为准。" \
+      ">>> Note: this password only applies until it is changed in the Web Console; afterwards the DB hash is authoritative."
+fi
+
+# ------------------------------------------------------------------------------
+# ACP backend discovery
+# ------------------------------------------------------------------------------
 
 find_existing_zed_binary() {
   for candidate in \
@@ -170,42 +395,87 @@ find_existing_cli_binary() {
   return 1
 }
 
-verify_sha512() {
-  local file_path="$1"
-  local expected="$2"
-  [[ -z "$expected" ]] && return 0
-  local actual=""
-  if command -v sha512sum >/dev/null 2>&1; then
-    actual="$(sha512sum "$file_path" | awk '{print $1}')"
+# ------------------------------------------------------------------------------
+# Download integrity (fail closed)
+# ------------------------------------------------------------------------------
+
+file_digest() {
+  local bits="$1" file="$2"
+  if command -v "sha${bits}sum" >/dev/null 2>&1; then
+    "sha${bits}sum" "$file" | awk '{print $1}'
   elif command -v shasum >/dev/null 2>&1; then
-    actual="$(shasum -a 512 "$file_path" | awk '{print $1}')"
+    shasum -a "$bits" "$file" | awk '{print $1}'
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl dgst "-sha${bits}" -r "$file" | awk '{print $1}'
   else
-    return 0
-  fi
-  if [[ "$(echo "$actual" | tr '[:upper:]' '[:lower:]')" != "$(echo "$expected" | tr '[:upper:]' '[:lower:]')" ]]; then
-    echo "SHA-512 verification failed: expected $expected, got $actual" >&2
     return 1
   fi
-  return 0
 }
 
-verify_sha256() {
-  local file_path="$1"
-  local expected="$2"
-  [[ -z "$expected" ]] && return 0
+# verify_digest <256|512> <file> <expected-hex> <label>
+# Missing expected hash or hashing tool: error unless --insecure-skip-verify. Mismatch: always fatal.
+verify_digest() {
+  local bits="$1" file="$2" label="$4"
+  local expected
+  expected="$(lower "$(printf '%s' "$3" | tr -d '[:space:]')")"
+  if [[ -z "$expected" ]]; then
+    if [[ "$INSECURE_SKIP_VERIFY" == "1" ]]; then
+      warn ">>> [警告] ${label} 缺少预期 SHA-${bits}，因 --insecure-skip-verify 跳过校验" \
+           ">>> [WARN] No expected SHA-${bits} for ${label}; skipping verification because of --insecure-skip-verify"
+      return 0
+    fi
+    die "${label} 缺少预期 SHA-${bits}，拒绝安装 (如确需跳过请显式传入 --insecure-skip-verify)" \
+        "No expected SHA-${bits} for ${label}; refusing to install (pass --insecure-skip-verify to override)"
+  fi
+  local want_len=$(( bits / 4 ))
+  if ! [[ "$expected" =~ ^[0-9a-f]+$ ]] || [[ ${#expected} -ne $want_len ]]; then
+    die "${label} 的预期 SHA-${bits} 格式无效: $expected" "Invalid expected SHA-${bits} for ${label}: $expected"
+  fi
   local actual=""
-  if command -v sha256sum >/dev/null 2>&1; then
-    actual="$(sha256sum "$file_path" | awk '{print $1}')"
-  elif command -v shasum >/dev/null 2>&1; then
-    actual="$(shasum -a 256 "$file_path" | awk '{print $1}')"
-  else
+  if ! actual="$(file_digest "$bits" "$file")" || [[ -z "$actual" ]]; then
+    if [[ "$INSECURE_SKIP_VERIFY" == "1" ]]; then
+      warn ">>> [警告] 未找到 sha${bits}sum/shasum/openssl，因 --insecure-skip-verify 跳过 ${label} 校验" \
+           ">>> [WARN] No sha${bits}sum/shasum/openssl found; skipping ${label} verification because of --insecure-skip-verify"
+      return 0
+    fi
+    die "未找到 sha${bits}sum/shasum/openssl，无法校验 ${label}" "No sha${bits}sum/shasum/openssl available to verify ${label}"
+  fi
+  if [[ "$(lower "$actual")" != "$expected" ]]; then
+    die "${label} SHA-${bits} 校验失败: 预期 ${expected}，实际 ${actual}" \
+        "${label} SHA-${bits} mismatch: expected $expected, got $actual"
+  fi
+  msg "    -> SHA-${bits} 校验通过" "    -> SHA-${bits} verified"
+}
+
+run_official_install_script() {
+  local dest_dir="$1"
+  local script="$SCRIPT_TMP/agy-install.sh"
+  msg ">>> 正在下载官方安装脚本 ${CLI_INSTALL_SCRIPT_URL} (未执行，先展示内容)..." \
+      ">>> Downloading official installer ${CLI_INSTALL_SCRIPT_URL} (not executed yet; showing it first)..."
+  curl -fsSL --retry 3 -o "$script" "$CLI_INSTALL_SCRIPT_URL"
+  echo "------------------------------------------------------------------------------" >&2
+  sed 's/^/    | /' "$script" >&2
+  echo "------------------------------------------------------------------------------" >&2
+  msg "    -> 脚本 SHA-256: $(file_digest 256 "$script" || echo unknown)" \
+      "    -> Script SHA-256: $(file_digest 256 "$script" || echo unknown)"
+  if [[ -t 0 ]]; then
+    local answer=""
+    read -r -p "Run this script? / 是否执行该脚本? [y/N] " answer
+    [[ "$answer" == "y" || "$answer" == "Y" ]] || die "已取消" "Aborted"
+  fi
+  bash "$script" --dir "$dest_dir"
+}
+
+cli_manifest_unavailable() {
+  local dest_dir="$1" reason="$2"
+  if [[ "$ALLOW_INSTALL_SCRIPT" == "1" ]]; then
+    warn ">>> [警告] ${reason}；因 --allow-install-script 回退到官方安装脚本" \
+         ">>> [WARN] ${reason}; falling back to the official install script because of --allow-install-script"
+    run_official_install_script "$dest_dir"
     return 0
   fi
-  if [[ "$(echo "$actual" | tr '[:upper:]' '[:lower:]')" != "$(echo "$expected" | tr '[:upper:]' '[:lower:]')" ]]; then
-    echo "SHA-256 verification failed: expected $expected, got $actual" >&2
-    return 1
-  fi
-  return 0
+  die "${reason}。可使用 --acp-bin 指定已安装的 agy，或显式传入 --allow-install-script 改用官方安装脚本" \
+      "${reason}. Use --acp-bin to point at an installed agy, or pass --allow-install-script to use the official installer"
 }
 
 install_cli_backend() {
@@ -217,27 +487,21 @@ install_cli_backend() {
   case "$OS_NAME" in
     Darwin) os_key="darwin" ;;
     Linux)  os_key="linux" ;;
-    *)
-      msg ">>> [警告] 当前系统 ($OS_NAME) 不支持自动下载 CLI，请使用 --acp-bin 手动指定" \
-          ">>> [WARN] OS ($OS_NAME) not supported for auto CLI download; specify --acp-bin manually"
-      return 1
-      ;;
+    *) die "当前系统 ($OS_NAME) 不支持自动下载 CLI，请使用 --acp-bin 手动指定" \
+           "OS ($OS_NAME) not supported for auto CLI download; specify --acp-bin manually" ;;
   esac
 
   local arch_key=""
   case "$ARCH_NAME" in
     x86_64|amd64)  arch_key="amd64" ;;
     arm64|aarch64) arch_key="arm64" ;;
-    *)
-      msg ">>> [警告] 当前架构 ($ARCH_NAME) 不支持自动下载 CLI，请使用 --acp-bin 手动指定" \
-          ">>> [WARN] Architecture ($ARCH_NAME) not supported for auto CLI download"
-      return 1
-      ;;
+    *) die "当前架构 ($ARCH_NAME) 不支持自动下载 CLI，请使用 --acp-bin 手动指定" \
+           "Architecture ($ARCH_NAME) not supported for auto CLI download; specify --acp-bin manually" ;;
   esac
 
   local platform="${os_key}_${arch_key}"
   if [[ "$os_key" == "linux" ]]; then
-    if [[ -f /lib/libc.musl-x86_64.so.1 ]] || [[ -f /lib/libc.musl-aarch64.so.1 ]] || ldd /bin/ls 2>&1 | grep -q musl; then
+    if [[ -f /lib/libc.musl-x86_64.so.1 ]] || [[ -f /lib/libc.musl-aarch64.so.1 ]] || { ldd /bin/ls 2>&1 || true; } | grep -q musl; then
       platform="linux_${arch_key}_musl"
     fi
   fi
@@ -245,97 +509,99 @@ install_cli_backend() {
   msg ">>> 正在自动下载并安装 Antigravity CLI 后端 (platform=${platform}) -> ${target_bin} ..." \
       ">>> Auto-downloading & installing Antigravity CLI backend (platform=${platform}) -> ${target_bin} ..."
 
-  local manifest_url="https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/${platform}.json"
   local manifest_json=""
-  manifest_json="$(curl -fsSL --retry 3 -A "Antigravity-Gateway-Deploy/1.6" "$manifest_url" 2>/dev/null || true)"
-  if [[ -n "$manifest_json" ]]; then
-    local version pkg_url expected_sha512
-    version="$(printf '%s\n' "$manifest_json" | awk -F'"' '/"version"[[:space:]]*:/ {print $4; exit}')"
-    pkg_url="$(printf '%s\n' "$manifest_json" | awk -F'"' '/"url"[[:space:]]*:/ {print $4; exit}')"
-    expected_sha512="$(printf '%s\n' "$manifest_json" | awk -F'"' '/"sha512"[[:space:]]*:/ {print $4; exit}')"
-    if [[ -n "$pkg_url" ]]; then
-      echo "    -> Matched Antigravity CLI v${version:-latest}: ${pkg_url}"
-      local tmpdir
-      tmpdir="$(mktemp -d)"
-      local pkg_path="$tmpdir/agy_pkg"
-      if curl -fL --retry 3 -o "$pkg_path" "$pkg_url" && verify_sha512 "$pkg_path" "$expected_sha512"; then
-        if [[ "$pkg_url" == *.tar.gz* ]]; then
-          tar -xzf "$pkg_path" -C "$tmpdir" antigravity
-          mv -f "$tmpdir/antigravity" "$target_bin"
-        else
-          mv -f "$pkg_path" "$target_bin"
-        fi
-        chmod 0755 "$target_bin"
-        if [[ "$os_key" == "darwin" ]]; then
-          xattr -d com.apple.quarantine "$target_bin" 2>/dev/null || true
-        fi
-        rm -rf "$tmpdir"
-        msg ">>> Antigravity CLI 安装完成: ${target_bin}" ">>> Antigravity CLI installed at: ${target_bin}"
-        return 0
-      fi
-      rm -rf "$tmpdir"
-    fi
+  if ! manifest_json="$(curl -fsSL --retry 3 -A "Antigravity-Gateway-Deploy/1.6" "${CLI_MANIFEST_BASE}/${platform}.json")" || [[ -z "$manifest_json" ]]; then
+    cli_manifest_unavailable "$dest_dir" "无法获取 CLI 发布清单 / CLI release manifest unavailable"
+    return 0
   fi
 
-  msg ">>> 清单直连下载未成功，正在回退使用官方安装脚本 https://antigravity.google/cli/install.sh ..." \
-      ">>> Falling back to official installer script https://antigravity.google/cli/install.sh ..."
-  curl -fsSL https://antigravity.google/cli/install.sh | bash -s -- --dir "$dest_dir"
+  local version pkg_url expected_sha512
+  version="$(printf '%s\n' "$manifest_json" | awk -F'"' '/"version"[[:space:]]*:/ {print $4; exit}')"
+  pkg_url="$(printf '%s\n' "$manifest_json" | awk -F'"' '/"url"[[:space:]]*:/ {print $4; exit}')"
+  expected_sha512="$(printf '%s\n' "$manifest_json" | awk -F'"' '/"sha512"[[:space:]]*:/ {print $4; exit}')"
+  if [[ -z "$pkg_url" ]]; then
+    cli_manifest_unavailable "$dest_dir" "CLI 发布清单中没有下载地址 / CLI manifest has no package URL"
+    return 0
+  fi
+  if [[ "$pkg_url" != https://* ]]; then
+    die "CLI 下载地址不是 HTTPS: $pkg_url" "CLI package URL is not HTTPS: $pkg_url"
+  fi
+
+  echo "    -> Matched Antigravity CLI v${version:-unknown}: ${pkg_url}"
+  local work="$SCRIPT_TMP/cli"
+  rm -rf "$work"
+  mkdir -p "$work"
+  local pkg_path="$work/agy_pkg"
+  curl -fL --retry 3 -o "$pkg_path" "$pkg_url"
+  verify_digest 512 "$pkg_path" "$expected_sha512" "Antigravity CLI ${version:-}"
+
+  if [[ "$pkg_url" == *.tar.gz* ]]; then
+    tar -xzf "$pkg_path" -C "$work" antigravity
+    install -m 0755 "$work/antigravity" "$target_bin"
+  else
+    install -m 0755 "$pkg_path" "$target_bin"
+  fi
+  if [[ "$os_key" == "darwin" ]]; then
+    xattr -d com.apple.quarantine "$target_bin" 2>/dev/null || true
+  fi
+  rm -rf "$work"
+  msg ">>> Antigravity CLI 安装完成: ${target_bin}" ">>> Antigravity CLI installed at: ${target_bin}"
 }
 
 install_zed_backend() {
   local dest_dir="${1:-$ROOT_DIR/bin}"
   mkdir -p "$dest_dir"
 
-  local os_key=""
-  local fallback_os=""
+  local os_key="" release_os=""
   case "$OS_NAME" in
-    Darwin) os_key="darwin"; fallback_os="macos" ;;
-    Linux)  os_key="linux";  fallback_os="linux" ;;
-    *)
-      msg ">>> [警告] 当前系统 ($OS_NAME) 不支持自动下载 Zed ACP 包" \
-          ">>> [WARN] OS ($OS_NAME) not supported for auto Zed ACP download"
-      return 1
-      ;;
+    Darwin) os_key="darwin"; release_os="macos" ;;
+    Linux)  os_key="linux";  release_os="linux" ;;
+    *) die "当前系统 ($OS_NAME) 不支持自动下载 Zed ACP 包" "OS ($OS_NAME) not supported for auto Zed ACP download" ;;
   esac
 
-  local zed_arch=""
-  local fallback_arch=""
+  local release_arch=""
   case "$ARCH_NAME" in
-    x86_64|amd64)  zed_arch="x86_64";  fallback_arch="x86_64" ;;
-    arm64|aarch64) zed_arch="aarch64"; fallback_arch="arm64" ;;
-    *)
-      msg ">>> [警告] 当前架构 ($ARCH_NAME) 不支持自动下载 Zed ACP 包" \
-          ">>> [WARN] Architecture ($ARCH_NAME) not supported for auto Zed ACP download"
-      return 1
-      ;;
+    x86_64|amd64)  release_arch="x86_64" ;;
+    arm64|aarch64) release_arch="arm64" ;;
+    *) die "当前架构 ($ARCH_NAME) 不支持自动下载 Zed ACP 包" "Architecture ($ARCH_NAME) not supported for auto Zed ACP download" ;;
   esac
 
-  local target_key="${os_key}-${zed_arch}"
-  msg ">>> 正在自动下载并安装 Zed ACP 独立后端包 (target=${target_key}) -> ${dest_dir}/agy_acp_server.par ..." \
-      ">>> Auto-downloading & installing Zed ACP standalone package (target=${target_key}) -> ${dest_dir}/agy_acp_server.par ..."
+  local archive_name="agy-acp-server-${ZED_ACP_VERSION}-${os_key}-${release_arch}.zip"
+  local archive_url="https://dl.google.com/agy-extensions/releases/${release_os}/${archive_name}"
 
-  local archive_url="https://dl.google.com/agy-extensions/releases/${fallback_os}/agy-acp-server-1.4.5-${os_key}-${fallback_arch}.zip"
-  echo "    -> Downloading Zed ACP package: ${archive_url}"
-  local tmpdir
-  tmpdir="$(mktemp -d)"
-  local zip_path="$tmpdir/agy_acp.zip"
+  if [[ -z "$ZED_ACP_SHA256" && "$INSECURE_SKIP_VERIFY" != "1" ]]; then
+    die "下载 Zed ACP 包需要固定的 SHA-256。请设置 ZED_ACP_SHA256=<${archive_name} 的 sha256> 或传入 --zed-sha256 <hex>。\n    哈希应来自可信来源，例如 https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json 中 antigravity-acp 条目的 distribution.binary.<目标平台>.sha256，或您已自行核验的副本。\n    也可以用 --acp-bin 指定已安装的 agy_acp_server.par。" \
+        "Installing the Zed ACP package requires a pinned SHA-256. Set ZED_ACP_SHA256=<sha256 of ${archive_name}> or pass --zed-sha256 <hex>.\n    Take the hash from a trusted source, e.g. distribution.binary.<target>.sha256 of the antigravity-acp entry in https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json, or a copy you verified yourself.\n    Alternatively pass --acp-bin with an already installed agy_acp_server.par."
+  fi
+  command -v unzip >/dev/null 2>&1 || die "需要 unzip 来解压 Zed ACP 包" "unzip is required to extract the Zed ACP package"
+
+  msg ">>> 正在下载 Zed ACP 独立后端包 ${archive_url} -> ${dest_dir} ..." \
+      ">>> Downloading Zed ACP standalone package ${archive_url} -> ${dest_dir} ..."
+  local work="$SCRIPT_TMP/zed"
+  rm -rf "$work"
+  mkdir -p "$work/extract"
+  local zip_path="$work/agy_acp.zip"
   curl -fL --retry 3 -o "$zip_path" "$archive_url"
-  unzip -q -o "$zip_path" -d "$dest_dir"
+  verify_digest 256 "$zip_path" "$ZED_ACP_SHA256" "$archive_name"
+  unzip -q -o "$zip_path" -d "$work/extract"
+
+  local installed="0"
   for fn in agy_acp_server.par agy_acp_server localharness_external; do
-    if [[ -f "$dest_dir/$fn" ]]; then
-      chmod 0755 "$dest_dir/$fn"
+    if [[ -f "$work/extract/$fn" ]]; then
+      install -m 0755 "$work/extract/$fn" "$dest_dir/$fn"
+      installed="1"
       if [[ "$os_key" == "darwin" ]]; then
         xattr -d com.apple.quarantine "$dest_dir/$fn" 2>/dev/null || true
       fi
     fi
   done
-  rm -rf "$tmpdir"
-  msg ">>> Zed ACP 独立后端包安装完成: ${dest_dir}/agy_acp_server.par" \
-      ">>> Zed ACP standalone package installed at: ${dest_dir}/agy_acp_server.par"
+  rm -rf "$work"
+  [[ "$installed" == "1" ]] || die "压缩包中未找到 agy_acp_server" "agy_acp_server not found in the archive"
+  msg ">>> Zed ACP 独立后端包安装完成: ${dest_dir}" ">>> Zed ACP standalone package installed in: ${dest_dir}"
 }
 
 ensure_acp_backend() {
-  if [[ -n "$ACP_BIN" && -f "$ACP_BIN" ]]; then
+  if [[ -n "$ACP_BIN" ]]; then
     return 0
   fi
   if [[ "$AUTO_DOWNLOAD" != "1" ]]; then
@@ -362,7 +628,7 @@ ensure_acp_backend() {
 }
 
 discover_acp_binary() {
-  if [[ -n "$ACP_BIN" && -f "$ACP_BIN" ]]; then
+  if [[ -n "$ACP_BIN" ]]; then
     echo "$ACP_BIN"
     return 0
   fi
@@ -391,20 +657,36 @@ discover_acp_binary() {
   esac
 }
 
+# ------------------------------------------------------------------------------
+# Build
+# ------------------------------------------------------------------------------
+
 build_frontend() {
   msg ">>> [1/3] 构建中英双语前端控制台 (web/dist)..." ">>> [1/3] Building bilingual ReUI frontend (web/dist)..."
   if [[ ! -d "$ROOT_DIR/web/node_modules" ]]; then
-    npm --prefix "$ROOT_DIR/web" install
+    npm --prefix "$ROOT_DIR/web" ci
   fi
   npm --prefix "$ROOT_DIR/web" run build
 }
 
 build_local_binaries() {
   build_frontend
-  mkdir -p "$ROOT_DIR/bin" "$ROOT_DIR/data"
+  mkdir -p "$ROOT_DIR/bin"
   msg ">>> [2/3] 编译 Go 网关与探测工具 ($OS_NAME/$ARCH_NAME)..." ">>> [2/3] Building Go gateway & probe binaries ($OS_NAME/$ARCH_NAME)..."
-  go build -trimpath -ldflags="-s -w" -o "$ROOT_DIR/bin/antigravity-gateway" ./cmd/gateway
-  go build -trimpath -ldflags="-s -w" -o "$ROOT_DIR/bin/antigravity-probe" ./cmd/probe
+  go build -tags webui -trimpath -ldflags="-s -w" -o "$GATEWAY_BIN" ./cmd/gateway
+  go build -trimpath -ldflags="-s -w" -o "$PROBE_BIN" ./cmd/probe
+}
+
+# Copy the tracked (pristine) config so local edits never end up in release archives.
+copy_pristine_config() {
+  local dest="$1"
+  if command -v git >/dev/null 2>&1 && git -C "$ROOT_DIR" cat-file -e HEAD:config/config.yaml 2>/dev/null; then
+    git -C "$ROOT_DIR" show HEAD:config/config.yaml >"$dest"
+  else
+    warn ">>> [警告] 无法从 git 读取原始 config.yaml，改为复制工作区版本，请确认其中不含敏感信息" \
+         ">>> [WARN] Could not read the tracked config.yaml from git; copying the working copy — make sure it holds no secrets"
+    cp "$CFG_PATH" "$dest"
+  fi
 }
 
 build_all_platforms() {
@@ -426,83 +708,130 @@ build_all_platforms() {
     local out_dir="$ROOT_DIR/dist/antigravity-gateway-${goos}-${goarch}"
     mkdir -p "$out_dir/config" "$out_dir/deploy"
     msg ">>> 交叉编译 ${goos}/${goarch}..." ">>> Cross-compiling ${goos}/${goarch}..."
-    CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build -trimpath -ldflags="-s -w" \
+    CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build -tags webui -trimpath -ldflags="-s -w" \
       -o "$out_dir/antigravity-gateway${ext}" ./cmd/gateway
     CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build -trimpath -ldflags="-s -w" \
       -o "$out_dir/antigravity-probe${ext}" ./cmd/probe
-    cp "$ROOT_DIR/config/config.yaml" "$out_dir/config/config.yaml"
-    cp "$ROOT_DIR/deploy/deploy.sh" "$ROOT_DIR/deploy/deploy.ps1" "$ROOT_DIR/deploy/Dockerfile" "$ROOT_DIR/deploy/docker-compose.yml" "$ROOT_DIR/deploy/antigravity-gateway.service" "$out_dir/deploy/" 2>/dev/null || true
+    copy_pristine_config "$out_dir/config/config.yaml"
+    cp "$ROOT_DIR/deploy/deploy.sh" "$ROOT_DIR/deploy/deploy.ps1" "$ROOT_DIR/deploy/Dockerfile" "$ROOT_DIR/deploy/docker-compose.yml" "$ROOT_DIR/deploy/antigravity-gateway.service" "$ROOT_DIR/deploy/gateway.env.example" "$out_dir/deploy/" 2>/dev/null || true
     cp "$ROOT_DIR/README.md" "$ROOT_DIR/README_EN.md" "$out_dir/" 2>/dev/null || true
   done
   msg ">>> 全平台编译完成，产物位于 ./dist 目录。" ">>> Cross-platform build complete. Artifacts in ./dist."
 }
 
-update_config_yaml() {
-  local resolved_bin="auto"
-  if [[ "$MODE" != "docker" ]]; then
-    resolved_bin="$(discover_acp_binary)"
-  elif [[ -n "$ACP_BIN" ]]; then
-    resolved_bin="/opt/antigravity-acp/$(basename "$ACP_BIN")"
+# Persist explicitly requested, non-secret settings into config/config.yaml (local / launchd modes).
+apply_local_config() {
+  local resolved_bin current_bin
+  resolved_bin="$(discover_acp_binary)"
+  if [[ "$resolved_bin" == "$ROOT_DIR/"* ]]; then
+    resolved_bin="./${resolved_bin#"$ROOT_DIR/"}"
   fi
+  current_bin="$(read_config_value binary_path)"
+
   msg ">>> [3/3] 同步网关配置 (backend_type=${BACKEND_NORM}, binary_path=${resolved_bin}, port=${PORT})..." \
       ">>> [3/3] Updating gateway config (backend_type=${BACKEND_NORM}, binary_path=${resolved_bin}, port=${PORT})..."
-
-  local cfg_path="$ROOT_DIR/config/config.yaml"
-  local tmp_cfg
-  tmp_cfg="$(mktemp)"
-  awk -v backend="$BACKEND_NORM" -v bin_path="$resolved_bin" -v port="$PORT" -v admin_pwd="$ADMIN_PASSWORD" '
-    BEGIN { has_backend = 0 }
-    /^[[:space:]]*backend_type[[:space:]]*:/ { has_backend = 1 }
-    { lines[++n] = $0 }
-    END {
-      for (i = 1; i <= n; i++) {
-        line = lines[i]
-        if (!has_backend && line ~ /^acp_pool[[:space:]]*:[[:space:]]*$/) {
-          print line
-          print "  backend_type: \"" backend "\""
-          continue
-        }
-        if (line ~ /^[[:space:]]*backend_type[[:space:]]*:/) {
-          sub(/:.*/, ": \"" backend "\"", line)
-        } else if (bin_path != "" && line ~ /^[[:space:]]*binary_path[[:space:]]*:/) {
-          sub(/:.*/, ": \"" bin_path "\"", line)
-        } else if (port != "" && line ~ /^[[:space:]]*port[[:space:]]*:[[:space:]]*[0-9]+/) {
-          sub(/:[[:space:]]*[0-9]+/, ": " port, line)
-        } else if (port != "" && line ~ /^[[:space:]]*public_base_url[[:space:]]*:[[:space:]]*"http:\/\/localhost:[0-9]+"/) {
-          sub(/http:\/\/localhost:[0-9]+/, "http://localhost:" port, line)
-        } else if (admin_pwd != "" && line ~ /^[[:space:]]*admin_password[[:space:]]*:/) {
-          sub(/:.*/, ": \"" admin_pwd "\"", line)
-        } else if (admin_pwd == "" && line ~ /^[[:space:]]*(admin_password|admin_token)[[:space:]]*:[[:space:]]*"ag-admin-secret-key"/) {
-          sub(/:.*/, ": \"auto\"", line)
-        }
-        print line
-      }
-    }
-  ' "$cfg_path" > "$tmp_cfg"
-  mv -f "$tmp_cfg" "$cfg_path"
+  if [[ "$BACKEND_SET" == "1" ]]; then
+    set_yaml_value "$CFG_PATH" acp_pool backend_type "$(yaml_quote "$BACKEND_NORM")"
+  fi
+  if [[ -n "$resolved_bin" && "$resolved_bin" != "$current_bin" ]]; then
+    set_yaml_value "$CFG_PATH" acp_pool binary_path "$(yaml_quote "$resolved_bin")"
+  fi
+  if [[ "$PORT_SET" == "1" ]]; then
+    set_yaml_value "$CFG_PATH" server port "$PORT"
+    if [[ "$(read_config_value public_base_url)" =~ ^http://localhost:[0-9]+$ ]]; then
+      set_yaml_value "$CFG_PATH" server public_base_url "$(yaml_quote "http://localhost:${PORT}")"
+    fi
+  fi
 }
+
+# ------------------------------------------------------------------------------
+# Process helpers (local mode)
+# ------------------------------------------------------------------------------
+
+process_command() {
+  ps -ww -p "$1" -o command= 2>/dev/null || true
+}
+
+# Only treat a PID as ours if its command line is the gateway binary from this checkout.
+pid_is_gateway() {
+  local pid="$1"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  local cmd
+  cmd="$(process_command "$pid")"
+  [[ "$cmd" == "$GATEWAY_BIN" || "$cmd" == "$GATEWAY_BIN "* ]]
+}
+
+pid_alive() {
+  kill -0 "$1" 2>/dev/null
+}
+
+wait_for_exit() {
+  local pid="$1" timeout="$2" i
+  for (( i = 0; i < timeout; i++ )); do
+    pid_alive "$pid" || return 0
+    sleep 1
+  done
+  ! pid_alive "$pid"
+}
+
+port_listeners() {
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | sort -u | tr '\n' ' ' | sed 's/ *$//' || true
+  fi
+}
+
+report_port_owner() {
+  local ours="${1:-}"
+  local p
+  for p in $(port_listeners); do
+    [[ "$p" == "$ours" ]] && continue
+    warn ">>> 端口 ${PORT} 被 PID ${p} 占用 (非本网关进程): $(process_command "$p")" \
+         ">>> Port ${PORT} is busy by PID ${p} (not ours): $(process_command "$p")"
+  done
+}
+
+# wait_for_healthz <url> <timeout-seconds> [pid]: 0 = healthy, 1 = timeout, 2 = process exited
+wait_for_healthz() {
+  local url="$1" timeout="$2" pid="${3:-}" i
+  if ! command -v curl >/dev/null 2>&1; then
+    sleep 2
+    [[ -z "$pid" ]] || pid_alive "$pid" || return 2
+    return 0
+  fi
+  for (( i = 0; i < timeout; i++ )); do
+    if [[ -n "$pid" ]] && ! pid_alive "$pid"; then
+      return 2
+    fi
+    if curl -fsS -m 2 -o /dev/null "$url" 2>/dev/null; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+# ------------------------------------------------------------------------------
+# Credentials banner
+# ------------------------------------------------------------------------------
 
 print_admin_credentials_banner() {
   local cred_content=""
   local hint_cmd=""
   if [[ "$MODE" == "docker" ]]; then
-    hint_cmd="docker exec antigravity-gateway cat /var/lib/antigravity-gateway/admin_credentials.txt  (或 docker logs antigravity-gateway)"
-    for _ in 1 2 3 4 5; do
-      cred_content="$(docker exec antigravity-gateway cat /var/lib/antigravity-gateway/admin_credentials.txt 2>/dev/null || true)"
-      [[ -n "$cred_content" ]] && break
-      sleep 1
-    done
+    hint_cmd="docker exec antigravity-gateway cat /var/lib/antigravity-gateway/admin_credentials.txt"
+    cred_content="$(docker exec antigravity-gateway cat /var/lib/antigravity-gateway/admin_credentials.txt 2>/dev/null || true)"
+  elif [[ "$MODE" == "service" && "$OS_NAME" == "Linux" ]]; then
+    local cred_file="$SERVICE_DATA_DIR/admin_credentials.txt"
+    hint_cmd="sudo cat ${cred_file}"
+    cred_content="$(sudo -n cat "$cred_file" 2>/dev/null || true)"
   else
-    local cred_file="$ROOT_DIR/data/admin_credentials.txt"
-    [[ "$MODE" == "service" && "$OS_NAME" == "Linux" ]] && cred_file="/var/lib/antigravity-gateway/admin_credentials.txt"
-    hint_cmd="cat ${cred_file}  (或查看日志 ${ROOT_DIR}/data/gateway.log)"
-    for _ in 1 2 3 4; do
-      if [[ -f "$cred_file" ]]; then
-        cred_content="$(cat "$cred_file" 2>/dev/null || true)"
-        [[ -n "$cred_content" ]] && break
-      fi
-      sleep 1
-    done
+    local cred_file
+    cred_file="$(local_data_dir)/admin_credentials.txt"
+    hint_cmd="cat ${cred_file}"
+    if [[ -f "$cred_file" ]]; then
+      cred_content="$(cat "$cred_file" 2>/dev/null || true)"
+    fi
   fi
 
   echo "=============================================================================="
@@ -511,187 +840,466 @@ print_admin_credentials_banner() {
     echo "$cred_content"
   fi
   msg ">>> 随时查看凭证命令: ${hint_cmd}" ">>> View credentials anytime via: ${hint_cmd}"
-  msg ">>> 说明: 未主动修改前，每次部署将动态生成随机密码与 Token；登录 Web 控制台点击右上角「修改密码」修改后即永久固定。" \
-      ">>> Note: Password & Token rotate dynamically on each deploy until modified via Web Console -> Change Password."
+  msg ">>> 说明: 凭证不会写入日志。未主动修改前，每次启动会动态生成随机密码与 Token；登录 Web 控制台点击右上角「修改密码」修改后即永久固定。" \
+      ">>> Note: credentials are never logged. Password & token rotate on every start until changed via Web Console -> Change Password."
+  msg ">>> 北向 API (/v1/*) 仅允许本机回环地址免密访问；远程客户端请先在控制台创建 API Key。" \
+      ">>> Northbound API (/v1/*) is only open without a key from loopback; create an API key in the console for remote clients."
   echo "=============================================================================="
 }
 
-find_running_gateway_pids() {
-  local pid_file="$ROOT_DIR/data/gateway.pid"
-  local pids=()
+# ------------------------------------------------------------------------------
+# Local mode lifecycle
+# ------------------------------------------------------------------------------
+
+read_pid_file() {
+  local pid_file
+  pid_file="$(local_data_dir)/gateway.pid"
   if [[ -f "$pid_file" ]]; then
-    local file_pid
-    file_pid="$(cat "$pid_file" 2>/dev/null || true)"
-    if [[ -n "$file_pid" ]] && kill -0 "$file_pid" 2>/dev/null; then
-      pids+=("$file_pid")
-    fi
-  fi
-  if command -v lsof >/dev/null 2>&1; then
-    local port_pids
-    port_pids="$(lsof -tiTCP:"${PORT}" -sTCP:LISTEN 2>/dev/null || true)"
-    for p in $port_pids; do
-      if [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null; then
-        local seen=0
-        for ep in "${pids[@]:-}"; do
-          [[ "$ep" == "$p" ]] && seen=1
-        done
-        [[ "$seen" == "0" ]] && pids+=("$p")
-      fi
-    done
-  fi
-  if command -v pgrep >/dev/null 2>&1; then
-    local pg_pids
-    pg_pids="$(pgrep -f "$ROOT_DIR/bin/antigravity-gateway" 2>/dev/null || true)"
-    for p in $pg_pids; do
-      if [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null; then
-        local seen=0
-        for ep in "${pids[@]:-}"; do
-          [[ "$ep" == "$p" ]] && seen=1
-        done
-        [[ "$seen" == "0" ]] && pids+=("$p")
-      fi
-    done
-  fi
-  echo "${pids[*]:-}"
-}
-
-start_local() {
-  mkdir -p "$ROOT_DIR/data"
-  local pid_file="$ROOT_DIR/data/gateway.pid"
-  local log_file="$ROOT_DIR/data/gateway.log"
-  local existing_pids
-  existing_pids="$(find_running_gateway_pids)"
-  if [[ -n "$existing_pids" ]]; then
-    msg ">>> 网关已在运行 (PID: $existing_pids)，正在平滑重启..." ">>> Gateway already running (PID: $existing_pids), restarting..."
-    for opid in $existing_pids; do
-      kill "$opid" 2>/dev/null || true
-    done
-    sleep 1
-  fi
-
-  nohup "$ROOT_DIR/bin/antigravity-gateway" \
-    -config "$ROOT_DIR/config/config.yaml" \
-    -backend "$BACKEND_NORM" \
-    ${ACP_BIN:+-acp-bin "$ACP_BIN"} \
-    >>"$log_file" 2>&1 &
-  local new_pid=$!
-  echo "$new_pid" >"$pid_file"
-  sleep 1
-  if kill -0 "$new_pid" 2>/dev/null; then
-    msg ">>> Antigravity ACP Gateway 已启动! PID: $new_pid | 地址: http://localhost:${PORT}" \
-        ">>> Antigravity ACP Gateway started! PID: $new_pid | URL: http://localhost:${PORT}"
-    print_admin_credentials_banner
-  else
-    msg ">>> 启动失败，请检查日志: $log_file" ">>> Startup failed. Check log: $log_file"
-    tail -n 20 "$log_file" || true
-    exit 1
+    tr -d '[:space:]' <"$pid_file" || true
   fi
 }
 
 stop_local() {
-  local pid_file="$ROOT_DIR/data/gateway.pid"
-  local existing_pids
-  existing_pids="$(find_running_gateway_pids)"
-  if [[ -n "$existing_pids" ]]; then
-    for pid in $existing_pids; do
-      kill "$pid" 2>/dev/null || true
-    done
+  local data_dir pid_file pid
+  data_dir="$(local_data_dir)"
+  pid_file="$data_dir/gateway.pid"
+  pid="$(read_pid_file)"
+
+  if [[ -z "$pid" ]] || ! pid_alive "$pid"; then
     rm -f "$pid_file"
-    msg ">>> 已停止网关进程 (PID: $existing_pids)" ">>> Stopped gateway process (PID: $existing_pids)"
+    msg ">>> 未发现运行中的网关进程 (PID 文件: $pid_file)" ">>> No running gateway process found (pid file: $pid_file)"
+    report_port_owner
     return 0
   fi
+  if ! pid_is_gateway "$pid"; then
+    warn ">>> [警告] PID 文件中的进程 $pid 不是 $GATEWAY_BIN ($(process_command "$pid"))，不会终止它；已删除过期的 PID 文件" \
+         ">>> [WARN] PID $pid from the pid file is not $GATEWAY_BIN ($(process_command "$pid")); not killing it, removed stale pid file"
+    rm -f "$pid_file"
+    return 0
+  fi
+
+  kill "$pid" 2>/dev/null || true
+  if ! wait_for_exit "$pid" 15; then
+    warn ">>> [警告] 网关进程 $pid 15 秒内未退出，发送 SIGKILL" ">>> [WARN] Gateway PID $pid did not exit within 15s; sending SIGKILL"
+    kill -9 "$pid" 2>/dev/null || true
+    wait_for_exit "$pid" 5 || true
+  fi
   rm -f "$pid_file"
-  msg ">>> 未发现运行中的网关进程" ">>> No running gateway process found"
+  msg ">>> 已停止网关进程 (PID: $pid)" ">>> Stopped gateway process (PID: $pid)"
+}
+
+start_local() {
+  [[ -x "$GATEWAY_BIN" ]] || die "未找到 ${GATEWAY_BIN}，请先执行 --action build" "$GATEWAY_BIN not found; run --action build first"
+  umask 077
+  local data_dir pid_file log_file
+  data_dir="$(local_data_dir)"
+  pid_file="$data_dir/gateway.pid"
+  log_file="$data_dir/gateway.log"
+  mkdir -p "$data_dir"
+  chmod 700 "$data_dir"
+  touch "$log_file"
+  chmod 600 "$log_file"
+
+  local old_pid
+  old_pid="$(read_pid_file)"
+  if [[ -n "$old_pid" ]] && pid_is_gateway "$old_pid"; then
+    msg ">>> 网关已在运行 (PID: $old_pid)，正在平滑重启..." ">>> Gateway already running (PID: $old_pid), restarting..."
+    stop_local
+  fi
+
+  local busy
+  busy="$(port_listeners)"
+  if [[ -n "$busy" ]]; then
+    report_port_owner
+    die "端口 ${PORT} 已被占用，无法启动" "Port ${PORT} is already in use; cannot start"
+  fi
+
+  local gw_args=(-config "$CFG_PATH")
+  [[ "$BACKEND_SET" == "1" ]] && gw_args+=(-backend "$BACKEND_NORM")
+  [[ -n "$ACP_BIN" ]] && gw_args+=(-acp-bin "$ACP_BIN")
+
+  if [[ -n "$ADMIN_PASSWORD" ]]; then
+    AG_ADMIN_PASSWORD="$ADMIN_PASSWORD" nohup "$GATEWAY_BIN" "${gw_args[@]}" >>"$log_file" 2>&1 &
+  else
+    nohup "$GATEWAY_BIN" "${gw_args[@]}" >>"$log_file" 2>&1 &
+  fi
+  local new_pid=$!
+  echo "$new_pid" >"$pid_file"
+
+  local rc=0
+  wait_for_healthz "http://$(health_host):${PORT}/healthz" 20 "$new_pid" || rc=$?
+  if [[ "$rc" == "0" ]]; then
+    msg ">>> Antigravity ACP Gateway 已启动! PID: $new_pid | 地址: http://localhost:${PORT}" \
+        ">>> Antigravity ACP Gateway started! PID: $new_pid | URL: http://localhost:${PORT}"
+    print_admin_credentials_banner
+    return 0
+  fi
+  if [[ "$rc" == "1" ]]; then
+    msg ">>> 网关进程 (PID: $new_pid) 20 秒内未通过 /healthz 检查，请检查日志: $log_file" \
+        ">>> Gateway (PID: $new_pid) did not pass /healthz within 20s. Check log: $log_file"
+  else
+    rm -f "$pid_file"
+    msg ">>> 启动失败，进程已退出，请检查日志: $log_file" ">>> Startup failed; the process exited. Check log: $log_file"
+  fi
+  tail -n 20 "$log_file" || true
+  exit 1
 }
 
 status_local() {
-  local existing_pids
-  existing_pids="$(find_running_gateway_pids)"
-  if [[ -n "$existing_pids" ]]; then
-    msg ">>> 运行中 (PID: $existing_pids) | http://localhost:${PORT}" ">>> Running (PID: $existing_pids) | http://localhost:${PORT}"
+  local pid
+  pid="$(read_pid_file)"
+  if [[ -n "$pid" ]] && pid_is_gateway "$pid"; then
+    msg ">>> 运行中 (PID: $pid) | http://localhost:${PORT}" ">>> Running (PID: $pid) | http://localhost:${PORT}"
+    report_port_owner "$pid"
     return 0
   fi
   msg ">>> 未运行" ">>> Stopped"
+  report_port_owner
+  return 3
 }
 
-install_service() {
-  if [[ "$OS_NAME" == "Darwin" ]]; then
-    local plist_dir="$HOME/Library/LaunchAgents"
-    local plist_path="$plist_dir/com.antigravity.gateway.plist"
-    mkdir -p "$plist_dir" "$ROOT_DIR/data"
-    cat >"$plist_path" <<EOF
+# ------------------------------------------------------------------------------
+# Service mode (systemd on Linux, launchd on macOS)
+# ------------------------------------------------------------------------------
+
+systemd_env_quote() {
+  printf '"%s"' "$(printf '%s' "$1" | sed -e 's/[\\"$`]/\\&/g')"
+}
+
+xml_escape() {
+  printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&apos;/g"
+}
+
+write_service_env_file() {
+  [[ -n "$ADMIN_PASSWORD" ]] || return 0
+  local tmp="$SCRIPT_TMP/service.env"
+  (
+    umask 077
+    printf '# Managed by deploy/deploy.sh. Applies only until the password is changed in the Web Console.\nAG_ADMIN_PASSWORD=%s\n' \
+      "$(systemd_env_quote "$ADMIN_PASSWORD")" >"$tmp"
+  )
+  sudo install -d -o root -g root -m 0755 "$SERVICE_CONFIG_DIR"
+  sudo install -o root -g root -m 0600 "$tmp" "$SERVICE_ENV_FILE"
+  rm -f "$tmp"
+  msg ">>> 管理员密码已写入 $SERVICE_ENV_FILE (root:root 0600)" ">>> Admin password written to $SERVICE_ENV_FILE (root:root 0600)"
+}
+
+ensure_service_user() {
+  if id -u "$SERVICE_USER" >/dev/null 2>&1; then
+    return 0
+  fi
+  local nologin="/usr/sbin/nologin"
+  [[ -x "$nologin" ]] || nologin="/sbin/nologin"
+  msg ">>> 创建系统用户 $SERVICE_USER ..." ">>> Creating system user $SERVICE_USER ..."
+  sudo useradd --system --user-group --home-dir "$SERVICE_STATE_DIR" --no-create-home --shell "$nologin" "$SERVICE_USER"
+}
+
+# Install the ACP backend as a root-owned copy in /usr/local/bin; never run a binary from the checkout.
+SERVICE_ACP_PATH=""
+install_service_acp_binary() {
+  local src
+  src="$(discover_acp_binary)"
+  if [[ ! -f "$src" ]]; then
+    if [[ "$src" != */* ]] && command -v "$src" >/dev/null 2>&1; then
+      src="$(command -v "$src")"
+    else
+      die "未找到 ACP 后端二进制 ($src)，请使用 --acp-bin 指定或去掉 --no-download" \
+          "ACP backend binary not found ($src); pass --acp-bin or drop --no-download"
+    fi
+  fi
+
+  local base dest
+  base="$(basename "$src")"
+  case "$base" in
+    agy_acp_server*) dest="$SERVICE_BIN_DIR/$base" ;;
+    *) dest="$SERVICE_BIN_DIR/agy" ;;
+  esac
+  if [[ ! "$src" -ef "$dest" ]]; then
+    sudo install -o root -g root -m 0755 "$src" "$dest"
+  fi
+  if [[ "$base" == agy_acp_server* ]]; then
+    local helper
+    helper="$(dirname "$src")/localharness_external"
+    if [[ -f "$helper" && ! "$helper" -ef "$SERVICE_BIN_DIR/localharness_external" ]]; then
+      sudo install -o root -g root -m 0755 "$helper" "$SERVICE_BIN_DIR/localharness_external"
+    fi
+  fi
+  SERVICE_ACP_PATH="$dest"
+}
+
+wait_for_service_health() {
+  local rc=0
+  wait_for_healthz "http://$(health_host "$SERVICE_CONFIG_DIR/config.yaml"):${PORT}/healthz" 20 || rc=$?
+  if [[ "$rc" != "0" ]]; then
+    msg ">>> 服务 20 秒内未通过 /healthz 检查，请执行: sudo systemctl status $SERVICE_NAME; sudo journalctl -u $SERVICE_NAME -n 50" \
+        ">>> Service did not pass /healthz within 20s. Run: sudo systemctl status $SERVICE_NAME; sudo journalctl -u $SERVICE_NAME -n 50"
+    exit 1
+  fi
+}
+
+install_service_linux() {
+  command -v systemctl >/dev/null 2>&1 || die "未检测到 systemd (systemctl)" "systemd (systemctl) not found"
+
+  sudo install -o root -g root -m 0755 "$GATEWAY_BIN" "$SERVICE_BIN_DIR/antigravity-gateway"
+  sudo install -o root -g root -m 0755 "$PROBE_BIN" "$SERVICE_BIN_DIR/antigravity-probe"
+  install_service_acp_binary
+
+  ensure_service_user
+  sudo install -d -o root -g root -m 0755 "$SERVICE_CONFIG_DIR"
+  sudo install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0700 "$SERVICE_STATE_DIR" "$SERVICE_DATA_DIR" "$SERVICE_WORKSPACE_DIR"
+  sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$SERVICE_STATE_DIR"
+
+  local cfg_tmp="$SCRIPT_TMP/service-config.yaml"
+  cp "$CFG_PATH" "$cfg_tmp"
+  set_yaml_value "$cfg_tmp" acp_pool backend_type "$(yaml_quote "$BACKEND_NORM")"
+  set_yaml_value "$cfg_tmp" acp_pool binary_path "$(yaml_quote "$SERVICE_ACP_PATH")"
+  set_yaml_value "$cfg_tmp" acp_pool workspace_dir "$(yaml_quote "$SERVICE_WORKSPACE_DIR")"
+  set_yaml_value "$cfg_tmp" server data_dir "$(yaml_quote "$SERVICE_DATA_DIR")"
+  set_yaml_value "$cfg_tmp" server port "$PORT"
+  set_yaml_value "$cfg_tmp" server public_base_url "$(yaml_quote "http://localhost:${PORT}")"
+  if [[ -f "$SERVICE_CONFIG_DIR/config.yaml" ]] && ! sudo cmp -s "$cfg_tmp" "$SERVICE_CONFIG_DIR/config.yaml"; then
+    local backup
+    backup="$SERVICE_CONFIG_DIR/config.yaml.bak.$(date +%Y%m%d%H%M%S)"
+    sudo cp -p "$SERVICE_CONFIG_DIR/config.yaml" "$backup"
+    msg ">>> 已备份旧配置: $backup" ">>> Backed up previous config: $backup"
+  fi
+  sudo install -o root -g root -m 0644 "$cfg_tmp" "$SERVICE_CONFIG_DIR/config.yaml"
+  write_service_env_file
+
+  sudo install -o root -g root -m 0644 "$ROOT_DIR/deploy/antigravity-gateway.service" "/etc/systemd/system/${SERVICE_NAME}.service"
+  sudo systemctl daemon-reload
+  sudo systemctl enable "${SERVICE_NAME}.service"
+  sudo systemctl restart "${SERVICE_NAME}.service"
+  wait_for_service_health
+  msg ">>> Linux systemd 服务 (${SERVICE_NAME}.service，用户 ${SERVICE_USER}) 已安装并启动" \
+      ">>> Linux systemd service (${SERVICE_NAME}.service, user ${SERVICE_USER}) installed and started"
+  print_admin_credentials_banner
+}
+
+write_launchd_plist() {
+  local data_dir log_file
+  data_dir="$(local_data_dir)"
+  log_file="$data_dir/gateway.log"
+  (
+    umask 077
+    mkdir -p "$(dirname "$LAUNCHD_PLIST")" "$data_dir"
+    chmod 700 "$data_dir"
+    touch "$log_file"
+    chmod 600 "$log_file"
+  )
+  local env_block=""
+  if [[ -n "$ADMIN_PASSWORD" ]]; then
+    env_block="  <key>EnvironmentVariables</key>
+  <dict>
+    <key>AG_ADMIN_PASSWORD</key>
+    <string>$(xml_escape "$ADMIN_PASSWORD")</string>
+  </dict>"
+  fi
+  (
+    umask 077
+    cat >"$LAUNCHD_PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.antigravity.gateway</string>
+  <string>${LAUNCHD_LABEL}</string>
   <key>WorkingDirectory</key>
-  <string>${ROOT_DIR}</string>
+  <string>$(xml_escape "$ROOT_DIR")</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${ROOT_DIR}/bin/antigravity-gateway</string>
+    <string>$(xml_escape "$GATEWAY_BIN")</string>
     <string>-config</string>
-    <string>${ROOT_DIR}/config/config.yaml</string>
-    <string>-backend</string>
-    <string>${BACKEND_NORM}</string>
+    <string>$(xml_escape "$CFG_PATH")</string>
   </array>
+${env_block}
+  <key>Umask</key>
+  <integer>63</integer>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
   <true/>
   <key>StandardOutPath</key>
-  <string>${ROOT_DIR}/data/gateway.log</string>
+  <string>$(xml_escape "$log_file")</string>
   <key>StandardErrorPath</key>
-  <string>${ROOT_DIR}/data/gateway.log</string>
+  <string>$(xml_escape "$log_file")</string>
 </dict>
 </plist>
 EOF
-    launchctl unload "$plist_path" 2>/dev/null || true
-    launchctl load "$plist_path"
-    msg ">>> macOS launchd 服务已安装并启动: $plist_path" ">>> macOS launchd service installed & loaded: $plist_path"
-    print_admin_credentials_banner
-  elif [[ "$OS_NAME" == "Linux" ]]; then
-    sudo install -m 0755 "$ROOT_DIR/bin/antigravity-gateway" /usr/local/bin/antigravity-gateway
-    sudo install -m 0755 "$ROOT_DIR/bin/antigravity-probe" /usr/local/bin/antigravity-probe
-    if [[ -f "$ROOT_DIR/bin/agy" ]]; then
-      sudo install -m 0755 "$ROOT_DIR/bin/agy" /usr/local/bin/agy
-    fi
-    if [[ -f "$ROOT_DIR/bin/agy_acp_server.par" ]]; then
-      sudo install -m 0755 "$ROOT_DIR/bin/agy_acp_server.par" /usr/local/bin/agy_acp_server.par
-    fi
-    if [[ -f "$ROOT_DIR/bin/localharness_external" ]]; then
-      sudo install -m 0755 "$ROOT_DIR/bin/localharness_external" /usr/local/bin/localharness_external
-    fi
-    sudo mkdir -p /etc/antigravity-gateway /var/lib/antigravity-gateway
-    sudo cp "$ROOT_DIR/config/config.yaml" /etc/antigravity-gateway/config.yaml
-    sudo cp "$ROOT_DIR/deploy/antigravity-gateway.service" /etc/systemd/system/antigravity-gateway.service
-    sudo systemctl daemon-reload
-    sudo systemctl enable --now antigravity-gateway.service
-    msg ">>> Linux systemd 服务 (antigravity-gateway.service) 已安装并启动" \
-        ">>> Linux systemd service (antigravity-gateway.service) installed and started"
-    print_admin_credentials_banner
+  )
+  chmod 600 "$LAUNCHD_PLIST"
+}
+
+install_service_macos() {
+  apply_local_config
+  write_launchd_plist
+  launchctl unload "$LAUNCHD_PLIST" 2>/dev/null || true
+  launchctl load "$LAUNCHD_PLIST"
+  local rc=0
+  wait_for_healthz "http://$(health_host):${PORT}/healthz" 20 || rc=$?
+  if [[ "$rc" != "0" ]]; then
+    msg ">>> launchd 服务 20 秒内未通过 /healthz 检查，请检查日志: $(local_data_dir)/gateway.log" \
+        ">>> launchd service did not pass /healthz within 20s. Check log: $(local_data_dir)/gateway.log"
+    exit 1
   fi
+  msg ">>> macOS launchd 服务已安装并启动: $LAUNCHD_PLIST" ">>> macOS launchd service installed & loaded: $LAUNCHD_PLIST"
+  print_admin_credentials_banner
+}
+
+install_service() {
+  case "$OS_NAME" in
+    Linux) install_service_linux ;;
+    Darwin) install_service_macos ;;
+    *) die "当前系统 ($OS_NAME) 不支持 service 模式" "Service mode is not supported on $OS_NAME" ;;
+  esac
+}
+
+service_ctl() {
+  local verb="$1"
+  if [[ "$OS_NAME" == "Linux" ]]; then
+    case "$verb" in
+      start|restart)
+        write_service_env_file
+        sudo systemctl "$verb" "${SERVICE_NAME}.service"
+        wait_for_service_health
+        msg ">>> 已执行 ${verb}: ${SERVICE_NAME}.service" ">>> ${SERVICE_NAME}.service: ${verb} done"
+        print_admin_credentials_banner
+        ;;
+      stop) sudo systemctl stop "${SERVICE_NAME}.service" ;;
+      status) systemctl status --no-pager "${SERVICE_NAME}.service" ;;
+    esac
+  elif [[ "$OS_NAME" == "Darwin" ]]; then
+    [[ -f "$LAUNCHD_PLIST" ]] || die "未安装 launchd 服务，请先执行 --mode service --action install" \
+                                    "launchd service not installed; run --mode service --action install first"
+    case "$verb" in
+      start) launchctl load "$LAUNCHD_PLIST" ;;
+      stop) launchctl unload "$LAUNCHD_PLIST" ;;
+      restart)
+        if [[ -n "$ADMIN_PASSWORD" ]]; then
+          write_launchd_plist
+        fi
+        launchctl unload "$LAUNCHD_PLIST" 2>/dev/null || true
+        launchctl load "$LAUNCHD_PLIST"
+        ;;
+      status) launchctl list | grep -F "$LAUNCHD_LABEL" || { msg ">>> 未运行" ">>> Stopped"; return 3; } ;;
+    esac
+  else
+    die "当前系统 ($OS_NAME) 不支持 service 模式" "Service mode is not supported on $OS_NAME"
+  fi
+}
+
+# ------------------------------------------------------------------------------
+# Docker mode
+# ------------------------------------------------------------------------------
+
+write_docker_env_file() {
+  [[ -n "$ADMIN_PASSWORD" ]] || return 0
+  case "$ADMIN_PASSWORD" in
+    *"'"*) die "Docker 模式下管理员密码不能包含单引号 (')" "In docker mode the admin password must not contain a single quote (')" ;;
+  esac
+  (
+    umask 077
+    printf "# Managed by deploy/deploy.sh (gitignored). Applies only until the password is changed in the Web Console.\nAG_ADMIN_PASSWORD='%s'\n" \
+      "$ADMIN_PASSWORD" >"$DOCKER_ENV_FILE"
+  )
+  chmod 600 "$DOCKER_ENV_FILE"
+  msg ">>> 管理员密码已写入 $DOCKER_ENV_FILE (0600，已被 git 忽略)" ">>> Admin password written to $DOCKER_ENV_FILE (0600, gitignored)"
+}
+
+docker_env_setup() {
+  export AG_ACP_BACKEND="$BACKEND_NORM"
+  export AG_PORT="$PORT"
+  [[ -n "$ZED_ACP_SHA256" ]] && export ZED_ACP_SHA256
+  export ZED_ACP_VERSION
+  [[ "$INSECURE_SKIP_VERIFY" == "1" ]] && export AG_INSECURE_SKIP_VERIFY=1
+  if [[ -z "${AG_BIND:-}" ]]; then
+    msg ">>> 端口仅绑定 127.0.0.1:${PORT}；如需对外开放请显式设置 AG_BIND=0.0.0.0" \
+        ">>> Port is published on 127.0.0.1:${PORT} only; set AG_BIND=0.0.0.0 explicitly to expose it"
+  fi
+  write_docker_env_file
+}
+
+docker_health_url() {
+  local bind="${AG_BIND:-127.0.0.1}"
+  case "$bind" in
+    0.0.0.0|"::"|"") bind="127.0.0.1" ;;
+  esac
+  echo "http://${bind}:${PORT}/healthz"
+}
+
+docker_wait_and_banner() {
+  local rc=0
+  wait_for_healthz "$(docker_health_url)" 30 || rc=$?
+  if [[ "$rc" != "0" ]]; then
+    msg ">>> 容器 30 秒内未通过 /healthz 检查，请执行: docker compose -f deploy/docker-compose.yml logs" \
+        ">>> Container did not pass /healthz within 30s. Run: docker compose -f deploy/docker-compose.yml logs"
+    exit 1
+  fi
+  msg ">>> Docker 容器已启动! 访问地址: http://localhost:${PORT}" ">>> Docker container is up! Access URL: http://localhost:${PORT}"
+  print_admin_credentials_banner
 }
 
 deploy_docker() {
   mkdir -p "$ROOT_DIR/bin"
-  if [[ -n "$ACP_BIN" && -f "$ACP_BIN" ]]; then
+  if [[ -n "$ACP_BIN" ]]; then
     local base_name
     base_name="$(basename "$ACP_BIN")"
     cp -f "$ACP_BIN" "$ROOT_DIR/bin/$base_name"
-    chmod +x "$ROOT_DIR/bin/$base_name"
+    chmod 0755 "$ROOT_DIR/bin/$base_name"
+    export AG_ACP_BINARY_PATH="/opt/antigravity-acp/$base_name"
   fi
-  export AG_ACP_BACKEND="$BACKEND_NORM"
-  export AG_PORT="$PORT"
-  [[ -n "$ADMIN_PASSWORD" ]] && export AG_ADMIN_PASSWORD="$ADMIN_PASSWORD"
+  if [[ "$BACKEND_NORM" == "zed" && -z "$ZED_ACP_SHA256" && "$INSECURE_SKIP_VERIFY" != "1" ]]; then
+    die "Docker 构建 Zed 后端需要 ZED_ACP_SHA256 (或 --zed-sha256)" "Building the Zed backend image requires ZED_ACP_SHA256 (or --zed-sha256)"
+  fi
+  docker_env_setup
 
   msg ">>> 使用 Docker Compose 构建并启动容器 (AG_ACP_BACKEND=${AG_ACP_BACKEND}, PORT=${AG_PORT})..." \
       ">>> Building and starting container via Docker Compose (AG_ACP_BACKEND=${AG_ACP_BACKEND}, PORT=${AG_PORT})..."
-  docker compose -f "$ROOT_DIR/deploy/docker-compose.yml" up -d --build
-  msg ">>> Docker 容器已启动! 访问地址: http://localhost:${PORT}" \
-      ">>> Docker container is up! Access URL: http://localhost:${PORT}"
-  print_admin_credentials_banner
+  docker compose -f "$COMPOSE_FILE" up -d --build
+  docker_wait_and_banner
+}
+
+docker_ctl() {
+  local verb="$1"
+  mkdir -p "$ROOT_DIR/bin"
+  case "$verb" in
+    start)
+      docker_env_setup
+      docker compose -f "$COMPOSE_FILE" up -d
+      docker_wait_and_banner
+      ;;
+    restart)
+      docker_env_setup
+      docker compose -f "$COMPOSE_FILE" up -d --force-recreate
+      docker_wait_and_banner
+      ;;
+    stop) docker compose -f "$COMPOSE_FILE" down ;;
+    status) docker compose -f "$COMPOSE_FILE" ps ;;
+  esac
+}
+
+# ------------------------------------------------------------------------------
+# Main
+# ------------------------------------------------------------------------------
+
+lifecycle() {
+  local verb="$1"
+  case "$MODE" in
+    service) service_ctl "$verb" ;;
+    docker) docker_ctl "$verb" ;;
+    *)
+      case "$verb" in
+        start|restart)
+          ensure_acp_backend
+          apply_local_config
+          [[ "$verb" == "restart" ]] && stop_local
+          start_local
+          ;;
+        stop) stop_local ;;
+        status) status_local ;;
+      esac
+      ;;
+  esac
 }
 
 case "$ACTION" in
@@ -708,50 +1316,24 @@ case "$ACTION" in
   build)
     build_local_binaries
     ensure_acp_backend
-    update_config_yaml
+    apply_local_config
     ;;
   install)
     if [[ "$MODE" == "docker" ]]; then
-      update_config_yaml
       deploy_docker
     elif [[ "$MODE" == "service" ]]; then
       build_local_binaries
       ensure_acp_backend
-      update_config_yaml
       install_service
     else
       build_local_binaries
       ensure_acp_backend
-      update_config_yaml
+      apply_local_config
       start_local
     fi
     ;;
-  start)
-    if [[ "$MODE" == "docker" ]]; then
-      docker compose -f "$ROOT_DIR/deploy/docker-compose.yml" up -d
-    else
-      ensure_acp_backend
-      start_local
-    fi
-    ;;
-  stop)
-    if [[ "$MODE" == "docker" ]]; then
-      docker compose -f "$ROOT_DIR/deploy/docker-compose.yml" down
-    else
-      stop_local
-    fi
-    ;;
-  restart)
-    if [[ "$MODE" == "docker" ]]; then
-      docker compose -f "$ROOT_DIR/deploy/docker-compose.yml" restart
-    else
-      stop_local
-      ensure_acp_backend
-      start_local
-    fi
-    ;;
-  status)
-    status_local
+  start|stop|restart|status)
+    lifecycle "$ACTION"
     ;;
   *)
     usage

@@ -22,6 +22,16 @@ updates:
     commit-message:
       prefix: "chore(web-deps)"
 
+  # Docker base images (/deploy/Dockerfile)
+  # 容器基础镜像版本每周检查
+  - package-ecosystem: "docker"
+    directory: "/deploy"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(docker)"
+
   # GitHub Actions workflows (/.github/workflows)
   # GitHub Actions 工作流组件版本检查
   - package-ecosystem: "github-actions"

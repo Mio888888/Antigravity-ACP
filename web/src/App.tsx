@@ -14,7 +14,6 @@ import {
   Plus,
   RefreshCw,
   Server,
-  Sparkles,
   Sun,
   Terminal,
 } from 'lucide-react'
@@ -23,32 +22,25 @@ import {
   AccountRecord,
   AccountSnapshot,
   APIKeyRecord,
-  AuditContextSnapshot,
   AuditLogRecord,
   ModelQuotaGroup,
   OverviewResponse,
   PromptPolicyConfig,
-  SkillRecord,
   TerminalLoginStatus,
   UnauthorizedError,
   adminChangePassword,
   adminCheckSession,
   adminLogin,
   adminLogout,
+  adminTerminalLoginStatus,
   apiFetch,
 } from './api'
-import {
-  OverviewDetailModal,
-  TreemapDetailKey,
-} from './components/OverviewDetailModal'
-import {
-  OverviewBoard,
-  ContextModuleSelection,
-  parseAuditContextSnapshot,
-  resolveEffectiveContextCapacity,
-  resolvePureOutputTokens,
-} from './components/OverviewBoard'
+import { OverviewDetailModal } from './components/OverviewDetailModal'
+import type { TreemapDetailKey } from './components/OverviewDetailModal'
+import { OverviewBoard } from './components/OverviewBoard'
+import type { ContextModuleSelection } from './components/OverviewBoard'
 import { getStoredLang, Lang, useAutoI18n } from './i18n'
+import { formatCompact } from './lib/format'
 import {
   Alert,
   AlertDescription,
@@ -57,6 +49,7 @@ import {
   BadgeVariant,
   Button,
   CodeBlock,
+  ConfirmDialog,
   copyTextToClipboard,
   DataGridColumn,
   DataGridView,
@@ -68,6 +61,7 @@ import {
   FramePanel,
   FrameTitle,
   IconTile,
+  InlineError,
   Input,
   ProgressBar,
   SelectField,
@@ -79,8 +73,51 @@ import {
 type NavTab = 'overview' | 'accounts' | 'clients' | 'keys'
 type ClientProtocolTab = 'openai_official' | 'openai_compat' | 'claude'
 type ClientSnippetFilter = 'all' | 'cli' | 'sdk' | 'curl' | 'models'
+type AuthState = 'checking' | 'unknown' | 'unauthenticated' | 'authenticated'
 
-const DEFAULT_ACCOUNT_FORM: AccountRecord = {
+const ADMIN_PASSWORD_MIN_LENGTH = 8
+const ADMIN_TOKEN_MIN_LENGTH = 12
+const LOGIN_STATUS_POLL_MS = 2000
+const THEME_STORAGE_KEY = 'ag_gateway_theme'
+const LEGACY_SESSION_STORAGE_KEYS = ['agy_admin_session', 'agy_admin_token', 'ag_admin_token']
+const OVERVIEW_PATH = '/api/admin/overview?include_logs=1&logs_limit=60'
+
+interface AccountFormState {
+  id: string
+  name: string
+  auth_mode: string
+  api_key: string
+  isolation_enabled: boolean
+  network_mode: string
+  proxy_url: string
+  bind_ip: string
+  netns_name: string
+  max_workers: string
+  weight: string
+  enabled: boolean
+}
+
+interface AccountWritePayload {
+  id: string
+  name: string
+  auth_mode: string
+  isolation_enabled: boolean
+  network_mode: string
+  proxy_url: string
+  bind_ip: string
+  netns_name: string
+  max_workers: number
+  weight: number
+  enabled: boolean
+  status: string
+  api_key?: string
+}
+
+type PendingDeletion =
+  | { kind: 'account'; id: string; name: string }
+  | { kind: 'api_key'; id: number; name: string }
+
+const DEFAULT_ACCOUNT_FORM: AccountFormState = {
   id: '',
   name: '',
   auth_mode: 'oauth_personal',
@@ -90,11 +127,82 @@ const DEFAULT_ACCOUNT_FORM: AccountRecord = {
   proxy_url: '',
   bind_ip: '',
   netns_name: '',
-  max_workers: 2,
-  weight: 1,
+  max_workers: '2',
+  weight: '1',
   enabled: true,
-  status: 'ready',
-  last_egress_ip: '',
+}
+
+function accountToForm(acc: AccountRecord): AccountFormState {
+  return {
+    id: acc.id,
+    name: acc.name,
+    auth_mode: acc.auth_mode,
+    api_key: '',
+    isolation_enabled: acc.isolation_enabled,
+    network_mode: acc.network_mode,
+    proxy_url: acc.proxy_url,
+    bind_ip: acc.bind_ip,
+    netns_name: acc.netns_name,
+    max_workers: String(acc.max_workers),
+    weight: String(acc.weight),
+    enabled: acc.enabled,
+  }
+}
+
+// The server upsert replaces whole records, so only user-editable fields plus the
+// latest server-side status are sent; disabled_models / last_egress_ip are omitted.
+function buildAccountPayload(
+  acc: AccountRecord,
+  overrides: Partial<AccountWritePayload> = {}
+): AccountWritePayload {
+  return {
+    id: acc.id,
+    name: acc.name,
+    auth_mode: acc.auth_mode,
+    isolation_enabled: acc.isolation_enabled,
+    network_mode: acc.network_mode,
+    proxy_url: acc.proxy_url,
+    bind_ip: acc.bind_ip,
+    netns_name: acc.netns_name,
+    max_workers: acc.max_workers,
+    weight: acc.weight,
+    enabled: acc.enabled,
+    status: acc.status,
+    ...overrides,
+  }
+}
+
+function parsePositiveInt(raw: string): number | null {
+  const trimmed = raw.trim()
+  if (!/^\d+$/.test(trimmed)) return null
+  const n = Number(trimmed)
+  return Number.isSafeInteger(n) && n >= 1 ? n : null
+}
+
+function errorMessage(err: unknown, fallback: string): string {
+  return err instanceof Error && err.message ? err.message : fallback
+}
+
+function readStoredTheme(): boolean {
+  try {
+    const stored = window.localStorage.getItem(THEME_STORAGE_KEY)
+    if (stored === 'light') return false
+    if (stored === 'dark') return true
+  } catch {
+    // ignore storage errors
+  }
+  return true
+}
+
+function purgeLegacySessionStorage(): void {
+  for (const key of LEGACY_SESSION_STORAGE_KEYS) {
+    try {
+      window.localStorage.removeItem(key)
+      window.sessionStorage.removeItem(key)
+    } catch {
+      // ignore storage errors
+    }
+  }
 }
 
 function statusBadgeVariant(status: string): BadgeVariant {
@@ -147,15 +255,8 @@ function cleanTerminalLoginOutput(output?: string, authUrl?: string): string {
     .join('\n')
 }
 
-function formatCompactNumber(num: number): string {
-  if (!num || num <= 0) return '0'
-  if (num >= 1_000_000) return `${(num / 1_000_000).toFixed(2)}M`
-  if (num >= 1_000) return `${(num / 1_000).toFixed(1)}K`
-  return String(Math.round(num))
-}
-
 function formatPct(val: number): string {
-  if (val === undefined || val === null) return '100%'
+  if (val === undefined || val === null) return '—'
   if (val >= 100) return '100%'
   return `${Number(val.toFixed(1))}%`
 }
@@ -188,16 +289,6 @@ function formatProxySubtitle(acc: AccountRecord): string {
   return acc.proxy_url || 'direct://本地直连'
 }
 
-function formatProtocolDisplay(proto?: string): string {
-  if (!proto) return 'OpenAI 官方 (Responses)'
-  const p = proto.toLowerCase()
-  if (p.includes('responses')) return 'OpenAI 官方 (Responses)'
-  if (p.includes('openai')) return 'OpenAI 兼容 (Chat)'
-  if (p.includes('anthropic') || p.includes('claude')) return 'Claude 协议 (Messages)'
-  if (p.includes('acp') || p.includes('ws')) return 'ACP Studio'
-  return proto
-}
-
 function formatPromptModeLabel(mode?: string): string {
   switch (mode) {
     case 'pure_passthrough':
@@ -219,43 +310,6 @@ function formatSessionModeLabel(mode?: string): string {
     case 'yolo':
     default:
       return 'YOLO 全自动'
-  }
-}
-
-const ADMIN_SESSION_STORAGE_KEY = 'agy_admin_session'
-
-function readStoredAdminSession(): string {
-  try {
-    // Clean up legacy unauthenticated fallback keys so password login is strictly enforced
-    window.localStorage.removeItem('agy_admin_token')
-    window.localStorage.removeItem('ag_admin_token')
-    return (
-      window.sessionStorage.getItem(ADMIN_SESSION_STORAGE_KEY) ||
-      window.localStorage.getItem(ADMIN_SESSION_STORAGE_KEY) ||
-      ''
-    ).trim()
-  } catch {
-    return ''
-  }
-}
-
-function writeStoredAdminSession(token: string, remember: boolean): void {
-  try {
-    const trimmed = token.trim()
-    if (!trimmed) {
-      window.sessionStorage.removeItem(ADMIN_SESSION_STORAGE_KEY)
-      window.localStorage.removeItem(ADMIN_SESSION_STORAGE_KEY)
-      return
-    }
-    if (remember) {
-      window.localStorage.setItem(ADMIN_SESSION_STORAGE_KEY, trimmed)
-      window.sessionStorage.removeItem(ADMIN_SESSION_STORAGE_KEY)
-    } else {
-      window.sessionStorage.setItem(ADMIN_SESSION_STORAGE_KEY, trimmed)
-      window.localStorage.removeItem(ADMIN_SESSION_STORAGE_KEY)
-    }
-  } catch {
-    // ignore storage errors
   }
 }
 
@@ -305,18 +359,20 @@ function mergeAuditLogsPreservingHydrated(
   })
 }
 
+function isCompactedLog(log: AuditLogRecord): boolean {
+  return !log.response_text && !log.system_prompt && log.total_tokens > 0
+}
+
 export function App() {
-  const [dark, setDark] = useState<boolean>(true)
+  const [dark, setDark] = useState<boolean>(() => readStoredTheme())
   const [lang, setLang] = useState<Lang>(() => getStoredLang())
   useAutoI18n(lang)
   const [activeTab, setActiveTab] = useState<NavTab>('overview')
-  const [adminToken, setAdminToken] = useState<string>(() => readStoredAdminSession())
-  const [authState, setAuthState] = useState<'checking' | 'unauthenticated' | 'authenticated'>(
-    'checking'
-  )
+  const [authState, setAuthState] = useState<AuthState>('checking')
+  const [sessionCheckError, setSessionCheckError] = useState<string>('')
   const [loginPassword, setLoginPassword] = useState<string>('')
   const [showLoginPassword, setShowLoginPassword] = useState<boolean>(false)
-  const [rememberLogin, setRememberLogin] = useState<boolean>(true)
+  const [rememberLogin, setRememberLogin] = useState<boolean>(false)
   const [loggingIn, setLoggingIn] = useState<boolean>(false)
   const [loginError, setLoginError] = useState<string>('')
 
@@ -327,10 +383,10 @@ export function App() {
   const [confirmPasswordInput, setConfirmPasswordInput] = useState<string>('')
   const [newAdminTokenInput, setNewAdminTokenInput] = useState<string>('')
   const [changingPassword, setChangingPassword] = useState<boolean>(false)
+  const [passwordModalError, setPasswordModalError] = useState<string>('')
 
   const [overview, setOverview] = useState<OverviewResponse | null>(null)
   const [accounts, setAccounts] = useState<AccountSnapshot[]>([])
-  const [skills, setSkills] = useState<SkillRecord[]>([])
   const [apiKeys, setApiKeys] = useState<APIKeyRecord[]>([])
   const [auditLogs, setAuditLogs] = useState<AuditLogRecord[]>([])
   const [policy, setPolicy] = useState<PromptPolicyConfig>({
@@ -341,6 +397,8 @@ export function App() {
     internal_approval: 'auto_approve_safe',
   })
   const [loading, setLoading] = useState<boolean>(false)
+  const [loadError, setLoadError] = useState<string>('')
+  const [syncError, setSyncError] = useState<string>('')
   const [errorMsg, setErrorMsg] = useState<string>('')
   const [noticeMsg, setNoticeMsg] = useState<string>('')
 
@@ -350,20 +408,7 @@ export function App() {
     null
   )
   const [selectedAuditLogId, setSelectedAuditLogId] = useState<string>('')
-
-  const openTreemapModal = (
-    key: TreemapDetailKey,
-    logId?: string,
-    moduleSelection?: ContextModuleSelection
-  ) => {
-    if (logId && auditLogs[0] && logId !== auditLogs[0].request_id) {
-      setSelectedAuditLogId(logId)
-    } else if (!logId || logId === auditLogs[0]?.request_id) {
-      setSelectedAuditLogId('')
-    }
-    setActiveTreemapModule(moduleSelection || null)
-    setActiveTreemapModal(key)
-  }
+  const [detailLogId, setDetailLogId] = useState<string>('')
 
   const selectedAuditLog = useMemo(() => {
     if (selectedAuditLogId) {
@@ -373,12 +418,47 @@ export function App() {
     return auditLogs[0]
   }, [auditLogs, selectedAuditLogId])
 
+  const boardLogIdRef = useRef<string>('')
+  boardLogIdRef.current = selectedAuditLog?.request_id || ''
+
+  // The detail modal is pinned to the request it was opened on, so new requests
+  // arriving in the background never swap its content.
+  const lastDetailLogRef = useRef<AuditLogRecord | undefined>(undefined)
+  const detailLog = useMemo(() => {
+    if (!detailLogId) return undefined
+    return auditLogs.find((l) => l.request_id === detailLogId)
+  }, [auditLogs, detailLogId])
+  if (detailLog) {
+    lastDetailLogRef.current = detailLog
+  }
+  const pinnedDetailLog =
+    detailLog ||
+    (lastDetailLogRef.current?.request_id === detailLogId ? lastDetailLogRef.current : undefined)
+
+  const openTreemapModal = useCallback(
+    (key: TreemapDetailKey, logId?: string, moduleSelection?: ContextModuleSelection) => {
+      setDetailLogId(logId || boardLogIdRef.current)
+      setActiveTreemapModule(moduleSelection || null)
+      setActiveTreemapModal(key)
+    },
+    []
+  )
+
+  const closeTreemapModal = useCallback(() => {
+    setActiveTreemapModal(null)
+    setActiveTreemapModule(null)
+    setDetailLogId('')
+  }, [])
+
   // Account creation / edit form & view state
-  const [accountForm, setAccountForm] = useState<AccountRecord>(DEFAULT_ACCOUNT_FORM)
+  const [accountForm, setAccountForm] = useState<AccountFormState>(DEFAULT_ACCOUNT_FORM)
   const [showAccountEditor, setShowAccountEditor] = useState<boolean>(false)
   const [isEditingAccount, setIsEditingAccount] = useState<boolean>(false)
+  const [savingAccount, setSavingAccount] = useState<boolean>(false)
+  const [accountFormError, setAccountFormError] = useState<string>('')
   const [accountViewMode, setAccountViewMode] = useState<'cards' | 'table'>('cards')
   const [loginState, setLoginState] = useState<Record<string, TerminalLoginStatus>>({})
+  const [loginErrors, setLoginErrors] = useState<Record<string, string>>({})
   const [loginCodeInput, setLoginCodeInput] = useState<Record<string, string>>({})
   const [probingAccount, setProbingAccount] = useState<Record<string, boolean>>({})
   const [refreshingQuota, setRefreshingQuota] = useState<Record<string, boolean>>({})
@@ -394,6 +474,7 @@ export function App() {
   const [accountModelsError, setAccountModelsError] = useState<Record<string, string>>({})
   const [togglingAccountModel, setTogglingAccountModel] = useState<Record<string, boolean>>({})
   const [modelModalAccountId, setModelModalAccountId] = useState<string | null>(null)
+  const [modelModalError, setModelModalError] = useState<string>('')
 
   // Remote Client Session Protocol Generator State (3 session protocols, dynamically populated from ACP backend)
   const [clientProtocolTab, setClientProtocolTab] = useState<ClientProtocolTab>('openai_official')
@@ -403,29 +484,41 @@ export function App() {
   const [clientModelPreview, setClientModelPreview] = useState<string>('')
   const [clientAccountBind, setClientAccountBind] = useState<string>('auto')
   const [clientSessionId, setClientSessionId] = useState<string>('sess-dev-01')
-  const [copiedClientField, setCopiedClientField] = useState<string>('')
+  const [copyFeedback, setCopyFeedback] = useState<{ key: string; ok: boolean } | null>(null)
 
-  const copyClientText = (fieldKey: string, value: string) => {
-    void copyTextToClipboard(value)
-    setCopiedClientField(fieldKey)
+  const copyClientText = async (fieldKey: string, value: string) => {
+    const ok = await copyTextToClipboard(value)
+    setCopyFeedback({ key: fieldKey, ok })
     window.setTimeout(() => {
-      setCopiedClientField((prev) => (prev === fieldKey ? '' : prev))
+      setCopyFeedback((prev) => (prev?.key === fieldKey ? null : prev))
     }, 1500)
+  }
+
+  const copyLabel = (fieldKey: string, idleLabel: string): string => {
+    if (copyFeedback?.key !== fieldKey) return idleLabel
+    return copyFeedback.ok ? '已复制' : '复制失败'
   }
 
   // API Key modal & form (with per-key prompt & session policy)
   const [showCreateKeyModal, setShowCreateKeyModal] = useState<boolean>(false)
   const [creatingKey, setCreatingKey] = useState<boolean>(false)
+  const [createKeyError, setCreateKeyError] = useState<string>('')
   const [newKeyName, setNewKeyName] = useState<string>('')
   const [newKeyAccount, setNewKeyAccount] = useState<string>('')
-  const [newKeyRPM, setNewKeyRPM] = useState<number>(60)
+  const [newKeyRPM, setNewKeyRPM] = useState<string>('60')
   const [newKeyPromptMode, setNewKeyPromptMode] = useState<string>('native_hybrid')
   const [newKeySessionMode, setNewKeySessionMode] = useState<string>('yolo')
   const [newKeyPrependPrompt, setNewKeyPrependPrompt] = useState<string>('')
   const [newKeyDisableBuiltinTools, setNewKeyDisableBuiltinTools] = useState<boolean>(true)
   const [issuedPlainKey, setIssuedPlainKey] = useState<string>('')
   const [editingKey, setEditingKey] = useState<APIKeyRecord | null>(null)
+  const [editKeyRPM, setEditKeyRPM] = useState<string>('')
+  const [editKeyError, setEditKeyError] = useState<string>('')
   const [savingKeyEdit, setSavingKeyEdit] = useState<boolean>(false)
+
+  const [pendingDeletion, setPendingDeletion] = useState<PendingDeletion | null>(null)
+  const [deletingItem, setDeletingItem] = useState<boolean>(false)
+  const [deletionError, setDeletionError] = useState<string>('')
 
   useEffect(() => {
     const root = document.documentElement
@@ -434,16 +527,69 @@ export function App() {
     } else {
       root.classList.remove('dark')
     }
+    try {
+      window.localStorage.setItem(THEME_STORAGE_KEY, dark ? 'dark' : 'light')
+    } catch {
+      // ignore storage errors
+    }
   }, [dark])
 
+  const accountsRef = useRef<AccountSnapshot[]>([])
+  useEffect(() => {
+    accountsRef.current = accounts
+  }, [accounts])
+
+  // Snapshot responses are applied only if they were issued after the last applied one
+  // and after the latest local mutation, so slow older responses never overwrite newer state.
+  const issuedSnapshotSeqRef = useRef<number>(0)
+  const appliedSnapshotSeqRef = useRef<number>(0)
+  const minAcceptedSnapshotSeqRef = useRef<number>(0)
+  const nextSnapshotSeq = () => {
+    issuedSnapshotSeqRef.current += 1
+    return issuedSnapshotSeqRef.current
+  }
+  const claimSnapshotSeq = (seq: number): boolean => {
+    if (seq <= appliedSnapshotSeqRef.current || seq < minAcceptedSnapshotSeqRef.current) {
+      return false
+    }
+    appliedSnapshotSeqRef.current = seq
+    return true
+  }
+  const invalidateInFlightSnapshots = () => {
+    minAcceptedSnapshotSeqRef.current = issuedSnapshotSeqRef.current + 1
+  }
+
+  const applyOverviewSnapshot = useCallback((ov: OverviewResponse, logs?: AuditLogRecord[]) => {
+    setOverview(ov)
+    setAccounts(ov.accounts || [])
+    accountsRef.current = ov.accounts || []
+    const incomingLogs = logs || ov.logs
+    if (incomingLogs) {
+      setAuditLogs((prev) => mergeAuditLogsPreservingHydrated(prev, incomingLogs))
+    }
+    if (ov.models && ov.models.length > 0) {
+      setClientModelPreview((prev) => prev || ov.models[0].modelId)
+    }
+    if (ov.prompt_policy) {
+      setPolicy({
+        ...ov.prompt_policy,
+        session_mode: ov.session_mode || ov.prompt_policy.session_mode || 'yolo',
+      })
+    }
+  }, [])
+
   const forceUnauthenticated = useCallback((msg = '登录会话已失效，请重新输入密码登录') => {
-    writeStoredAdminSession('', false)
-    setAdminToken('')
     setOverview(null)
     setAccounts([])
-    setSkills([])
+    accountsRef.current = []
     setApiKeys([])
     setAuditLogs([])
+    setLoginState({})
+    setLoadError('')
+    setSyncError('')
+    setActiveTreemapModal(null)
+    setActiveTreemapModule(null)
+    setDetailLogId('')
     setAuthState('unauthenticated')
     setLoginError(msg)
   }, [])
@@ -454,7 +600,19 @@ export function App() {
         forceUnauthenticated(err.message || '未登录或管理会话已过期，请重新输入密码登录')
         return
       }
-      setErrorMsg(err instanceof Error ? err.message : fallbackMsg)
+      setErrorMsg(errorMessage(err, fallbackMsg))
+    },
+    [forceUnauthenticated]
+  )
+
+  // Returns the message to show inline, or null when the session expired.
+  const resolveInlineError = useCallback(
+    (err: unknown, fallbackMsg: string): string | null => {
+      if (err instanceof UnauthorizedError) {
+        forceUnauthenticated(err.message || '未登录或管理会话已过期，请重新输入密码登录')
+        return null
+      }
+      return errorMessage(err, fallbackMsg)
     },
     [forceUnauthenticated]
   )
@@ -471,102 +629,98 @@ export function App() {
     return () => window.clearTimeout(timer)
   }, [noticeMsg])
 
-  const refreshTelemetrySilently = useCallback(
-    async (overrideToken?: string) => {
-      if (inFlightTelemetryRef.current) {
-        pendingTelemetryFollowUpRef.current = true
-        return
+  const refreshTelemetrySilently = useCallback(async () => {
+    if (inFlightTelemetryRef.current) {
+      pendingTelemetryFollowUpRef.current = true
+      return
+    }
+    inFlightTelemetryRef.current = true
+    const seq = nextSnapshotSeq()
+    try {
+      const ov = await apiFetch<OverviewResponse>(OVERVIEW_PATH)
+      if (claimSnapshotSeq(seq)) {
+        applyOverviewSnapshot(ov)
       }
-      const tokenToUse = overrideToken !== undefined ? overrideToken : adminToken
-      inFlightTelemetryRef.current = true
-      try {
-        const ov = await apiFetch<OverviewResponse>(
-          '/api/admin/overview?include_logs=1&logs_limit=60',
-          tokenToUse
-        )
-        setOverview(ov)
-        setAccounts(ov.accounts || [])
-        if (ov.logs) {
-          setAuditLogs((prev) => mergeAuditLogsPreservingHydrated(prev, ov.logs || []))
-        }
-        if (ov.models && ov.models.length > 0) {
-          setClientModelPreview((prev) => prev || ov.models[0].modelId)
-        }
-      } catch (err) {
-        if (err instanceof UnauthorizedError) {
-          forceUnauthenticated(err.message || '未登录或管理会话已过期，请重新输入密码登录')
-        }
-      } finally {
-        inFlightTelemetryRef.current = false
-        if (pendingTelemetryFollowUpRef.current) {
-          pendingTelemetryFollowUpRef.current = false
-          window.setTimeout(() => {
-            void refreshTelemetrySilently(overrideToken)
-          }, 40)
-        }
+      setSyncError('')
+      setLoadError('')
+    } catch (err) {
+      if (err instanceof UnauthorizedError) {
+        pendingTelemetryFollowUpRef.current = false
+        forceUnauthenticated(err.message || '未登录或管理会话已过期，请重新输入密码登录')
+      } else {
+        setSyncError(errorMessage(err, '后台同步失败'))
       }
-    },
-    [adminToken, forceUnauthenticated]
-  )
+    } finally {
+      inFlightTelemetryRef.current = false
+      if (pendingTelemetryFollowUpRef.current) {
+        pendingTelemetryFollowUpRef.current = false
+        window.setTimeout(() => {
+          void refreshTelemetrySilently()
+        }, 40)
+      }
+    }
+  }, [applyOverviewSnapshot, forceUnauthenticated])
 
+  const loadingCountRef = useRef<number>(0)
   const refreshAll = useCallback(
-    async (overrideToken?: string) => {
-      const tokenToUse = overrideToken !== undefined ? overrideToken : adminToken
+    async (options: { userInitiated?: boolean } = {}) => {
+      const seq = nextSnapshotSeq()
+      loadingCountRef.current += 1
       setLoading(true)
-      setErrorMsg('')
+      if (options.userInitiated) {
+        setErrorMsg('')
+      }
       try {
         const [ov, keyRes] = await Promise.all([
-          apiFetch<OverviewResponse>('/api/admin/overview?include_logs=1&logs_limit=60', tokenToUse),
-          apiFetch<{ api_keys: APIKeyRecord[] }>('/api/admin/api-keys', tokenToUse),
+          apiFetch<OverviewResponse>(OVERVIEW_PATH),
+          apiFetch<{ api_keys: APIKeyRecord[] }>('/api/admin/api-keys'),
         ])
         const loadedKeys = keyRes.api_keys || []
         const incomingLogs =
           ov.logs ||
-          (await apiFetch<{ logs: AuditLogRecord[] }>('/api/admin/logs?limit=60&compact=1', tokenToUse))
+          (await apiFetch<{ logs: AuditLogRecord[] }>('/api/admin/logs?limit=60&compact=1'))
             .logs ||
           []
-        setOverview(ov)
-        setAccounts(ov.accounts || [])
         setApiKeys(loadedKeys)
-        setAuditLogs((prev) => mergeAuditLogsPreservingHydrated(prev, incomingLogs))
-        if (ov.models && ov.models.length > 0) {
-          setClientModelPreview((prev) => prev || ov.models[0].modelId)
+        setClientSelectedKeyId((prev) =>
+          prev && loadedKeys.some((k) => String(k.id) === prev)
+            ? prev
+            : loadedKeys.length > 0
+              ? String(loadedKeys[0].id)
+              : ''
+        )
+        if (claimSnapshotSeq(seq)) {
+          applyOverviewSnapshot(ov, incomingLogs)
         }
-        if (loadedKeys.length > 0) {
-          const nextKeyId =
-            clientSelectedKeyId && loadedKeys.some((k) => String(k.id) === clientSelectedKeyId)
-              ? clientSelectedKeyId
-              : String(loadedKeys[0].id)
-          setClientSelectedKeyId(nextKeyId)
-          const activeKey =
-            loadedKeys.find((k) => String(k.id) === nextKeyId) || loadedKeys[0]
-          if (activeKey.bound_account_id) {
-            setClientAccountBind(activeKey.bound_account_id)
-          }
-          setPolicy({
-            mode: activeKey.prompt_mode || ov.prompt_policy?.mode || 'native_hybrid',
-            global_prepend_prompt:
-              activeKey.global_prepend_prompt ?? ov.prompt_policy?.global_prepend_prompt ?? '',
-            disable_builtin_tools:
-              activeKey.disable_builtin_tools ?? ov.prompt_policy?.disable_builtin_tools ?? true,
-            session_mode: activeKey.session_mode || ov.session_mode || 'yolo',
-          })
-        } else if (ov.prompt_policy) {
-          setPolicy({
-            ...ov.prompt_policy,
-            session_mode: ov.session_mode || 'yolo',
-          })
-        }
+        setLoadError('')
+        setSyncError('')
       } catch (err) {
-        handleRequestError(err, '加载管理数据失败')
+        if (err instanceof UnauthorizedError) {
+          forceUnauthenticated(err.message || '未登录或管理会话已过期，请重新输入密码登录')
+        } else {
+          setLoadError(errorMessage(err, '加载管理数据失败'))
+        }
       } finally {
-        setLoading(false)
+        loadingCountRef.current -= 1
+        if (loadingCountRef.current <= 0) {
+          loadingCountRef.current = 0
+          setLoading(false)
+        }
       }
     },
-    [adminToken, clientSelectedKeyId, handleRequestError]
+    [applyOverviewSnapshot, forceUnauthenticated]
   )
 
-  // Real-time event-driven WebSocket push (/api/admin/ws/wiretap?mode=telemetry) + visibility-aware background sync
+  const retryRefresh = useCallback(() => {
+    void refreshAll({ userInitiated: true })
+  }, [refreshAll])
+
+  const navigateTab = useCallback((tab: NavTab) => {
+    setActiveTab(tab)
+  }, [])
+
+  // Real-time event-driven WebSocket push (/api/admin/ws/wiretap?mode=telemetry) + visibility-aware background sync.
+  // The socket authenticates with the same-origin HttpOnly session cookie only.
   useEffect(() => {
     if (authState !== 'authenticated') return
     let disposed = false
@@ -594,8 +748,7 @@ export function App() {
       if (disposed) return
       try {
         const wsProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-        const tokenQuery = adminToken ? `&token=${encodeURIComponent(adminToken)}` : ''
-        const wsUrl = `${wsProto}//${window.location.host}/api/admin/ws/wiretap?mode=telemetry${tokenQuery}`
+        const wsUrl = `${wsProto}//${window.location.host}/api/admin/ws/wiretap?mode=telemetry`
         ws = new WebSocket(wsUrl)
         ws.onopen = () => {
           wsConnected = true
@@ -668,25 +821,25 @@ export function App() {
         }
       }
     }
-  }, [adminToken, authState, refreshTelemetrySilently])
+  }, [authState, refreshTelemetrySilently])
 
-  // On-demand full log hydration only when the detail modal is open on a compacted log
+  // On-demand full log hydration while the detail modal is open on a compacted log.
+  // Each request_id is fetched at most once per page session.
+  const hydrationAttemptedRef = useRef<Set<string>>(new Set())
+  const hydrateTargetId =
+    activeTreemapModal && pinnedDetailLog && isCompactedLog(pinnedDetailLog)
+      ? pinnedDetailLog.request_id
+      : ''
   useEffect(() => {
-    if (!activeTreemapModal || !selectedAuditLog) return
-    const isCompacted =
-      !selectedAuditLog.response_text &&
-      !selectedAuditLog.system_prompt &&
-      selectedAuditLog.total_tokens > 0
-    if (!isCompacted) return
-    let cancelled = false
+    if (!hydrateTargetId || hydrationAttemptedRef.current.has(hydrateTargetId)) return
+    hydrationAttemptedRef.current.add(hydrateTargetId)
     const hydrateFullLog = async () => {
       try {
         const res = await apiFetch<{ log?: AuditLogRecord; logs?: AuditLogRecord[] }>(
-          `/api/admin/logs?request_id=${encodeURIComponent(selectedAuditLog.request_id)}`,
-          adminToken
+          `/api/admin/logs?request_id=${encodeURIComponent(hydrateTargetId)}`
         )
         const full = res.log || res.logs?.[0]
-        if (!cancelled && full) {
+        if (full) {
           setAuditLogs((prev) =>
             prev.map((item) => (item.request_id === full.request_id ? full : item))
           )
@@ -696,37 +849,116 @@ export function App() {
       }
     }
     void hydrateFullLog()
-    return () => {
-      cancelled = true
-    }
-  }, [activeTreemapModal, adminToken, selectedAuditLog])
+  }, [hydrateTargetId])
 
-  useEffect(() => {
-    let cancelled = false
-    const verifyInitialSession = async () => {
-      const stored = readStoredAdminSession()
-      const valid = await adminCheckSession(stored)
-      if (cancelled) return
+  const verifySession = useCallback(async () => {
+    setAuthState('checking')
+    setSessionCheckError('')
+    try {
+      const valid = await adminCheckSession()
       if (valid) {
         setAuthState('authenticated')
-        void refreshAll(stored)
+        void refreshAll()
       } else {
-        writeStoredAdminSession('', false)
-        setAdminToken('')
         setAuthState('unauthenticated')
       }
+    } catch (err) {
+      setSessionCheckError(errorMessage(err, '无法确认登录状态'))
+      setAuthState('unknown')
     }
-    void verifyInitialSession()
+  }, [refreshAll])
+
+  useEffect(() => {
+    purgeLegacySessionStorage()
+    void verifySession()
+  }, [verifySession])
+
+  // Seed in-progress terminal logins from the server snapshot (e.g. after a reload).
+  const dismissedLoginRef = useRef<Set<string>>(new Set())
+  useEffect(() => {
+    const waiting = accounts.filter((snap) => snap.login_state === 'waiting_code')
+    for (const snap of accounts) {
+      if (snap.login_state !== 'waiting_code') {
+        dismissedLoginRef.current.delete(snap.account.id)
+      }
+    }
+    if (waiting.length === 0) return
+    setLoginState((prev) => {
+      let next = prev
+      for (const snap of waiting) {
+        const id = snap.account.id
+        if (prev[id] || dismissedLoginRef.current.has(id)) continue
+        if (next === prev) next = { ...prev }
+        next[id] = { account_id: id, state: 'waiting_code', auth_url: snap.login_auth_url }
+      }
+      return next
+    })
+  }, [accounts])
+
+  // Poll terminal login status every 2s while a login drawer is open and waiting for a code.
+  const loginPollInFlightRef = useRef<Set<string>>(new Set())
+  const waitingLoginIds = useMemo(
+    () =>
+      Object.entries(loginState)
+        .filter(([, status]) => status.state === 'waiting_code')
+        .map(([id]) => id)
+        .sort()
+        .join('\n'),
+    [loginState]
+  )
+  useEffect(() => {
+    if (authState !== 'authenticated' || !waitingLoginIds) return
+    const ids = waitingLoginIds.split('\n')
+    const controller = new AbortController()
+    const pollOnce = () => {
+      for (const id of ids) {
+        if (loginPollInFlightRef.current.has(id)) continue
+        loginPollInFlightRef.current.add(id)
+        adminTerminalLoginStatus(id, controller.signal)
+          .then((status) => {
+            if (controller.signal.aborted) return
+            setLoginState((prev) => {
+              if (!prev[id]) return prev
+              if (status.state === 'success') {
+                const next = { ...prev }
+                delete next[id]
+                return next
+              }
+              return { ...prev, [id]: { ...prev[id], ...status } }
+            })
+            if (status.state === 'success') {
+              setLoginErrors((prev) => ({ ...prev, [id]: '' }))
+              setNoticeMsg(`账户 ${id} 授权验证成功，已恢复就绪状态`)
+              void refreshAll()
+            } else if (status.state === 'error') {
+              setLoginErrors((prev) => ({
+                ...prev,
+                [id]: cleanTerminalLoginOutput(status.output, status.auth_url) || '授权失败，请重新发起登录',
+              }))
+            }
+          })
+          .catch((err: unknown) => {
+            if (controller.signal.aborted) return
+            const msg = resolveInlineError(err, '读取登录状态失败')
+            if (msg) {
+              setLoginErrors((prev) => ({ ...prev, [id]: msg }))
+            }
+          })
+          .finally(() => {
+            loginPollInFlightRef.current.delete(id)
+          })
+      }
+    }
+    const timer = window.setInterval(pollOnce, LOGIN_STATUS_POLL_MS)
     return () => {
-      cancelled = true
+      window.clearInterval(timer)
+      controller.abort()
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  }, [authState, refreshAll, resolveInlineError, waitingLoginIds])
 
   const handleLoginSubmit = async (e?: React.FormEvent) => {
     if (e) e.preventDefault()
-    const pwd = loginPassword.trim()
-    if (!pwd) {
+    if (!loginPassword) {
       setLoginError('请输入管理员密码')
       return
     }
@@ -735,66 +967,73 @@ export function App() {
     setErrorMsg('')
     setNoticeMsg('')
     try {
-      const res = await adminLogin(pwd, rememberLogin)
-      const sessToken = res.session_token || ''
-      writeStoredAdminSession(sessToken, rememberLogin)
-      setAdminToken(sessToken)
+      await adminLogin(loginPassword, rememberLogin)
       setLoginPassword('')
       setAuthState('authenticated')
-      await refreshAll(sessToken)
+      await refreshAll()
     } catch (err) {
-      setLoginError(err instanceof Error ? err.message : '登录失败，请检查管理员密码')
+      setLoginError(errorMessage(err, '登录失败，请检查管理员密码'))
     } finally {
       setLoggingIn(false)
     }
   }
 
   const handleLogout = async () => {
-    await adminLogout(adminToken)
-    writeStoredAdminSession('', false)
-    setAdminToken('')
+    await adminLogout()
     setOverview(null)
     setAccounts([])
-    setSkills([])
+    accountsRef.current = []
     setApiKeys([])
     setAuditLogs([])
+    setLoginState({})
     setErrorMsg('')
     setNoticeMsg('')
     setLoginError('')
+    setLoadError('')
+    setSyncError('')
     setAuthState('unauthenticated')
   }
 
+  const openPasswordModal = () => {
+    setCurrentPasswordInput('')
+    setNewPasswordInput('')
+    setConfirmPasswordInput('')
+    setNewAdminTokenInput('')
+    setPasswordModalError('')
+    setShowPasswordModal(true)
+  }
+
+  const closePasswordModal = () => {
+    setShowPasswordModal(false)
+    setPasswordModalError('')
+  }
+
   const handleChangePassword = async () => {
-    if (!currentPasswordInput.trim()) {
-      setErrorMsg('请输入当前管理员密码')
+    if (!currentPasswordInput) {
+      setPasswordModalError('请输入当前管理员密码')
       return
     }
-    if (newPasswordInput.trim().length < 6) {
-      setErrorMsg('新管理员密码长度不能少于 6 位')
+    if (newPasswordInput.length < ADMIN_PASSWORD_MIN_LENGTH) {
+      setPasswordModalError(`新管理员密码长度不能少于 ${ADMIN_PASSWORD_MIN_LENGTH} 位`)
       return
     }
-    if (newPasswordInput.trim() !== confirmPasswordInput.trim()) {
-      setErrorMsg('两次输入的新密码不一致')
+    if (newPasswordInput !== confirmPasswordInput) {
+      setPasswordModalError('两次输入的新密码不一致')
       return
     }
-    if (newAdminTokenInput.trim() && newAdminTokenInput.trim().length < 6) {
-      setErrorMsg('自定义 Admin Token 长度不能少于 6 位')
+    if (newAdminTokenInput && newAdminTokenInput.length < ADMIN_TOKEN_MIN_LENGTH) {
+      setPasswordModalError(`自定义 Admin Token 长度不能少于 ${ADMIN_TOKEN_MIN_LENGTH} 位`)
       return
     }
     setChangingPassword(true)
-    setErrorMsg('')
+    setPasswordModalError('')
     setNoticeMsg('')
     try {
-      const res = await adminChangePassword(
-        adminToken,
-        currentPasswordInput.trim(),
-        newPasswordInput.trim(),
-        newAdminTokenInput.trim()
+      await adminChangePassword(
+        currentPasswordInput,
+        newPasswordInput,
+        newAdminTokenInput || undefined
       )
-      if (res.session_token) {
-        writeStoredAdminSession(res.session_token, rememberLogin)
-        setAdminToken(res.session_token)
-      }
       setOverview((prev) => (prev ? { ...prev, credentials_locked: true } : prev))
       setShowPasswordModal(false)
       setCurrentPasswordInput('')
@@ -803,7 +1042,8 @@ export function App() {
       setNewAdminTokenInput('')
       setNoticeMsg('管理员密码与 Token 已更新并永久固定，后续重新部署不会再重置')
     } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : '修改管理员密码失败')
+      const msg = resolveInlineError(err, '修改管理员密码失败')
+      if (msg) setPasswordModalError(msg)
     } finally {
       setChangingPassword(false)
     }
@@ -855,7 +1095,7 @@ export function App() {
         acc.tokens24h += u?.tokens_24h || 0
         acc.busyWorkers += item.busy_workers
         acc.spawnedWorkers += item.worker_count
-        acc.maxWorkers += item.account.max_workers || 2
+        acc.maxWorkers += item.account.max_workers || 0
         if (item.account.enabled) {
           acc.enabledCount += 1
         }
@@ -881,360 +1121,144 @@ export function App() {
     )
   }, [accounts])
 
-  const activeClientKey = useMemo<APIKeyRecord | undefined>(() => {
-    if (apiKeys.length === 0) return undefined
-    if (clientSelectedKeyId) {
-      const found = apiKeys.find((k) => String(k.id) === clientSelectedKeyId)
-      if (found) return found
-    }
-    return apiKeys[0]
-  }, [apiKeys, clientSelectedKeyId])
+  const latestAccount = (id: string): AccountRecord | undefined =>
+    accountsRef.current.find((snap) => snap.account.id === id)?.account
 
-  // Compute per-request routing & context composition telemetry only when OverviewDetailModal is open
-  const overviewTelemetry = useMemo(() => {
-    const enabledAccounts = accounts.filter((a) => a.account.enabled)
-    const latestLog: AuditLogRecord | undefined = selectedAuditLog || auditLogs[0]
-    if (!activeTreemapModal) {
-      return {
-        enabledAccounts,
-        latestLog,
-        routedId: latestLog?.account_id || 'default',
-        routedName: latestLog?.account_id || 'default',
-        routedProxy: 'direct://本地直连',
-        routedEgress: '本地直连',
-        routedWeight: 1,
-        latestProtocol: formatProtocolDisplay(latestLog?.protocol),
-        latestModel: latestLog?.model_name || effectiveClientModel || 'ACP 动态模型',
-        latestLatencyMs: latestLog?.latency_ms || 0,
-        gwMs: 0,
-        netMs: 0,
-        providerMs: 0,
-        ttfbMs: 0,
-        streamMs: 0,
-        totalReqs: overview?.stats.total_requests ?? fleetUsageSummary.totalRequests,
-        successReqs: overview?.stats.success_requests ?? 0,
-        errorReqs: fleetUsageSummary.errorRequests,
-        successRatePct: 100,
-        switchCount: 0,
-        totalTokens: latestLog?.total_tokens || 0,
-        promptTokens: latestLog?.prompt_tokens || 0,
-        completionTokens: latestLog?.completion_tokens || 0,
-        sysPromptTokens: 0,
-        toolsTokens: 0,
-        skillsTokens: 0,
-        filesTokens: 0,
-        toolResultsTokens: 0,
-        conversationTokens: 0,
-        contextInputTokens: 0,
-        contextCapacity: 1048576,
-        usedContextTokens: 0,
-        usedPct: 0,
-        remainingTokens: 1048576,
-        estRemainingReqs: 32,
-        effectivePromptMode: activeClientKey?.prompt_mode || policy.mode || 'native_hybrid',
-        effectiveSessionMode: activeClientKey?.session_mode || policy.session_mode || 'yolo',
-        effectiveDisableBuiltin:
-          activeClientKey?.disable_builtin_tools ?? Boolean(policy.disable_builtin_tools),
-        effectivePrependPrompt:
-          activeClientKey?.global_prepend_prompt ?? policy.global_prepend_prompt ?? '',
-        effectiveKeyName: activeClientKey?.name || '',
-      }
-    }
+  const openCreateAccountEditor = () => {
+    setAccountForm(DEFAULT_ACCOUNT_FORM)
+    setIsEditingAccount(false)
+    setAccountFormError('')
+    setShowAccountEditor(true)
+  }
 
-    const parsedSnap = parseAuditContextSnapshot(latestLog)
-
-    const effectivePromptMode =
-      activeClientKey?.prompt_mode ||
-      policy.mode ||
-      parsedSnap?.prompt_mode ||
-      'native_hybrid'
-    const effectiveSessionMode =
-      activeClientKey?.session_mode ||
-      policy.session_mode ||
-      parsedSnap?.session_mode ||
-      'yolo'
-    const effectiveDisableBuiltin =
-      activeClientKey?.disable_builtin_tools !== undefined
-        ? activeClientKey.disable_builtin_tools
-        : policy.disable_builtin_tools !== undefined
-          ? Boolean(policy.disable_builtin_tools)
-          : parsedSnap?.disable_builtin_tools !== undefined
-            ? parsedSnap.disable_builtin_tools
-            : true
-    const effectivePrependPrompt =
-      activeClientKey?.global_prepend_prompt !== undefined
-        ? activeClientKey.global_prepend_prompt
-        : policy.global_prepend_prompt || ''
-    const effectiveKeyName = activeClientKey?.name || parsedSnap?.key_name || ''
-
-    const explicitBindAcc =
-      clientAccountBind && clientAccountBind !== 'auto'
-        ? clientAccountBind
-        : activeClientKey?.bound_account_id && activeClientKey.bound_account_id !== 'auto'
-          ? activeClientKey.bound_account_id
-          : ''
-
-    const routedSnap =
-      accounts.find((a) => a.account.id === (explicitBindAcc || latestLog?.account_id)) ||
-      accounts.find((a) => a.account.id === latestLog?.account_id) ||
-      enabledAccounts[0] ||
-      accounts[0]
-
-    const routedId = routedSnap?.account.id || latestLog?.account_id || 'default'
-    const routedName = routedSnap?.account.name || routedId
-    const routedProxy = routedSnap ? formatProxySubtitle(routedSnap.account) : 'direct://本地直连'
-    const routedEgress = routedSnap?.account.last_egress_ip || '本地直连'
-    const routedWeight = routedSnap?.account.weight || 1
-
-    const latestProtocol = formatProtocolDisplay(latestLog?.protocol)
-    const latestModel =
-      latestLog?.model_name ||
-      effectiveClientModel ||
-      overview?.models?.[0]?.modelId ||
-      'ACP 动态模型'
-    const latestLatencyMs =
-      latestLog?.latency_ms || Math.round(overview?.stats.avg_latency_ms || 420)
-
-    const recordedPrepMs = parsedSnap?.prep_ms && parsedSnap.prep_ms > 0 ? parsedSnap.prep_ms : 0
-    const recordedTtfb = parsedSnap?.ttfb_ms && parsedSnap.ttfb_ms > 0 ? parsedSnap.ttfb_ms : 0
-    const gwMs =
-      recordedPrepMs > 0
-        ? Math.min(latestLatencyMs, recordedPrepMs)
-        : Math.min(latestLatencyMs, Math.max(1, Math.round(latestLatencyMs * 0.01)))
-    const firstWordMs =
-      recordedTtfb > 0
-        ? Math.min(latestLatencyMs, Math.max(gwMs, recordedTtfb))
-        : latestLatencyMs
-    const netMs =
-      routedSnap?.account.network_mode === 'proxy'
-        ? Math.min(Math.max(0, firstWordMs - gwMs), Math.max(5, Math.round(firstWordMs * 0.06)))
-        : Math.min(Math.max(0, firstWordMs - gwMs), 2)
-    const ttfbMs = Math.max(0, firstWordMs - gwMs - netMs)
-    const streamMs = Math.max(0, latestLatencyMs - firstWordMs)
-    const providerMs = ttfbMs + streamMs
-
-    const totalReqs = overview?.stats.total_requests ?? fleetUsageSummary.totalRequests
-    const successReqs =
-      overview?.stats.success_requests ??
-      Math.max(0, totalReqs - fleetUsageSummary.errorRequests)
-    const errorReqs = Math.max(0, totalReqs - successReqs, fleetUsageSummary.errorRequests)
-    const successRatePct =
-      totalReqs > 0 ? Math.min(100, Math.round((successReqs / totalReqs) * 1000) / 10) : 100
-
-    let switchCount = 0
-    for (let i = 1; i < auditLogs.length; i += 1) {
-      if (
-        auditLogs[i].account_id &&
-        auditLogs[i - 1].account_id &&
-        auditLogs[i].account_id !== auditLogs[i - 1].account_id
-      ) {
-        switchCount += 1
-      }
-    }
-
-    // Per-request tokens (strictly from the selected/latest request)
-    const promptTokens =
-      parsedSnap?.input_tokens && parsedSnap.input_tokens > 0
-        ? parsedSnap.input_tokens
-        : latestLog?.prompt_tokens || 0
-    const completionTokens = resolvePureOutputTokens(latestLog, parsedSnap)
-    const totalTokens = promptTokens + completionTokens
-
-    const baseModelWindow = resolveEffectiveContextCapacity(latestModel, parsedSnap)
-    const usedContextTokens = promptTokens > 0 ? promptTokens : totalTokens
-    const contextCapacity =
-      usedContextTokens > baseModelWindow
-        ? Math.ceil((usedContextTokens * 1.15) / 10_000) * 10_000
-        : baseModelWindow
-
-    const usedPct = Math.min(100, Math.round((usedContextTokens / contextCapacity) * 100))
-    const remainingTokens = Math.max(0, contextCapacity - usedContextTokens)
-    const perTurnDelta = Math.max(800, completionTokens + Math.round(promptTokens * 0.06))
-    const estRemainingReqs =
-      usedContextTokens > 0 ? Math.max(1, Math.round(remainingTokens / perTurnDelta)) : 32
-
-    let sysPromptTokens = 0
-    let toolsTokens = 0
-    let skillsTokens = 0
-    let filesTokens = 0
-    let toolResultsTokens = 0
-    let conversationTokens = 0
-
-    if (parsedSnap?.items && parsedSnap.items.length > 0) {
-      for (const it of parsedSnap.items) {
-        const tok = Math.max(0, it.tokens || 0)
-        switch (it.category) {
-          case 'system_prompt':
-            sysPromptTokens += tok
-            break
-          case 'tools':
-            toolsTokens += tok
-            break
-          case 'skills':
-            skillsTokens += tok
-            break
-          case 'files':
-            filesTokens += tok
-            break
-          case 'tool_results':
-            toolResultsTokens += tok
-            break
-          default:
-            conversationTokens += tok
-            break
-        }
-      }
-      const fixedSum = sysPromptTokens + toolsTokens + skillsTokens
-      const dynSum = filesTokens + toolResultsTokens + conversationTokens
-      const rawSum = fixedSum + dynSum
-      if (usedContextTokens > 0 && rawSum > 0 && Math.abs(rawSum - usedContextTokens) > 64) {
-        if (dynSum > 0 && fixedSum < usedContextTokens * 0.75) {
-          const remDyn = usedContextTokens - fixedSum
-          filesTokens = Math.round((filesTokens * remDyn) / dynSum)
-          toolResultsTokens = Math.round((toolResultsTokens * remDyn) / dynSum)
-          conversationTokens = Math.max(0, remDyn - filesTokens - toolResultsTokens)
-        } else {
-          sysPromptTokens = Math.round((sysPromptTokens * usedContextTokens) / rawSum)
-          toolsTokens = Math.round((toolsTokens * usedContextTokens) / rawSum)
-          skillsTokens = Math.round((skillsTokens * usedContextTokens) / rawSum)
-          filesTokens = Math.round((filesTokens * usedContextTokens) / rawSum)
-          toolResultsTokens = Math.round((toolResultsTokens * usedContextTokens) / rawSum)
-          conversationTokens = Math.max(
-            0,
-            usedContextTokens -
-              sysPromptTokens -
-              toolsTokens -
-              skillsTokens -
-              filesTokens -
-              toolResultsTokens
-          )
-        }
-      }
-    } else if (usedContextTokens > 0) {
-      const rawSysLen = (latestLog?.system_prompt || '').trim().length
-      const rawSysTok = rawSysLen > 0 ? Math.max(1, Math.round(rawSysLen / 3.2)) : 0
-      const prependLen = effectivePrependPrompt.trim().length
-      const prependTok = prependLen > 0 ? Math.max(1, Math.round(prependLen / 3.2)) : 0
-      sysPromptTokens = rawSysTok + prependTok
-      conversationTokens = Math.max(0, usedContextTokens - sysPromptTokens)
-    }
-
-    const contextInputTokens = Math.max(0, promptTokens - sysPromptTokens - skillsTokens - toolsTokens)
-
-    return {
-      enabledAccounts,
-      latestLog,
-      routedId,
-      routedName,
-      routedProxy,
-      routedEgress,
-      routedWeight,
-      latestProtocol,
-      latestModel,
-      latestLatencyMs,
-      gwMs,
-      netMs,
-      providerMs,
-      ttfbMs,
-      streamMs,
-      totalReqs,
-      successReqs,
-      errorReqs,
-      successRatePct,
-      switchCount,
-      totalTokens,
-      promptTokens,
-      completionTokens,
-      sysPromptTokens,
-      toolsTokens,
-      skillsTokens,
-      filesTokens,
-      toolResultsTokens,
-      conversationTokens,
-      contextInputTokens,
-      contextCapacity,
-      usedContextTokens,
-      usedPct,
-      remainingTokens,
-      estRemainingReqs,
-      effectivePromptMode,
-      effectiveSessionMode,
-      effectiveDisableBuiltin,
-      effectivePrependPrompt,
-      effectiveKeyName,
-    }
-  }, [
-    accounts,
-    activeClientKey,
-    activeTreemapModal,
-    auditLogs,
-    clientAccountBind,
-    effectiveClientModel,
-    fleetUsageSummary,
-    overview,
-    policy.disable_builtin_tools,
-    policy.global_prepend_prompt,
-    policy.mode,
-    policy.session_mode,
-    selectedAuditLog,
-    skills.length,
-  ])
+  const closeAccountEditor = () => {
+    setShowAccountEditor(false)
+    setAccountFormError('')
+  }
 
   const handleSaveAccount = async () => {
-    if (!accountForm.id.trim() || !accountForm.name.trim()) {
-      setErrorMsg('账户 ID 与名称不能为空')
+    const id = accountForm.id.trim()
+    const name = accountForm.name.trim()
+    if (!id || !name) {
+      setAccountFormError('账户 ID 与名称不能为空')
       return
     }
-    setErrorMsg('')
+    if (!isEditingAccount && accountsRef.current.some((snap) => snap.account.id === id)) {
+      setAccountFormError(`账户 ID「${id}」已存在，请使用其他 ID 或编辑现有账户`)
+      return
+    }
+    const maxWorkers = parsePositiveInt(accountForm.max_workers)
+    if (maxWorkers === null) {
+      setAccountFormError('最大并发进程数必须是不小于 1 的整数')
+      return
+    }
+    const weight = parsePositiveInt(accountForm.weight)
+    if (weight === null) {
+      setAccountFormError('调度权重必须是不小于 1 的整数')
+      return
+    }
+    const payload: AccountWritePayload = {
+      id,
+      name,
+      auth_mode: accountForm.auth_mode,
+      isolation_enabled: accountForm.isolation_enabled,
+      network_mode: accountForm.network_mode,
+      proxy_url: accountForm.proxy_url.trim(),
+      bind_ip: accountForm.bind_ip.trim(),
+      netns_name: accountForm.netns_name.trim(),
+      max_workers: maxWorkers,
+      weight,
+      enabled: accountForm.enabled,
+      status: latestAccount(id)?.status || 'ready',
+    }
+    if (accountForm.api_key) {
+      payload.api_key = accountForm.api_key
+    }
+    setSavingAccount(true)
+    setAccountFormError('')
     setNoticeMsg('')
     try {
-      await apiFetch('/api/admin/accounts', adminToken, {
+      await apiFetch('/api/admin/accounts', {
         method: 'POST',
-        body: JSON.stringify(accountForm),
+        body: JSON.stringify(payload),
       })
-      setNoticeMsg(`账户 ${accountForm.id} 已保存并同步隔离目录`)
+      invalidateInFlightSnapshots()
+      setNoticeMsg(`账户 ${id} 已保存并同步隔离目录`)
       setAccountForm(DEFAULT_ACCOUNT_FORM)
       setShowAccountEditor(false)
       await refreshAll()
     } catch (err) {
-      handleRequestError(err, '保存账户失败')
+      const msg = resolveInlineError(err, '保存账户失败')
+      if (msg) setAccountFormError(msg)
+    } finally {
+      setSavingAccount(false)
     }
   }
 
   const handleEditAccount = (acc: AccountRecord) => {
-    setAccountForm({ ...acc, api_key: '' })
+    setAccountForm(accountToForm(latestAccount(acc.id) || acc))
     setIsEditingAccount(true)
+    setAccountFormError('')
     setShowAccountEditor(true)
   }
 
   const handleToggleAccountEnabled = async (acc: AccountRecord) => {
+    const current = latestAccount(acc.id) || acc
     setErrorMsg('')
     setNoticeMsg('')
     try {
-      await apiFetch('/api/admin/accounts', adminToken, {
+      await apiFetch('/api/admin/accounts', {
         method: 'POST',
-        body: JSON.stringify({
-          ...acc,
-          enabled: !acc.enabled,
-        }),
+        body: JSON.stringify(buildAccountPayload(current, { enabled: !current.enabled })),
       })
-      setNoticeMsg(`账户 ${acc.id} 已${acc.enabled ? '停用' : '启用'}`)
+      invalidateInFlightSnapshots()
+      setNoticeMsg(`账户 ${current.id} 已${current.enabled ? '停用' : '启用'}`)
       await refreshAll()
     } catch (err) {
       handleRequestError(err, '切换账户状态失败')
     }
   }
 
-  const handleDeleteAccount = async (id: string) => {
-    setErrorMsg('')
+  const requestDeleteAccount = (acc: AccountRecord) => {
+    setDeletionError('')
+    setPendingDeletion({ kind: 'account', id: acc.id, name: acc.name || acc.id })
+  }
+
+  const requestDeleteAPIKey = (key: APIKeyRecord) => {
+    setDeletionError('')
+    setPendingDeletion({ kind: 'api_key', id: key.id, name: key.name || key.key_prefix })
+  }
+
+  const cancelDeletion = () => {
+    setPendingDeletion(null)
+    setDeletionError('')
+  }
+
+  const confirmDeletion = async () => {
+    if (!pendingDeletion) return
+    setDeletingItem(true)
+    setDeletionError('')
     try {
-      await apiFetch(`/api/admin/accounts/${encodeURIComponent(id)}`, adminToken, {
-        method: 'DELETE',
-      })
-      setNoticeMsg(`账户 ${id} 已删除`)
+      if (pendingDeletion.kind === 'account') {
+        await apiFetch(`/api/admin/accounts/${encodeURIComponent(pendingDeletion.id)}`, {
+          method: 'DELETE',
+        })
+        setNoticeMsg(`账户 ${pendingDeletion.id} 已删除`)
+      } else {
+        await apiFetch(`/api/admin/api-keys/${pendingDeletion.id}`, { method: 'DELETE' })
+        setNoticeMsg(`已吊销密钥「${pendingDeletion.name}」`)
+      }
+      invalidateInFlightSnapshots()
+      setPendingDeletion(null)
       await refreshAll()
     } catch (err) {
-      handleRequestError(err, '删除账户失败')
+      const msg = resolveInlineError(
+        err,
+        pendingDeletion.kind === 'account' ? '删除账户失败' : '吊销 API Key 失败'
+      )
+      if (msg) setDeletionError(msg)
+    } finally {
+      setDeletingItem(false)
     }
   }
 
@@ -1245,7 +1269,6 @@ export function App() {
     try {
       const res = await apiFetch<{ egress_ip: string }>(
         `/api/admin/accounts/${encodeURIComponent(id)}/probe`,
-        adminToken,
         { method: 'POST' }
       )
       setNoticeMsg(`账户 ${id} 检测通过，出口 IP: ${res.egress_ip}`)
@@ -1265,11 +1288,9 @@ export function App() {
     setErrorMsg('')
     setNoticeMsg('')
     try {
-      await apiFetch(
-        `/api/admin/accounts/${encodeURIComponent(id)}/refresh-quota`,
-        adminToken,
-        { method: 'POST' }
-      )
+      await apiFetch(`/api/admin/accounts/${encodeURIComponent(id)}/refresh-quota`, {
+        method: 'POST',
+      })
       setNoticeMsg(`已刷新账户 ${id} 的模型额度状态`)
       await refreshAll()
     } catch (err) {
@@ -1283,11 +1304,9 @@ export function App() {
     setErrorMsg('')
     setNoticeMsg('')
     try {
-      await apiFetch(
-        `/api/admin/accounts/${encodeURIComponent(id)}/clear-cooldown`,
-        adminToken,
-        { method: 'POST' }
-      )
+      await apiFetch(`/api/admin/accounts/${encodeURIComponent(id)}/clear-cooldown`, {
+        method: 'POST',
+      })
       setNoticeMsg(`已清除账户 ${id} 的冷却限制并恢复就绪状态`)
       await refreshAll()
     } catch (err) {
@@ -1298,180 +1317,139 @@ export function App() {
   const handleRefreshAccountModels = async (accountId: string) => {
     setRefreshingAccountModels((prev) => ({ ...prev, [accountId]: true }))
     setAccountModelsError((prev) => ({ ...prev, [accountId]: '' }))
-    setErrorMsg('')
     setNoticeMsg('')
     try {
-      let nextModels: ACPModelInfo[] = []
-      let nextCachedAt: string | undefined
-      try {
-        const res = await apiFetch<{
-          account_id: string
-          models: ACPModelInfo[]
-          models_cached_at?: string
-          error?: string
-        }>(`/api/admin/accounts/${encodeURIComponent(accountId)}/refresh-models`, adminToken, {
-          method: 'POST',
-        })
-        if (res.error && (!res.models || res.models.length === 0)) {
-          setAccountModelsError((prev) => ({ ...prev, [accountId]: res.error || '拉取模型失败' }))
-          return
-        }
-        nextModels = res.models || []
-        nextCachedAt = res.models_cached_at
-      } catch (innerErr) {
-        const msg = innerErr instanceof Error ? innerErr.message : ''
-        if (msg.includes('unknown account action')) {
-          const fallbackRes = await apiFetch<{
-            cached_at?: string
-            data?: Array<{
-              id: string
-              name?: string
-              display_name?: string
-              description?: string
-              thinking_levels?: string[]
-              default_thinking_level?: string
-            }>
-          }>('/v1/models?refresh=1', adminToken)
-          nextModels = (fallbackRes.data || []).map((item) => ({
-            modelId: item.id,
-            name: item.display_name || item.name || item.id,
-            description: item.description,
-            thinkingLevels:
-              item.thinking_levels && item.thinking_levels.length > 0
-                ? item.thinking_levels
-                : ['low', 'medium', 'high'],
-            defaultThinkingLevel: item.default_thinking_level || 'high',
-          }))
-          nextCachedAt = fallbackRes.cached_at || new Date().toISOString()
-        } else {
-          throw innerErr
-        }
+      const res = await apiFetch<{
+        account_id: string
+        models: ACPModelInfo[]
+        models_cached_at?: string
+        error?: string
+      }>(`/api/admin/accounts/${encodeURIComponent(accountId)}/refresh-models`, {
+        method: 'POST',
+      })
+      if (res.error && (!res.models || res.models.length === 0)) {
+        setAccountModelsError((prev) => ({ ...prev, [accountId]: res.error || '拉取模型失败' }))
+        return
       }
+      const nextModels = res.models || []
+      invalidateInFlightSnapshots()
       setAccounts((prev) =>
         prev.map((snap) =>
           snap.account.id === accountId
             ? {
                 ...snap,
                 models: nextModels,
-                models_cached_at: nextCachedAt || snap.models_cached_at,
+                models_cached_at: res.models_cached_at || snap.models_cached_at,
               }
             : snap
         )
       )
       if (nextModels.length > 0) {
-        setOverview((prev) =>
-          prev
-            ? {
-                ...prev,
-                models: nextModels,
-                models_cached_at: nextCachedAt || prev.models_cached_at,
-              }
-            : prev
-        )
         setNoticeMsg(`账户 ${accountId} 已实时同步 ${nextModels.length} 个 ACP 可用模型`)
       }
+      void refreshTelemetrySilently()
     } catch (err) {
-      if (err instanceof UnauthorizedError) {
-        handleRequestError(err, '探测账户模型失败')
-        return
+      const msg = resolveInlineError(err, '探测账户模型失败')
+      if (msg) {
+        setAccountModelsError((prev) => ({ ...prev, [accountId]: msg }))
       }
-      setAccountModelsError((prev) => ({
-        ...prev,
-        [accountId]: err instanceof Error ? err.message : '探测账户模型失败',
-      }))
     } finally {
       setRefreshingAccountModels((prev) => ({ ...prev, [accountId]: false }))
     }
   }
 
-  const handleToggleAccountModelDisabled = async (
-    acc: AccountRecord,
-    modelId: string
-  ) => {
+  const applyDisabledModels = (accountId: string, disabledModels: string[]) => {
+    invalidateInFlightSnapshots()
+    setAccounts((prev) =>
+      prev.map((snap) =>
+        snap.account.id === accountId
+          ? {
+              ...snap,
+              account: {
+                ...snap.account,
+                disabled_models: disabledModels,
+              },
+            }
+          : snap
+      )
+    )
+  }
+
+  const handleToggleAccountModelDisabled = async (acc: AccountRecord, modelId: string) => {
     const toggleKey = `${acc.id}:${modelId}`
     setTogglingAccountModel((prev) => ({ ...prev, [toggleKey]: true }))
-    setErrorMsg('')
+    setModelModalError('')
     setNoticeMsg('')
     try {
-      const currentlyDisabled = (acc.disabled_models || []).some(
+      const current = latestAccount(acc.id) || acc
+      const currentlyDisabled = (current.disabled_models || []).some(
         (m) => m.trim().toLowerCase() === modelId.trim().toLowerCase()
       )
       const res = await apiFetch<{
         account_id: string
         disabled_models: string[]
         account: AccountRecord
-      }>(`/api/admin/accounts/${encodeURIComponent(acc.id)}/disabled-models`, adminToken, {
+      }>(`/api/admin/accounts/${encodeURIComponent(acc.id)}/disabled-models`, {
         method: 'PUT',
         body: JSON.stringify({
           model_id: modelId,
           disabled: !currentlyDisabled,
         }),
       })
-      setAccounts((prev) =>
-        prev.map((snap) =>
-          snap.account.id === acc.id
-            ? {
-                ...snap,
-                account: {
-                  ...snap.account,
-                  disabled_models: res.disabled_models || [],
-                },
-              }
-            : snap
-        )
-      )
+      applyDisabledModels(acc.id, res.disabled_models || [])
       setNoticeMsg(
         !currentlyDisabled
           ? `已在账户 ${acc.id} 下禁用模型 ${modelId}`
           : `已在账户 ${acc.id} 下恢复启用模型 ${modelId}`
       )
     } catch (err) {
-      handleRequestError(err, '更新账户模型启用状态失败')
+      const msg = resolveInlineError(err, '更新账户模型启用状态失败')
+      if (msg) setModelModalError(msg)
     } finally {
       setTogglingAccountModel((prev) => ({ ...prev, [toggleKey]: false }))
     }
   }
 
   const handleEnableAllAccountModels = async (acc: AccountRecord) => {
-    setErrorMsg('')
+    setModelModalError('')
     setNoticeMsg('')
     try {
       const res = await apiFetch<{
         account_id: string
         disabled_models: string[]
-      }>(`/api/admin/accounts/${encodeURIComponent(acc.id)}/disabled-models`, adminToken, {
+      }>(`/api/admin/accounts/${encodeURIComponent(acc.id)}/disabled-models`, {
         method: 'PUT',
         body: JSON.stringify({
           disabled_models: [],
         }),
       })
-      setAccounts((prev) =>
-        prev.map((snap) =>
-          snap.account.id === acc.id
-            ? {
-                ...snap,
-                account: {
-                  ...snap.account,
-                  disabled_models: res.disabled_models || [],
-                },
-              }
-            : snap
-        )
-      )
+      applyDisabledModels(acc.id, res.disabled_models || [])
       setNoticeMsg(`已恢复启用账户 ${acc.id} 下的全部 ACP 模型`)
     } catch (err) {
-      handleRequestError(err, '恢复全部模型失败')
+      const msg = resolveInlineError(err, '恢复全部模型失败')
+      if (msg) setModelModalError(msg)
     }
   }
 
+  const openModelModal = (accountId: string) => {
+    setModelModalError('')
+    setModelModalAccountId(accountId)
+  }
+
+  const closeModelModal = () => {
+    setModelModalAccountId(null)
+    setModelModalError('')
+  }
+
   const toggleQuickProxy = (acc: AccountRecord) => {
+    const current = latestAccount(acc.id) || acc
     setProxyEditorOpen((prev) => ({ ...prev, [acc.id]: !prev[acc.id] }))
     setProxyDraft((prev) => ({
       ...prev,
       [acc.id]: {
-        network_mode: acc.network_mode === 'direct' ? 'proxy' : acc.network_mode,
-        proxy_url: acc.proxy_url || 'socks5://127.0.0.1:1080',
-        bind_ip: acc.bind_ip || '',
+        network_mode: current.network_mode === 'direct' ? 'proxy' : current.network_mode,
+        proxy_url: current.proxy_url || '',
+        bind_ip: current.bind_ip || '',
       },
     }))
   }
@@ -1479,18 +1457,31 @@ export function App() {
   const handleSaveQuickProxy = async (acc: AccountRecord) => {
     const draft = proxyDraft[acc.id]
     if (!draft) return
+    const proxyUrl = draft.proxy_url.trim()
+    const bindIp = draft.bind_ip.trim()
+    if (draft.network_mode === 'proxy' && !proxyUrl) {
+      setErrorMsg('请输入代理地址，例如 socks5://user:pass@127.0.0.1:1080')
+      return
+    }
+    if (draft.network_mode === 'bind_ip' && !bindIp) {
+      setErrorMsg('请输入要绑定的网卡 IP')
+      return
+    }
+    const current = latestAccount(acc.id) || acc
     setErrorMsg('')
     setNoticeMsg('')
     try {
-      await apiFetch('/api/admin/accounts', adminToken, {
+      await apiFetch('/api/admin/accounts', {
         method: 'POST',
-        body: JSON.stringify({
-          ...acc,
-          network_mode: draft.network_mode,
-          proxy_url: draft.proxy_url,
-          bind_ip: draft.bind_ip,
-        }),
+        body: JSON.stringify(
+          buildAccountPayload(current, {
+            network_mode: draft.network_mode,
+            proxy_url: proxyUrl,
+            bind_ip: bindIp,
+          })
+        ),
       })
+      invalidateInFlightSnapshots()
       setProxyEditorOpen((prev) => ({ ...prev, [acc.id]: false }))
       setNoticeMsg(`账户 ${acc.id} 的代理与出口配置已热更新`)
       await refreshAll()
@@ -1499,33 +1490,43 @@ export function App() {
     }
   }
 
+  const closeLoginDrawer = (id: string) => {
+    dismissedLoginRef.current.add(id)
+    setLoginState((prev) => {
+      const next = { ...prev }
+      delete next[id]
+      return next
+    })
+    setLoginErrors((prev) => ({ ...prev, [id]: '' }))
+  }
+
   const handleStartTerminalLogin = async (id: string) => {
     setStartingLogin((prev) => ({ ...prev, [id]: true }))
-    setErrorMsg('')
+    setLoginErrors((prev) => ({ ...prev, [id]: '' }))
     try {
       const status = await apiFetch<TerminalLoginStatus>(
         `/api/admin/accounts/${encodeURIComponent(id)}/login/start`,
-        adminToken,
         { method: 'POST' }
       )
+      dismissedLoginRef.current.delete(id)
       setLoginState((prev) => ({ ...prev, [id]: status }))
       setNoticeMsg(`已为账户 ${id} 启动重新登录会话`)
     } catch (err) {
-      handleRequestError(err, '启动登录失败')
+      const msg = resolveInlineError(err, '启动登录失败')
+      if (msg) setLoginErrors((prev) => ({ ...prev, [id]: msg }))
     } finally {
       setStartingLogin((prev) => ({ ...prev, [id]: false }))
     }
   }
 
   const handleSubmitTerminalCode = async (id: string) => {
-    const code = loginCodeInput[id] || ''
-    if (!code.trim()) return
+    const code = (loginCodeInput[id] || '').trim()
+    if (!code) return
     setSubmittingLogin((prev) => ({ ...prev, [id]: true }))
-    setErrorMsg('')
+    setLoginErrors((prev) => ({ ...prev, [id]: '' }))
     try {
       const status = await apiFetch<TerminalLoginStatus>(
         `/api/admin/accounts/${encodeURIComponent(id)}/login/submit`,
-        adminToken,
         {
           method: 'POST',
           body: JSON.stringify({ code }),
@@ -1541,11 +1542,19 @@ export function App() {
         setNoticeMsg(`账户 ${id} 授权验证成功，已恢复就绪状态`)
       } else {
         setLoginState((prev) => ({ ...prev, [id]: status }))
-        setNoticeMsg(`已向账户 ${id} 提交授权验证码`)
+        if (status.state === 'error') {
+          setLoginErrors((prev) => ({
+            ...prev,
+            [id]: cleanTerminalLoginOutput(status.output, status.auth_url) || '授权失败，请重新发起登录',
+          }))
+        } else {
+          setNoticeMsg(`已向账户 ${id} 提交授权验证码`)
+        }
       }
       await refreshAll()
     } catch (err) {
-      handleRequestError(err, '提交验证码失败')
+      const msg = resolveInlineError(err, '提交验证码失败')
+      if (msg) setLoginErrors((prev) => ({ ...prev, [id]: msg }))
     } finally {
       setSubmittingLogin((prev) => ({ ...prev, [id]: false }))
     }
@@ -1554,32 +1563,43 @@ export function App() {
   const openCreateAPIKeyModal = () => {
     setNewKeyName('')
     setNewKeyAccount('')
-    setNewKeyRPM(60)
+    setNewKeyRPM('60')
     setNewKeyPromptMode(policy.mode || 'native_hybrid')
     setNewKeySessionMode(policy.session_mode || 'yolo')
     setNewKeyPrependPrompt(policy.global_prepend_prompt || '')
     setNewKeyDisableBuiltinTools(policy.disable_builtin_tools ?? true)
-    setErrorMsg('')
+    setCreateKeyError('')
     setShowCreateKeyModal(true)
   }
 
+  const closeCreateAPIKeyModal = () => {
+    setShowCreateKeyModal(false)
+    setCreateKeyError('')
+  }
+
   const handleCreateAPIKey = async () => {
-    if (!newKeyName.trim()) {
-      setErrorMsg('请输入客户端密钥名称')
+    const name = newKeyName.trim()
+    if (!name) {
+      setCreateKeyError('请输入客户端密钥名称')
       return
     }
+    const rpm = parsePositiveInt(newKeyRPM)
+    if (rpm === null) {
+      setCreateKeyError('每分钟请求上限 (RPM) 必须是不小于 1 的整数')
+      return
+    }
+    const boundAccountId = newKeyAccount.trim()
     setCreatingKey(true)
-    setErrorMsg('')
+    setCreateKeyError('')
     try {
       const res = await apiFetch<{ plain_key: string; record?: APIKeyRecord }>(
         '/api/admin/api-keys',
-        adminToken,
         {
           method: 'POST',
           body: JSON.stringify({
-            name: newKeyName,
-            bound_account_id: newKeyAccount,
-            rate_limit_rpm: Number(newKeyRPM) || 60,
+            name,
+            bound_account_id: boundAccountId,
+            rate_limit_rpm: rpm,
             prompt_mode: newKeyPromptMode,
             session_mode: newKeySessionMode,
             global_prepend_prompt: newKeyPrependPrompt,
@@ -1592,71 +1612,74 @@ export function App() {
       if (res.record?.id) {
         setClientSelectedKeyId(String(res.record.id))
       }
-      setClientAccountBind(newKeyAccount.trim() || 'auto')
-      setPolicy({
-        mode: newKeyPromptMode,
-        global_prepend_prompt: newKeyPrependPrompt,
-        disable_builtin_tools: newKeyDisableBuiltinTools,
-        session_mode: newKeySessionMode,
-      })
+      setClientAccountBind(boundAccountId || 'auto')
       setNewKeyName('')
       setShowCreateKeyModal(false)
-      setNoticeMsg('已签发新的客户端 API Key 并同步至上下文窗口与客户端接入设置，请立即复制保存下方明文密钥')
+      setNoticeMsg('已签发新的客户端 API Key 并同步至客户端接入设置，请立即复制保存下方明文密钥')
       await refreshAll()
     } catch (err) {
-      handleRequestError(err, '签发 API Key 失败')
+      const msg = resolveInlineError(err, '签发 API Key 失败')
+      if (msg) setCreateKeyError(msg)
     } finally {
       setCreatingKey(false)
     }
   }
 
+  const openEditAPIKey = (key: APIKeyRecord) => {
+    setEditingKey({
+      ...key,
+      bound_account_id: key.bound_account_id || '',
+      prompt_mode: key.prompt_mode || 'native_hybrid',
+      session_mode: key.session_mode || 'yolo',
+      global_prepend_prompt: key.global_prepend_prompt || '',
+      disable_builtin_tools: key.disable_builtin_tools ?? true,
+    })
+    setEditKeyRPM(String(key.rate_limit_rpm))
+    setEditKeyError('')
+  }
+
+  const closeEditAPIKey = () => {
+    setEditingKey(null)
+    setEditKeyError('')
+  }
+
   const handleSaveKeyEdit = async () => {
     if (!editingKey) return
-    if (!editingKey.name.trim()) {
-      setErrorMsg('请输入客户端密钥名称')
+    const name = editingKey.name.trim()
+    if (!name) {
+      setEditKeyError('请输入客户端密钥名称')
       return
     }
+    const rpm = parsePositiveInt(editKeyRPM)
+    if (rpm === null) {
+      setEditKeyError('每分钟请求上限 (RPM) 必须是不小于 1 的整数')
+      return
+    }
+    const boundAccountId = (editingKey.bound_account_id || '').trim()
     setSavingKeyEdit(true)
-    setErrorMsg('')
+    setEditKeyError('')
     setNoticeMsg('')
     try {
-      await apiFetch(`/api/admin/api-keys/${editingKey.id}`, adminToken, {
+      await apiFetch(`/api/admin/api-keys/${editingKey.id}`, {
         method: 'PUT',
         body: JSON.stringify({
-          name: editingKey.name,
-          bound_account_id: editingKey.bound_account_id,
-          rate_limit_rpm: Number(editingKey.rate_limit_rpm) || 60,
+          name,
+          bound_account_id: boundAccountId,
+          rate_limit_rpm: rpm,
           prompt_mode: editingKey.prompt_mode || 'native_hybrid',
           session_mode: editingKey.session_mode || 'yolo',
           global_prepend_prompt: editingKey.global_prepend_prompt || '',
           disable_builtin_tools: editingKey.disable_builtin_tools ?? true,
         }),
       })
-      const updatedName = editingKey.name
-      setClientSelectedKeyId(String(editingKey.id))
-      setClientAccountBind(editingKey.bound_account_id?.trim() || 'auto')
-      setPolicy({
-        mode: editingKey.prompt_mode || 'native_hybrid',
-        global_prepend_prompt: editingKey.global_prepend_prompt || '',
-        disable_builtin_tools: editingKey.disable_builtin_tools ?? true,
-        session_mode: editingKey.session_mode || 'yolo',
-      })
       setEditingKey(null)
-      setNoticeMsg(`已更新密钥「${updatedName}」的独立策略，并已同步刷新上下文窗口与客户端设置`)
+      setNoticeMsg(`已更新密钥「${name}」的独立策略`)
       await refreshAll()
     } catch (err) {
-      handleRequestError(err, '保存密钥独立策略失败')
+      const msg = resolveInlineError(err, '保存密钥独立策略失败')
+      if (msg) setEditKeyError(msg)
     } finally {
       setSavingKeyEdit(false)
-    }
-  }
-
-  const handleDeleteAPIKey = async (id: number) => {
-    try {
-      await apiFetch(`/api/admin/api-keys/${id}`, adminToken, { method: 'DELETE' })
-      await refreshAll()
-    } catch (err) {
-      handleRequestError(err, '吊销 API Key 失败')
     }
   }
 
@@ -1674,7 +1697,7 @@ export function App() {
       id: 'account',
       header: '账户名称 / ID',
       cell: (row) => (
-        <div>
+        <div translate="no">
           <div className="font-medium text-foreground">{row.account.name}</div>
           <div className="font-mono text-muted-foreground">{row.account.id}</div>
         </div>
@@ -1692,8 +1715,8 @@ export function App() {
       cell: (row) => (
         <div className="font-mono tabular-nums">
           <span className="font-semibold text-foreground">
-            {formatCompactNumber(row.usage?.today_prompt_tokens || 0)} /{' '}
-            {formatCompactNumber(row.usage?.today_completion_tokens || 0)}
+            {formatCompact(row.usage?.today_prompt_tokens || 0)} /{' '}
+            {formatCompact(row.usage?.today_completion_tokens || 0)}
           </span>
         </div>
       ),
@@ -1767,7 +1790,7 @@ export function App() {
           <Button
             size="xs"
             variant="outline"
-            onClick={() => setModelModalAccountId(row.account.id)}
+            onClick={() => openModelModal(row.account.id)}
           >
             模型
           </Button>
@@ -1827,11 +1850,13 @@ export function App() {
           {/* 1. Top Header: Account ID/Name + Status Pill + Enable Switch */}
           <div className="flex items-center justify-between gap-2">
             <div className="flex items-center gap-2 min-w-0">
-              <span className="text-sm font-bold tracking-tight text-foreground truncate">
+              <span className="text-sm font-bold tracking-tight text-foreground truncate" translate="no">
                 {acc.id}
               </span>
               {acc.name && acc.name !== acc.id && (
-                <span className="text-xs text-muted-foreground truncate">({acc.name})</span>
+                <span className="text-xs text-muted-foreground truncate" translate="no">
+                  ({acc.name})
+                </span>
               )}
               <Badge variant={isReadyState ? 'success-light' : 'warning-light'}>
                 {statusLabel}
@@ -1848,7 +1873,10 @@ export function App() {
           {/* 2. Proxy & Egress Subtitle + Quota Read Timestamp */}
           <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
             <div className="flex flex-wrap items-center gap-1 font-mono truncate">
-              <span className="truncate">{`代理 ${formatProxySubtitle(acc)}`}</span>
+              <span>代理</span>
+              <span className="truncate" translate="no">
+                {formatProxySubtitle(acc)}
+              </span>
               <span>·</span>
               <span>{`出口 ${acc.last_egress_ip || '待检测'}`}</span>
             </div>
@@ -1945,7 +1973,7 @@ export function App() {
                 <strong className="font-semibold text-foreground">{u?.today_failed ?? 0}</strong>
                 {' · Token '}
                 <strong className="font-semibold text-foreground">
-                  {`${formatCompactNumber(u?.today_prompt_tokens ?? 0)} / ${formatCompactNumber(
+                  {`${formatCompact(u?.today_prompt_tokens ?? 0)} / ${formatCompact(
                     u?.today_completion_tokens ?? 0
                   )}`}
                 </strong>
@@ -1954,7 +1982,7 @@ export function App() {
               <span>
                 {'近 7 天 '}
                 <strong className="font-semibold text-foreground">
-                  {`${formatCompactNumber(u?.week_prompt_tokens ?? 0)} / ${formatCompactNumber(
+                  {`${formatCompact(u?.week_prompt_tokens ?? 0)} / ${formatCompact(
                     u?.week_completion_tokens ?? 0
                   )}`}
                 </strong>
@@ -2045,6 +2073,15 @@ export function App() {
             </div>
           )}
 
+          {loginErrors[acc.id] && !activeLogin && (
+            <InlineError
+              title="登录授权失败"
+              message={loginErrors[acc.id]}
+              onRetry={() => void handleStartTerminalLogin(acc.id)}
+              retrying={isStartingLogin}
+            />
+          )}
+
           {/* Inline Terminal Login Drawer (when 重新登录 is clicked) */}
           {activeLogin && (
             <div className="rounded-lg border border-info/35 bg-info/8 p-3 flex flex-col gap-2.5">
@@ -2056,21 +2093,21 @@ export function App() {
                   <Badge variant={statusBadgeVariant(activeLogin.state)}>
                     {formatLoginStateLabel(activeLogin.state)}
                   </Badge>
-                  <Button
-                    size="xs"
-                    variant="ghost"
-                    onClick={() =>
-                      setLoginState((prev) => {
-                        const next = { ...prev }
-                        delete next[acc.id]
-                        return next
-                      })
-                    }
-                  >
+                  <Button size="xs" variant="ghost" onClick={() => closeLoginDrawer(acc.id)}>
                     收起
                   </Button>
                 </div>
               </div>
+
+              {loginErrors[acc.id] && (
+                <InlineError
+                  title="登录授权失败"
+                  message={loginErrors[acc.id]}
+                  onRetry={() => void handleStartTerminalLogin(acc.id)}
+                  retrying={isStartingLogin}
+                  retryLabel="重新发起登录"
+                />
+              )}
 
               {activeLogin.auth_url && (
                 <div className="flex flex-col gap-1.5">
@@ -2080,6 +2117,7 @@ export function App() {
                   <div className="flex items-center gap-1.5">
                     <div
                       title={activeLogin.auth_url}
+                      translate="no"
                       className="flex-1 min-w-0 rounded-md border border-border bg-background/90 px-2.5 py-1.5 font-mono text-xs text-muted-foreground truncate select-all"
                     >
                       {activeLogin.auth_url}
@@ -2088,10 +2126,10 @@ export function App() {
                       size="xs"
                       variant="outline"
                       onClick={() =>
-                        copyClientText(`login-url-${acc.id}`, activeLogin.auth_url || '')
+                        void copyClientText(`login-url-${acc.id}`, activeLogin.auth_url || '')
                       }
                     >
-                      {copiedClientField === `login-url-${acc.id}` ? '已复制' : '复制链接'}
+                      {copyLabel(`login-url-${acc.id}`, '复制链接')}
                     </Button>
                     <Button
                       size="xs"
@@ -2134,7 +2172,10 @@ export function App() {
               </div>
 
               {cleanedLoginOutput && (
-                <pre className="max-h-24 overflow-y-auto rounded-md border border-border bg-background/90 p-2 font-mono text-xs text-muted-foreground whitespace-pre-wrap break-all">
+                <pre
+                  translate="no"
+                  className="max-h-24 overflow-y-auto rounded-md border border-border bg-background/90 p-2 font-mono text-xs text-muted-foreground whitespace-pre-wrap break-all"
+                >
                   {cleanedLoginOutput}
                 </pre>
               )}
@@ -2162,7 +2203,7 @@ export function App() {
             <Button
               size="xs"
               variant="outline"
-              onClick={() => setModelModalAccountId(acc.id)}
+              onClick={() => openModelModal(acc.id)}
             >
               模型
             </Button>
@@ -2183,11 +2224,7 @@ export function App() {
             <Button size="xs" variant="outline" onClick={() => void handleClearCooldown(acc.id)}>
               清除冷却
             </Button>
-            <Button
-              size="xs"
-              variant="destructive"
-              onClick={() => void handleDeleteAccount(acc.id)}
-            >
+            <Button size="xs" variant="destructive" onClick={() => requestDeleteAccount(acc)}>
               删除
             </Button>
           </div>
@@ -2196,7 +2233,7 @@ export function App() {
     )
   }
 
-  if (authState === 'checking') {
+  if (authState === 'checking' || authState === 'unknown') {
     return (
       <div className="min-h-screen bg-background text-foreground flex items-center justify-center p-4">
         <Frame className="w-full max-w-sm">
@@ -2204,8 +2241,19 @@ export function App() {
             <IconTile variant="elevated">
               <Lock />
             </IconTile>
-            <div className="text-sm font-medium text-foreground">正在验证管理会话...</div>
-            <div className="text-xs text-muted-foreground">请稍候，正在检查访问权限</div>
+            {authState === 'checking' ? (
+              <>
+                <div className="text-sm font-medium text-foreground">正在验证管理会话...</div>
+                <div className="text-xs text-muted-foreground">请稍候，正在检查访问权限</div>
+              </>
+            ) : (
+              <InlineError
+                className="text-start"
+                title="无法确认登录状态"
+                message={sessionCheckError || '无法连接网关服务，请检查网络后重试'}
+                onRetry={() => void verifySession()}
+              />
+            )}
           </FramePanel>
         </Frame>
       </div>
@@ -2316,7 +2364,7 @@ export function App() {
                 <Button
                   type="submit"
                   size="default"
-                  disabled={loggingIn || !loginPassword.trim()}
+                  disabled={loggingIn || !loginPassword}
                   className="w-full"
                 >
                   <Lock />
@@ -2373,15 +2421,12 @@ export function App() {
             <Button
               variant="outline"
               size="sm"
-              onClick={() => {
-                setErrorMsg('')
-                setShowPasswordModal(true)
-              }}
+              onClick={openPasswordModal}
             >
               <KeyRound />
               修改密码
             </Button>
-            <Button variant="outline" size="sm" onClick={() => void refreshAll()} disabled={loading}>
+            <Button variant="outline" size="sm" onClick={retryRefresh} disabled={loading}>
               <RefreshCw />
               刷新
             </Button>
@@ -2410,7 +2455,7 @@ export function App() {
 
       <DialogModal
         open={showPasswordModal}
-        onClose={() => setShowPasswordModal(false)}
+        onClose={closePasswordModal}
         title="修改并固定管理员密码与 Token"
         description={
           overview?.credentials_locked
@@ -2421,11 +2466,7 @@ export function App() {
           <>
             <span className="text-xs text-muted-foreground">修改后立即持久化锁定至数据库</span>
             <div className="flex items-center gap-2">
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={() => setShowPasswordModal(false)}
-              >
+              <Button size="sm" variant="outline" onClick={closePasswordModal}>
                 取消
               </Button>
               <Button
@@ -2440,6 +2481,14 @@ export function App() {
         }
       >
         <div className="flex flex-col gap-3">
+          {passwordModalError && (
+            <Alert variant="destructive">
+              <div className="flex-1">
+                <AlertTitle>修改失败</AlertTitle>
+                <AlertDescription>{passwordModalError}</AlertDescription>
+              </div>
+            </Alert>
+          )}
           <div className="flex flex-col gap-1">
             <label htmlFor="current-admin-pwd" className="text-xs font-medium text-foreground">
               当前管理员密码或 Token
@@ -2462,7 +2511,7 @@ export function App() {
               type="password"
               value={newPasswordInput}
               onChange={setNewPasswordInput}
-              placeholder="输入至少 6 位的新密码（修改后永久固定）"
+              placeholder="输入至少 8 位的新密码（修改后永久固定）"
               autoComplete="new-password"
             />
           </div>
@@ -2488,12 +2537,40 @@ export function App() {
               type="password"
               value={newAdminTokenInput}
               onChange={setNewAdminTokenInput}
-              placeholder="用于脚本调用 /api/admin/* 的静态 Token（留空保持当前值并固定）"
+              placeholder="至少 12 位，用于脚本调用 /api/admin/*（留空保持当前值并固定）"
               autoComplete="new-password"
             />
           </div>
         </div>
       </DialogModal>
+
+      <ConfirmDialog
+        open={pendingDeletion !== null}
+        title={pendingDeletion?.kind === 'api_key' ? '确认吊销 API Key' : '确认删除隔离账户'}
+        description={
+          pendingDeletion?.kind === 'api_key'
+            ? '吊销后使用该密钥的客户端将立即无法访问网关，此操作不可撤销。'
+            : '删除后该账户的隔离目录与登录凭证将被移除，此操作不可撤销。'
+        }
+        confirmLabel={pendingDeletion?.kind === 'api_key' ? '吊销密钥' : '删除账户'}
+        busy={deletingItem}
+        error={deletionError}
+        onConfirm={() => void confirmDeletion()}
+        onCancel={cancelDeletion}
+      >
+        {pendingDeletion && (
+          <div className="flex flex-col gap-1 rounded-lg border border-border bg-muted/30 p-3 text-sm">
+            <span className="text-xs text-muted-foreground">
+              {pendingDeletion.kind === 'api_key' ? '将要吊销的密钥' : '将要删除的账户'}
+            </span>
+            <span className="font-semibold text-foreground" translate="no">
+              {pendingDeletion.kind === 'account' && pendingDeletion.name !== pendingDeletion.id
+                ? `${pendingDeletion.name} (${pendingDeletion.id})`
+                : pendingDeletion.name}
+            </span>
+          </div>
+        )}
+      </ConfirmDialog>
 
       {/* Main Layout */}
       <div className="mx-auto flex w-full max-w-[1440px] flex-1 gap-5 px-5 py-5">
@@ -2537,7 +2614,7 @@ export function App() {
             <FrameFooter>
               <span>全池 24h Token</span>
               <span className="font-mono font-semibold text-foreground tabular-nums">
-                {formatCompactNumber(fleetUsageSummary.tokens24h)}
+                {formatCompact(fleetUsageSummary.tokens24h)}
               </span>
             </FrameFooter>
           </Frame>
@@ -2553,6 +2630,15 @@ export function App() {
               </div>
             </Alert>
           )}
+          {(loadError || syncError) &&
+            !(activeTab === 'overview' && !overview && auditLogs.length === 0) && (
+              <InlineError
+                title={loadError ? '加载管理数据失败' : '后台同步中断，当前显示的数据可能已过期'}
+                message={loadError || syncError}
+                onRetry={retryRefresh}
+                retrying={loading}
+              />
+            )}
           {noticeMsg && (
             <Alert variant="success">
               <div className="flex-1">
@@ -2568,51 +2654,27 @@ export function App() {
               <OverviewBoard
                 overview={overview}
                 accounts={accounts}
-                apiKeys={apiKeys}
                 auditLogs={auditLogs}
                 selectedAuditLog={selectedAuditLog}
-                onSelectAuditLogId={(id) => setSelectedAuditLogId(id)}
-                policy={policy}
-                skills={skills}
+                onSelectAuditLogId={setSelectedAuditLogId}
                 gatewayHostPort={gatewayHostPort}
-                clientSettings={{
-                  selectedKey: activeClientKey,
-                  protocolTab: clientProtocolTab,
-                  effectiveModel: effectiveClientModel,
-                  accountBind: clientAccountBind,
-                }}
+                loading={loading}
+                loadError={loadError}
+                syncError={syncError}
                 fleetUsageSummary={fleetUsageSummary}
-                onOpenModal={(key, logId, moduleSelection) =>
-                  openTreemapModal(key, logId, moduleSelection)
-                }
-                onNavigateTab={(tab) => setActiveTab(tab)}
-                onRefresh={() => void refreshAll()}
+                onOpenModal={openTreemapModal}
+                onNavigateTab={navigateTab}
+                onRefresh={retryRefresh}
               />
 
               <OverviewDetailModal
                 activeModal={activeTreemapModal}
                 activeModule={activeTreemapModule}
-                onClose={() => {
-                  setActiveTreemapModal(null)
-                  setActiveTreemapModule(null)
-                }}
-                onSelectModal={(key) => {
-                  setActiveTreemapModule(null)
-                  setActiveTreemapModal(key)
-                }}
-                selectedAuditLog={selectedAuditLog}
-                onSelectAuditLogId={(id) => setSelectedAuditLogId(id)}
+                onClose={closeTreemapModal}
+                selectedAuditLog={pinnedDetailLog}
+                onSelectAuditLogId={setDetailLogId}
                 auditLogs={auditLogs}
-                accounts={accounts}
-                skills={skills}
-                policy={policy}
-                discoveredModels={discoveredModels}
-                gatewayBaseUrl={gatewayBaseUrl}
-                fleetUsageSummary={fleetUsageSummary}
-                overviewTelemetry={overviewTelemetry}
-                onNavigateTab={(tab) => setActiveTab(tab)}
-                onProbeAccount={(id) => void handleProbeEgress(id)}
-                onRefreshQuota={(id) => void handleRefreshQuota(id)}
+                onNavigateTab={navigateTab}
               />
             </div>
           )}
@@ -2643,14 +2705,7 @@ export function App() {
                         { value: 'table', label: '表格视图' },
                       ]}
                     />
-                    <Button
-                      size="sm"
-                      onClick={() => {
-                        setAccountForm(DEFAULT_ACCOUNT_FORM)
-                        setIsEditingAccount(false)
-                        setShowAccountEditor(true)
-                      }}
-                    >
+                    <Button size="sm" onClick={openCreateAccountEditor}>
                       <Plus />
                       新增隔离账户
                     </Button>
@@ -2661,8 +2716,9 @@ export function App() {
               {/* Modal Dialog for Account Creation / Editing */}
               <DialogModal
                 open={showAccountEditor}
-                onClose={() => setShowAccountEditor(false)}
+                onClose={closeAccountEditor}
                 title={isEditingAccount ? `编辑隔离账户: ${accountForm.id}` : '新增隔离账户'}
+                translateTitle={!isEditingAccount}
                 description="配置独立 GEMINI_CLI_HOME 容器目录、ACP 认证方式、SOCKS5/HTTP 代理或源网卡 IP 绑定"
                 footer={
                   <>
@@ -2670,33 +2726,39 @@ export function App() {
                       {`目录: data/accounts/${accountForm.id || '<id>'}/gemini_home`}
                     </span>
                     <div className="flex items-center gap-2">
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        onClick={() => {
-                          setAccountForm(DEFAULT_ACCOUNT_FORM)
-                          setShowAccountEditor(false)
-                        }}
-                      >
+                      <Button size="sm" variant="outline" onClick={closeAccountEditor}>
                         取消
                       </Button>
-                      <Button size="sm" onClick={() => void handleSaveAccount()}>
-                        保存配置
+                      <Button
+                        size="sm"
+                        disabled={savingAccount}
+                        onClick={() => void handleSaveAccount()}
+                      >
+                        {savingAccount ? '正在保存...' : '保存配置'}
                       </Button>
                     </div>
                   </>
                 }
               >
+                {accountFormError && (
+                  <Alert variant="destructive">
+                    <div className="flex-1">
+                      <AlertTitle>保存失败</AlertTitle>
+                      <AlertDescription>{accountFormError}</AlertDescription>
+                    </div>
+                  </Alert>
+                )}
                 <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                   <div className="flex flex-col gap-1">
                     <label htmlFor="acc-id" className="text-xs font-medium text-foreground">
-                      账户标识 ID (例如 g1, g2)
+                      {isEditingAccount ? '账户标识 ID (创建后不可修改)' : '账户标识 ID (例如 g1, g2)'}
                     </label>
                     <Input
                       id="acc-id"
                       value={accountForm.id}
                       onChange={(v) => setAccountForm({ ...accountForm, id: v })}
                       placeholder="例如: g1 或 us-node-01"
+                      readOnly={isEditingAccount}
                     />
                   </div>
                   <div className="flex flex-col gap-1">
@@ -2736,9 +2798,10 @@ export function App() {
                     <Input
                       id="acc-apikey"
                       type="password"
-                      value={accountForm.api_key || ''}
+                      value={accountForm.api_key}
                       onChange={(v) => setAccountForm({ ...accountForm, api_key: v })}
-                      placeholder="AIzaSy..."
+                      placeholder={isEditingAccount ? '留空保持不变' : 'AIzaSy...'}
+                      autoComplete="new-password"
                     />
                   </div>
                 )}
@@ -2805,11 +2868,13 @@ export function App() {
                     </label>
                     <Input
                       id="acc-workers"
-                      type="number"
+                      inputMode="numeric"
                       value={accountForm.max_workers}
-                      onChange={(v) =>
-                        setAccountForm({ ...accountForm, max_workers: Number(v) || 1 })
+                      invalid={
+                        accountForm.max_workers !== '' &&
+                        parsePositiveInt(accountForm.max_workers) === null
                       }
+                      onChange={(v) => setAccountForm({ ...accountForm, max_workers: v })}
                     />
                   </div>
                   <div className="flex flex-col gap-1">
@@ -2818,9 +2883,12 @@ export function App() {
                     </label>
                     <Input
                       id="acc-weight"
-                      type="number"
+                      inputMode="numeric"
                       value={accountForm.weight}
-                      onChange={(v) => setAccountForm({ ...accountForm, weight: Number(v) || 1 })}
+                      invalid={
+                        accountForm.weight !== '' && parsePositiveInt(accountForm.weight) === null
+                      }
+                      onChange={(v) => setAccountForm({ ...accountForm, weight: v })}
                     />
                   </div>
                 </div>
@@ -2852,8 +2920,9 @@ export function App() {
                 return (
                   <DialogModal
                     open={Boolean(modelModalAccountId && modalAcc)}
-                    onClose={() => setModelModalAccountId(null)}
+                    onClose={closeModelModal}
                     maxWidthClass="max-w-xl"
+                    translateTitle={false}
                     title={
                       modalAcc
                         ? `ACP 后端实时可用模型 — ${modalAcc.id}${
@@ -2879,11 +2948,7 @@ export function App() {
                               全部恢复启用
                             </Button>
                           )}
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            onClick={() => setModelModalAccountId(null)}
-                          >
+                          <Button size="sm" variant="outline" onClick={closeModelModal}>
                             关闭
                           </Button>
                         </div>
@@ -2929,6 +2994,14 @@ export function App() {
                         </div>
 
                         {/* Error / Skeleton / List / Empty states */}
+                        {modelModalError && (
+                          <Alert variant="destructive">
+                            <div className="flex-1">
+                              <AlertTitle>更新模型启用状态失败</AlertTitle>
+                              <AlertDescription>{modelModalError}</AlertDescription>
+                            </div>
+                          </Alert>
+                        )}
                         {accModelErr && (
                           <Alert variant="destructive">
                             <div className="flex items-center justify-between gap-3 w-full">
@@ -2965,12 +3038,9 @@ export function App() {
                                   ? m.thinkingLevels
                                   : m.thinking_levels && m.thinking_levels.length > 0
                                     ? m.thinking_levels
-                                    : ['low', 'medium', 'high']
+                                    : []
                               const defaultLevel =
-                                m.defaultThinkingLevel ||
-                                m.default_thinking_level ||
-                                rawLevels[rawLevels.length - 1] ||
-                                'high'
+                                m.defaultThinkingLevel || m.default_thinking_level || ''
                               return (
                                 <div
                                   key={m.modelId}
@@ -3022,6 +3092,9 @@ export function App() {
                                         <span className="text-xs text-muted-foreground">
                                           思考强度:
                                         </span>
+                                        {rawLevels.length === 0 && (
+                                          <span className="text-xs text-muted-foreground">—</span>
+                                        )}
                                         {rawLevels.map((lvl) => {
                                           const isDefault =
                                             lvl.toLowerCase() === defaultLevel.toLowerCase()
@@ -3103,9 +3176,35 @@ export function App() {
 
               {/* Account Cards Grid (compact 3-column on desktop) vs Table View */}
               {accountViewMode === 'cards' ? (
-                <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
-                  {accounts.map((snap) => renderAccountQuotaCard(snap))}
-                </div>
+                accounts.length > 0 ? (
+                  <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
+                    {accounts.map((snap) => renderAccountQuotaCard(snap))}
+                  </div>
+                ) : !overview && (loading || !loadError) ? (
+                  <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
+                    <Skeleton className="h-64 w-full" />
+                    <Skeleton className="h-64 w-full" />
+                    <Skeleton className="h-64 w-full" />
+                  </div>
+                ) : (
+                  <Frame>
+                    <FramePanel className="flex flex-col items-center gap-3 py-10 text-center">
+                      <IconTile variant="outline">
+                        <Layers />
+                      </IconTile>
+                      <div className="flex flex-col gap-1">
+                        <div className="text-sm font-medium text-foreground">尚未配置任何账户</div>
+                        <div className="text-xs text-muted-foreground">
+                          新增一个隔离账户后，即可在此查看额度、出口 IP 与运维操作
+                        </div>
+                      </div>
+                      <Button size="sm" onClick={openCreateAccountEditor}>
+                        <Plus />
+                        新增隔离账户
+                      </Button>
+                    </FramePanel>
+                  </Frame>
+                )
               ) : (
                 <Frame>
                   <FrameHeader>
@@ -3117,7 +3216,13 @@ export function App() {
                       rows={accounts}
                       getRowId={(r) => r.account.id}
                       emptyTitle="尚未配置任何账户"
-                      emptyDescription="点击上方新增隔离账户按钮创建账户"
+                      emptyDescription="新增一个隔离账户后即可在此管理"
+                      emptyAction={
+                        <Button size="sm" onClick={openCreateAccountEditor}>
+                          <Plus />
+                          新增隔离账户
+                        </Button>
+                      }
                     />
                   </FramePanel>
                 </Frame>
@@ -3212,15 +3317,6 @@ export function App() {
                                 } else {
                                   setClientAccountBind('auto')
                                 }
-                                setPolicy((prev) => ({
-                                  ...prev,
-                                  mode: found.prompt_mode || prev.mode || 'native_hybrid',
-                                  global_prepend_prompt:
-                                    found.global_prepend_prompt ?? prev.global_prepend_prompt ?? '',
-                                  disable_builtin_tools:
-                                    found.disable_builtin_tools ?? prev.disable_builtin_tools ?? true,
-                                  session_mode: found.session_mode || prev.session_mode || 'yolo',
-                                }))
                               }
                             }}
                             className="h-7 w-full rounded-md border border-input bg-background px-2 text-xs text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
@@ -3266,9 +3362,9 @@ export function App() {
                         <Button
                           size="xs"
                           variant="ghost"
-                          onClick={() => copyClientText('model-input', effectiveClientModel)}
+                          onClick={() => void copyClientText('model-input', effectiveClientModel)}
                         >
-                          {copiedClientField === 'model-input' ? '已复制' : '复制模型 ID'}
+                          {copyLabel('model-input', '复制模型 ID')}
                         </Button>
                       </div>
                       <Input
@@ -3433,7 +3529,7 @@ export function App() {
                           copyClientText('card-ep-responses', `${gatewayBaseUrl}/v1/responses`)
                         }}
                       >
-                        {copiedClientField === 'card-ep-responses' ? '已复制' : '复制'}
+                        {copyLabel('card-ep-responses', '复制')}
                       </Button>
                     </div>
                   </div>
@@ -3492,7 +3588,7 @@ export function App() {
                           copyClientText('card-ep-chat', `${gatewayBaseUrl}/v1/chat/completions`)
                         }}
                       >
-                        {copiedClientField === 'card-ep-chat' ? '已复制' : '复制'}
+                        {copyLabel('card-ep-chat', '复制')}
                       </Button>
                     </div>
                   </div>
@@ -3551,7 +3647,7 @@ export function App() {
                           copyClientText('card-ep-claude', `${gatewayBaseUrl}/v1/messages`)
                         }}
                       >
-                        {copiedClientField === 'card-ep-claude' ? '已复制' : '复制'}
+                        {copyLabel('card-ep-claude', '复制')}
                       </Button>
                     </div>
                   </div>
@@ -3642,9 +3738,9 @@ export function App() {
                               <Button
                                 size="xs"
                                 variant="ghost"
-                                onClick={() => copyClientText(item.key, item.value)}
+                                onClick={() => void copyClientText(item.key, item.value)}
                               >
-                                {copiedClientField === item.key ? '已复制' : '复制'}
+                                {copyLabel(item.key, '复制')}
                               </Button>
                             </div>
                             <code className="font-mono text-xs font-medium text-foreground truncate">
@@ -3661,6 +3757,7 @@ export function App() {
                     <div className="flex flex-col gap-2.5">
                       {(clientSnippetFilter === 'all' || clientSnippetFilter === 'cli') && (
                         <CodeBlock
+                          translatable
                           collapsible
                           defaultOpen={false}
                           title="1. OpenAI Codex CLI 配置 (~/.codex/config.toml · 官方 Responses 协议)"
@@ -3681,6 +3778,7 @@ wire_api = "responses"
 
                       {(clientSnippetFilter === 'all' || clientSnippetFilter === 'sdk') && (
                         <CodeBlock
+                          translatable
                           collapsible
                           defaultOpen={false}
                           title="2. OpenAI 官方 Python SDK (动态获取 ACP 模型 + Responses 多轮续接)"
@@ -3721,6 +3819,7 @@ print(resp2.output_text)`}
 
                       {(clientSnippetFilter === 'all' || clientSnippetFilter === 'curl') && (
                         <CodeBlock
+                          translatable
                           collapsible
                           defaultOpen={false}
                           title="3. cURL 流式调用 OpenAI 官方协议 (POST /v1/responses)"
@@ -3749,6 +3848,7 @@ print(resp2.output_text)`}
 
                       {(clientSnippetFilter === 'all' || clientSnippetFilter === 'models') && (
                         <CodeBlock
+                          translatable
                           collapsible
                           defaultOpen={false}
                           title="4. OpenAI 官方协议获取可用模型 & 强制刷新缓存 (GET /v1/models)"
@@ -3770,6 +3870,7 @@ curl "${gatewayBaseUrl}/v1/models?refresh=1" \\
                     <div className="flex flex-col gap-2.5">
                       {(clientSnippetFilter === 'all' || clientSnippetFilter === 'cli') && (
                         <CodeBlock
+                          translatable
                           collapsible
                           defaultOpen={false}
                           title="1. Cursor / Cline / Roo Code / Cherry Studio 接入参数 (OpenAI 兼容)"
@@ -3796,6 +3897,7 @@ curl "${gatewayBaseUrl}/v1/models?refresh=1" \\
 
                       {(clientSnippetFilter === 'all' || clientSnippetFilter === 'sdk') && (
                         <CodeBlock
+                          translatable
                           collapsible
                           defaultOpen={false}
                           title="2. OpenAI 兼容 SDK 多轮对话示例 (chat.completions.create)"
@@ -3830,6 +3932,7 @@ for chunk in stream:
 
                       {(clientSnippetFilter === 'all' || clientSnippetFilter === 'curl') && (
                         <CodeBlock
+                          translatable
                           collapsible
                           defaultOpen={false}
                           title="3. cURL 流式调用 OpenAI 兼容协议 (POST /v1/chat/completions)"
@@ -3853,6 +3956,7 @@ for chunk in stream:
 
                       {(clientSnippetFilter === 'all' || clientSnippetFilter === 'models') && (
                         <CodeBlock
+                          translatable
                           collapsible
                           defaultOpen={false}
                           title="4. OpenAI 兼容协议获取模型列表与单模型详情 (GET /v1/models)"
@@ -3874,6 +3978,7 @@ curl "${gatewayBaseUrl}/v1/models/${effectiveClientModel}" \\
                     <div className="flex flex-col gap-2.5">
                       {(clientSnippetFilter === 'all' || clientSnippetFilter === 'cli') && (
                         <CodeBlock
+                          translatable
                           collapsible
                           defaultOpen={false}
                           title="1. Claude Code CLI 环境变量一键接入 (Anthropic Messages 协议)"
@@ -3890,6 +3995,7 @@ claude`}
 
                       {(clientSnippetFilter === 'all' || clientSnippetFilter === 'sdk') && (
                         <CodeBlock
+                          translatable
                           collapsible
                           defaultOpen={false}
                           title="2. Anthropic 官方 Python SDK (拉取 ACP 模型 + Messages 对话)"
@@ -3924,6 +4030,7 @@ print(msg.content)`}
 
                       {(clientSnippetFilter === 'all' || clientSnippetFilter === 'curl') && (
                         <CodeBlock
+                          translatable
                           collapsible
                           defaultOpen={false}
                           title="3. cURL 流式调用 Claude 协议 (POST /v1/messages)"
@@ -3950,6 +4057,7 @@ print(msg.content)`}
 
                       {(clientSnippetFilter === 'all' || clientSnippetFilter === 'models') && (
                         <CodeBlock
+                          translatable
                           collapsible
                           defaultOpen={false}
                           title="4. Claude 协议获取可用模型列表 (GET /v1/models · x-api-key 鉴权)"
@@ -4025,6 +4133,7 @@ curl "${gatewayBaseUrl}/v1/models?refresh=1" \\
                   </FrameHeader>
                   <FramePanel>
                     <CodeBlock
+                      translateTitle={false}
                       title="Client API Key (Bearer / x-api-key)"
                       language="text"
                       code={issuedPlainKey}
@@ -4036,7 +4145,7 @@ curl "${gatewayBaseUrl}/v1/models?refresh=1" \\
               {/* Modal for Issuing New Client API Key with Independent Policy */}
               <DialogModal
                 open={showCreateKeyModal}
-                onClose={() => setShowCreateKeyModal(false)}
+                onClose={closeCreateAPIKeyModal}
                 title="签发客户端 API Key 与独立策略配置"
                 description="为接入客户端签发专属密钥，并独立设定账户路由、系统提示词注入模式与 ACP 会话复用策略"
                 maxWidthClass="max-w-2xl"
@@ -4046,11 +4155,7 @@ curl "${gatewayBaseUrl}/v1/models?refresh=1" \\
                       签发后将生成一次性的 <code className="font-mono">sk-ag-...</code> 明文密钥
                     </span>
                     <div className="flex items-center gap-2">
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        onClick={() => setShowCreateKeyModal(false)}
-                      >
+                      <Button size="sm" variant="outline" onClick={closeCreateAPIKeyModal}>
                         取消
                       </Button>
                       <Button
@@ -4066,6 +4171,14 @@ curl "${gatewayBaseUrl}/v1/models?refresh=1" \\
                 }
               >
                 <div className="flex flex-col gap-3.5">
+                  {createKeyError && (
+                    <Alert variant="destructive">
+                      <div className="flex-1">
+                        <AlertTitle>签发失败</AlertTitle>
+                        <AlertDescription>{createKeyError}</AlertDescription>
+                      </div>
+                    </Alert>
+                  )}
                   {/* Section 1: Basic Identity & Traffic Quota */}
                   <div className="rounded-lg border border-border bg-muted/20 p-3.5 flex flex-col gap-3">
                     <div className="flex items-center justify-between gap-2">
@@ -4099,9 +4212,10 @@ curl "${gatewayBaseUrl}/v1/models?refresh=1" \\
                         </label>
                         <Input
                           id="key-rpm"
-                          type="number"
+                          inputMode="numeric"
                           value={newKeyRPM}
-                          onChange={(v) => setNewKeyRPM(Number(v) || 60)}
+                          invalid={newKeyRPM !== '' && parsePositiveInt(newKeyRPM) === null}
+                          onChange={setNewKeyRPM}
                         />
                       </div>
                     </div>
@@ -4338,17 +4452,25 @@ curl "${gatewayBaseUrl}/v1/models?refresh=1" \\
               {/* Modal for Editing Existing API Key's Independent Policy */}
               <DialogModal
                 open={Boolean(editingKey)}
-                onClose={() => setEditingKey(null)}
-                title={editingKey ? `配置密钥独立策略: ${editingKey.name}` : '配置密钥独立策略'}
+                onClose={closeEditAPIKey}
+                title={
+                  editingKey ? (
+                    <>
+                      配置密钥独立策略：<span translate="no">{editingKey.name}</span>
+                    </>
+                  ) : (
+                    '配置密钥独立策略'
+                  )
+                }
                 description="修改该客户端 API Key 的账户绑定、RPM 限流、系统提示词注入模式与 ACP 会话复用策略"
                 maxWidthClass="max-w-2xl"
                 footer={
                   <>
                     <span className="font-mono text-xs text-muted-foreground">
-                      {`前缀: ${editingKey?.key_prefix || ''}`}
+                      前缀：<span translate="no">{editingKey?.key_prefix || ''}</span>
                     </span>
                     <div className="flex items-center gap-2">
-                      <Button size="sm" variant="outline" onClick={() => setEditingKey(null)}>
+                      <Button size="sm" variant="outline" onClick={closeEditAPIKey}>
                         取消
                       </Button>
                       <Button
@@ -4364,6 +4486,14 @@ curl "${gatewayBaseUrl}/v1/models?refresh=1" \\
               >
                 {editingKey && (
                   <div className="flex flex-col gap-3.5">
+                    {editKeyError && (
+                      <Alert variant="destructive">
+                        <div className="flex-1">
+                          <AlertTitle>保存失败</AlertTitle>
+                          <AlertDescription>{editKeyError}</AlertDescription>
+                        </div>
+                      </Alert>
+                    )}
                     {/* Section 1: Basic Identity & Traffic Quota */}
                     <div className="rounded-lg border border-border bg-muted/20 p-3.5 flex flex-col gap-3">
                       <div className="flex items-center justify-between gap-2">
@@ -4401,11 +4531,10 @@ curl "${gatewayBaseUrl}/v1/models?refresh=1" \\
                           </label>
                           <Input
                             id="edit-key-rpm"
-                            type="number"
-                            value={editingKey.rate_limit_rpm}
-                            onChange={(v) =>
-                              setEditingKey({ ...editingKey, rate_limit_rpm: Number(v) || 60 })
-                            }
+                            inputMode="numeric"
+                            value={editKeyRPM}
+                            invalid={editKeyRPM !== '' && parsePositiveInt(editKeyRPM) === null}
+                            onChange={setEditKeyRPM}
                           />
                         </div>
                       </div>
@@ -4679,7 +4808,7 @@ curl "${gatewayBaseUrl}/v1/models?refresh=1" \\
                         id: 'name',
                         header: '密钥名称 / 前缀',
                         cell: (r: APIKeyRecord) => (
-                          <div>
+                          <div translate="no">
                             <div className="font-medium text-foreground">{r.name}</div>
                             <div className="font-mono text-xs text-muted-foreground">
                               {r.key_prefix}
@@ -4690,11 +4819,14 @@ curl "${gatewayBaseUrl}/v1/models?refresh=1" \\
                       {
                         id: 'bound',
                         header: '绑定隔离账户',
-                        cell: (r: APIKeyRecord) => (
-                          <Badge variant="outline">
-                            {r.bound_account_id || '全池自动负载均衡'}
-                          </Badge>
-                        ),
+                        cell: (r: APIKeyRecord) =>
+                          r.bound_account_id ? (
+                            <span translate="no">
+                              <Badge variant="outline">{r.bound_account_id}</Badge>
+                            </span>
+                          ) : (
+                            <Badge variant="outline">全池自动负载均衡</Badge>
+                          ),
                       },
                       {
                         id: 'prompt_mode',
@@ -4746,22 +4878,14 @@ curl "${gatewayBaseUrl}/v1/models?refresh=1" \\
                             <Button
                               size="xs"
                               variant="outline"
-                              onClick={() =>
-                                setEditingKey({
-                                  ...r,
-                                  prompt_mode: r.prompt_mode || 'native_hybrid',
-                                  session_mode: r.session_mode || 'yolo',
-                                  global_prepend_prompt: r.global_prepend_prompt || '',
-                                  disable_builtin_tools: r.disable_builtin_tools ?? true,
-                                })
-                              }
+                              onClick={() => openEditAPIKey(r)}
                             >
                               配置策略
                             </Button>
                             <Button
                               size="xs"
                               variant="destructive"
-                              onClick={() => void handleDeleteAPIKey(r.id)}
+                              onClick={() => requestDeleteAPIKey(r)}
                             >
                               吊销
                             </Button>
@@ -4772,7 +4896,13 @@ curl "${gatewayBaseUrl}/v1/models?refresh=1" \\
                     rows={apiKeys}
                     getRowId={(r) => String(r.id)}
                     emptyTitle="暂未签发客户端 API Key"
-                    emptyDescription="点击右上角「签发客户端 API Key」按钮即可弹窗创建密钥并配置独立策略"
+                    emptyDescription="签发密钥后即可在此配置独立策略"
+                    emptyAction={
+                      <Button size="sm" onClick={openCreateAPIKeyModal}>
+                        <Plus />
+                        签发客户端 API Key
+                      </Button>
+                    }
                   />
                 </FramePanel>
               </Frame>

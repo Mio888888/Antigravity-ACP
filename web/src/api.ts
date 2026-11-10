@@ -212,39 +212,65 @@ export interface APIKeyRecord {
   created_at: string
 }
 
-export class UnauthorizedError extends Error {
+export const API_TIMEOUT_MS = 15_000
+
+export class ApiError extends Error {
   status: number
-  constructor(message = '未登录或管理会话已过期，请先输入密码登录') {
+  constructor(message: string, status: number) {
     super(message)
+    this.name = 'ApiError'
+    this.status = status
+  }
+}
+
+export class UnauthorizedError extends ApiError {
+  constructor(message = '未登录或管理会话已过期，请先输入密码登录') {
+    super(message, 401)
     this.name = 'UnauthorizedError'
-    this.status = 401
   }
 }
 
-export interface AdminLoginResponse {
-  authenticated: boolean
-  session_token: string
-  expires_at: string
+export class NetworkError extends Error {
+  constructor(message = '无法连接网关服务，请检查网络后重试') {
+    super(message)
+    this.name = 'NetworkError'
+  }
 }
 
-export async function apiFetch<T>(
-  path: string,
-  adminToken: string,
-  init?: RequestInit
-): Promise<T> {
+// Admin calls authenticate solely via the HttpOnly `ag_admin_session` cookie.
+export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers || {})
-  headers.set('Content-Type', 'application/json')
-  const effectiveToken = (adminToken || '').trim()
-  if (effectiveToken) {
-    headers.set('Authorization', `Bearer ${effectiveToken}`)
+  if (init?.body !== undefined && !headers.has('Content-Type')) {
+    headers.set('Content-Type', 'application/json')
   }
-  const resp = await fetch(path, {
-    ...init,
-    headers,
-    credentials: 'same-origin',
-  })
+  const controller = new AbortController()
+  const timer = window.setTimeout(() => controller.abort(), API_TIMEOUT_MS)
+  const outerSignal = init?.signal
+  const onOuterAbort = () => controller.abort()
+  if (outerSignal) {
+    if (outerSignal.aborted) controller.abort()
+    else outerSignal.addEventListener('abort', onOuterAbort, { once: true })
+  }
+  let resp: Response
+  try {
+    resp = await fetch(path, {
+      ...init,
+      headers,
+      credentials: 'same-origin',
+      signal: controller.signal,
+    })
+  } catch (err) {
+    if (controller.signal.aborted && !outerSignal?.aborted) {
+      throw new NetworkError('请求网关超时，请稍后重试')
+    }
+    if (err instanceof DOMException && err.name === 'AbortError') throw err
+    throw new NetworkError()
+  } finally {
+    window.clearTimeout(timer)
+    outerSignal?.removeEventListener('abort', onOuterAbort)
+  }
   if (!resp.ok) {
-    const errText = await resp.text()
+    const errText = await resp.text().catch(() => '')
     let message = errText || `HTTP ${resp.status}`
     try {
       const parsed = JSON.parse(errText) as { error?: { message?: string } }
@@ -257,65 +283,61 @@ export async function apiFetch<T>(
     if (resp.status === 401) {
       throw new UnauthorizedError(message)
     }
-    throw new Error(message)
+    throw new ApiError(message, resp.status)
   }
   return resp.json() as Promise<T>
 }
 
-export async function adminLogin(
-  password: string,
-  remember: boolean
-): Promise<AdminLoginResponse> {
-  return apiFetch<AdminLoginResponse>('/api/admin/auth/login', '', {
+export async function adminLogin(password: string, remember: boolean): Promise<void> {
+  await apiFetch<unknown>('/api/admin/auth/login', {
     method: 'POST',
     body: JSON.stringify({ password, remember }),
   })
 }
 
-export async function adminLogout(adminToken: string): Promise<void> {
+export async function adminLogout(): Promise<void> {
   try {
-    await apiFetch<{ logged_out: boolean }>('/api/admin/auth/logout', adminToken, {
-      method: 'POST',
-    })
+    await apiFetch<{ logged_out: boolean }>('/api/admin/auth/logout', { method: 'POST' })
   } catch {
     // ignore logout network errors
   }
 }
 
-export async function adminCheckSession(adminToken: string): Promise<boolean> {
+// Resolves to true/false only for a definitive answer (200 / 401); other failures throw.
+export async function adminCheckSession(): Promise<boolean> {
   try {
-    const res = await apiFetch<{ authenticated: boolean }>(
-      '/api/admin/auth/session',
-      adminToken
-    )
-    return Boolean(res.authenticated)
-  } catch {
-    return false
+    const res = await apiFetch<{ authenticated?: boolean }>('/api/admin/auth/session')
+    return res.authenticated !== false
+  } catch (err) {
+    if (err instanceof UnauthorizedError) return false
+    throw err
   }
 }
 
 export async function adminChangePassword(
-  adminToken: string,
   currentPassword: string,
   newPassword: string,
   newAdminToken?: string
-): Promise<{
-  updated: boolean
-  credentials_locked?: boolean
-  session_token: string
-  expires_at: string
-}> {
-  return apiFetch<{
-    updated: boolean
-    credentials_locked?: boolean
-    session_token: string
-    expires_at: string
-  }>('/api/admin/auth/password', adminToken, {
-    method: 'POST',
-    body: JSON.stringify({
-      current_password: currentPassword,
-      new_password: newPassword,
-      new_admin_token: newAdminToken || '',
-    }),
-  })
+): Promise<{ updated: boolean; credentials_locked?: boolean }> {
+  return apiFetch<{ updated: boolean; credentials_locked?: boolean }>(
+    '/api/admin/auth/password',
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        current_password: currentPassword,
+        new_password: newPassword,
+        new_admin_token: newAdminToken || '',
+      }),
+    }
+  )
+}
+
+export async function adminTerminalLoginStatus(
+  accountId: string,
+  signal?: AbortSignal
+): Promise<TerminalLoginStatus> {
+  return apiFetch<TerminalLoginStatus>(
+    `/api/admin/accounts/${encodeURIComponent(accountId)}/login/status`,
+    { signal }
+  )
 }

@@ -41,6 +41,8 @@ type ManagedSession struct {
 	HistoryHash        string
 	explicitKeys       []string
 	historyHashes      []string
+	// recentHashes lists raw history hashes in the order they were last recorded.
+	recentHashes []string
 	ACPSessionID       string
 	WorkspaceDir       string
 	Worker             *WorkerClient
@@ -59,6 +61,27 @@ type ManagedSession struct {
 	ClientCompactionRequested bool
 	ClientCompactionWaitTurns int
 	UpdatedAt                 time.Time
+	lastStopReason            string
+}
+
+// SetLastStopReason records the ACP stopReason of the most recent session/prompt.
+func (ms *ManagedSession) SetLastStopReason(reason string) {
+	if ms == nil {
+		return
+	}
+	ms.mu.Lock()
+	ms.lastStopReason = reason
+	ms.mu.Unlock()
+}
+
+// LastStopReason returns the ACP stopReason of the most recent session/prompt.
+func (ms *ManagedSession) LastStopReason() string {
+	if ms == nil {
+		return ""
+	}
+	ms.mu.RLock()
+	defer ms.mu.RUnlock()
+	return ms.lastStopReason
 }
 
 func (ms *ManagedSession) GetLastTokenUsage() (inputTokens, cachedTokens int64) {
@@ -429,6 +452,37 @@ func (sm *SessionManager) recordHistoryHashLocked(sess *ManagedSession, historyH
 	}
 	sm.recordKeyIndexLocked(sm.byHistoryHash, &sess.historyHashes, sess, scopedKey(accID, historyHash))
 	sm.recordKeyIndexLocked(sm.byHistoryHash, &sess.historyHashes, sess, scopedKey("", historyHash))
+	for i, h := range sess.recentHashes {
+		if h == historyHash {
+			sess.recentHashes = append(sess.recentHashes[:i], sess.recentHashes[i+1:]...)
+			break
+		}
+	}
+	sess.recentHashes = append(sess.recentHashes, historyHash)
+	if len(sess.recentHashes) > maxKeysPerSession {
+		sess.recentHashes = sess.recentHashes[len(sess.recentHashes)-maxKeysPerSession:]
+	}
+}
+
+// IsStaleHistoryHash reports whether historyHash is a known but older point in the
+// session's history, meaning the client forked or regenerated from an earlier turn
+// and the live ACP session already contains turns the client discarded. The two
+// most recent hashes (the latest request and its recorded reply) are current.
+func (sm *SessionManager) IsStaleHistoryHash(sess *ManagedSession, historyHash string) bool {
+	if sess == nil || historyHash == "" {
+		return false
+	}
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	n := len(sess.recentHashes)
+	for i, h := range sess.recentHashes {
+		if h == historyHash {
+			return i < n-2
+		}
+	}
+	return false
 }
 
 func (sm *SessionManager) RegisterOrMatchSession(accountID, explicitKey, historyHash string, worker *WorkerClient, acpSessionID string, tools []ToolDefinition) *ManagedSession {
@@ -738,8 +792,8 @@ func (sm *SessionManager) CancelParkedToolCall(callID string) {
 	}
 	if !hasRemaining {
 		if sess, exists := sm.byBridgeID[parked.BridgeID]; exists {
-			if w := sess.GetWorker(); w != nil && w.GetState() == StateParked {
-				w.SetState(StateIdle)
+			if w := sess.GetWorker(); w != nil {
+				w.CompareAndSetState(StateParked, StateIdle)
 			}
 		}
 	}
@@ -923,9 +977,7 @@ func (sm *SessionManager) AbortParkedCallsForSession(sess *ManagedSession, accou
 		}
 		if it.worker != nil {
 			it.worker.DrainEvents()
-			if it.worker.GetState() == StateParked {
-				it.worker.SetState(StateIdle)
-			}
+			it.worker.CompareAndSetState(StateParked, StateIdle)
 		}
 	}
 	return len(items)
@@ -1061,9 +1113,7 @@ func (sm *SessionManager) gcLoop() {
 							}
 						}
 						w.DrainEvents()
-						if w.GetState() == StateParked {
-							w.SetState(StateIdle)
-						}
+						w.CompareAndSetState(StateParked, StateIdle)
 					}()
 				}
 			}

@@ -87,11 +87,11 @@ const ZH_TO_EN_EXACT: Record<string, string> = {
   '修改 Web 管理控制台登录密码': 'Change Web Admin Console Password',
   '验证当前密码后更新管理后台登录密码，修改后立即生效并持久化保存':
     'Verify current password and update admin console password immediately',
-  '新密码长度不少于 6 位': 'New password must be at least 6 characters',
+  '新密码长度不少于 8 位': 'New password must be at least 8 characters',
   当前管理员密码: 'Current Admin Password',
   输入当前正在使用的密码: 'Enter current password',
   新管理员密码: 'New Admin Password',
-  '输入至少 6 位的新密码': 'Enter new password (min 6 chars)',
+  '输入至少 8 位的新密码': 'Enter new password (min 8 chars)',
   确认新密码: 'Confirm New Password',
   再次输入新密码: 'Re-enter new password',
   '登录会话已失效，请重新输入密码登录': 'Session expired. Please sign in again.',
@@ -102,8 +102,9 @@ const ZH_TO_EN_EXACT: Record<string, string> = {
   '未登录或管理会话已过期，请先登录': 'Not signed in or session expired. Please sign in.',
   '登录失败，请检查管理员密码': 'Sign-in failed. Please check admin password.',
   请输入当前管理员密码: 'Please enter current admin password',
-  '新管理员密码长度不能少于 6 位': 'New admin password must be at least 6 characters',
-  '新密码长度不能少于 6 位': 'New password must be at least 6 characters',
+  '新管理员密码长度不能少于 8 位': 'New admin password must be at least 8 characters',
+  '新密码长度不能少于 8 位': 'New password must be at least 8 characters',
+  '自定义 Admin Token 长度不能少于 12 位': 'Custom Admin Token must be at least 12 characters',
   两次输入的新密码不一致: 'New passwords do not match',
   管理员登录密码已更新: 'Admin password updated successfully',
   修改管理员密码失败: 'Failed to change admin password',
@@ -140,7 +141,6 @@ const ZH_TO_EN_EXACT: Record<string, string> = {
   最近一个请求是怎么路由的: 'How the Latest Request Was Routed',
   请求与响应: 'Request & Response',
   查看用量: 'View Quotas',
-  重放: 'Next Turn',
   ': 由': ': served by',
   '提供，向厂商请求的模型是': 'using upstream model',
   '推理强度 用': 'reasoning completed in',
@@ -214,7 +214,6 @@ const ZH_TO_EN_EXACT: Record<string, string> = {
   '用途 · 工具续接': 'Purpose · Tool',
   '指标 · 完整': 'Metrics · Full',
   '指标 · 精简': 'Metrics · Compact',
-  全部重放: 'Cycle Requests',
   实时: 'Live',
   更早的日期: 'Older Dates',
   按请求: 'By Request',
@@ -324,7 +323,9 @@ const ZH_TO_EN_EXACT: Record<string, string> = {
   确认修改并固定: 'Save & Lock',
   '当前管理员密码或 Token': 'Current Admin Password or Token',
   '输入当前正在使用的密码或 Admin Token': 'Enter current Admin Password or Token',
-  '输入至少 6 位的新密码（修改后永久固定）': 'Enter at least 6 characters (locks permanently)',
+  '输入至少 8 位的新密码（修改后永久固定）': 'Enter at least 8 characters (locks permanently)',
+  '至少 12 位，用于脚本调用 /api/admin/*（留空保持当前值并固定）':
+    'Min 12 characters, for scripts calling /api/admin/* (leave blank to keep and lock the current token)',
   '自定义 Admin Token（可选，留空则固定当前 Token）':
     'Custom Admin Token (optional; leave blank to lock current token)',
   '用于脚本调用 /api/admin/* 的静态 Token（留空保持当前值并固定）':
@@ -712,9 +713,157 @@ const ZH_TO_EN_EXACT: Record<string, string> = {
   按单次平均消耗自动动态测算: 'Dynamically estimated from average per-turn token usage',
   容量构成与测算说明: 'Context Capacity Breakdown',
   上下文容量占用比: 'Context capacity utilization',
+
+  // Shared states, errors & confirmations
+  复制失败: 'Copy failed',
+  '复制失败，已选中文本': 'Copy failed — text selected',
+  '重试中...': 'Retrying...',
+  '正在处理...': 'Processing...',
+  操作失败: 'Operation failed',
+  保存失败: 'Save failed',
+  修改失败: 'Update failed',
+  签发失败: 'Issue failed',
+  后台同步失败: 'Background sync failed',
+  同步中断: 'Sync interrupted',
+  概览加载失败: 'Failed to load overview',
+  '后台同步中断，当前显示的数据可能已过期':
+    'Background sync interrupted; the data shown may be stale',
+  无法确认登录状态: 'Unable to verify sign-in status',
+  '无法连接网关服务，请检查网络后重试': 'Unable to reach the gateway. Check your network and retry.',
+  '请求网关超时，请稍后重试': 'Gateway request timed out. Please retry later.',
+  确认删除隔离账户: 'Delete isolated account?',
+  确认吊销: 'Revoke',
+  '确认吊销 API Key': 'Revoke API key?',
+  '删除后该账户的隔离目录与登录凭证将被移除，此操作不可撤销。':
+    "The account's isolated directory and sign-in credentials will be removed. This cannot be undone.",
+  '吊销后使用该密钥的客户端将立即无法访问网关，此操作不可撤销。':
+    'Clients using this key will lose gateway access immediately. This cannot be undone.',
+  删除账户: 'Delete account',
+  吊销密钥: 'Revoke key',
+  将要删除的账户: 'Account to delete',
+  将要吊销的密钥: 'Key to revoke',
+
+  // Auth & sign-in flow
+  登录授权失败: 'Sign-in authorization failed',
+  重新发起登录: 'Restart sign-in',
+  '授权失败，请重新发起登录': 'Authorization failed. Please restart sign-in.',
+  读取登录状态失败: 'Failed to read sign-in status',
+  '或': 'or',
+
+  // Accounts
+  '账户标识 ID (创建后不可修改)': 'Account ID (cannot be changed after creation)',
+  留空保持不变: 'Leave blank to keep unchanged',
+  '最大并发进程数必须是不小于 1 的整数': 'Max concurrent workers must be an integer of at least 1',
+  '调度权重必须是不小于 1 的整数': 'Scheduling weight must be an integer of at least 1',
+  '请输入代理地址，例如 socks5://user:pass@127.0.0.1:1080':
+    'Enter a proxy URL, e.g. socks5://user:pass@127.0.0.1:1080',
+  '请输入要绑定的网卡 IP': 'Enter the interface IP to bind',
+  更新模型启用状态失败: 'Failed to update model enablement',
+  '新增一个隔离账户后，即可在此查看额度、出口 IP 与运维操作':
+    'Add an isolated account to see its quota, egress IP and operations here',
+  新增一个隔离账户后即可在此管理: 'Add an isolated account to manage it here',
+  代理: 'Proxy',
+  上次检测: 'Last probed',
+  停用: 'Disable',
+  启用: 'Enable',
+
+  // API keys
+  '每分钟请求上限 (RPM) 必须是不小于 1 的整数': 'Requests per minute (RPM) must be an integer of at least 1',
+  '已签发新的客户端 API Key 并同步至客户端接入设置，请立即复制保存下方明文密钥':
+    'New client API key issued and applied to client settings. Copy the plaintext key below now.',
+  签发密钥后即可在此配置独立策略: 'Issue a key to configure its policy here',
+  '配置密钥独立策略：': 'Key policy: ',
+  '前缀：': 'Prefix: ',
+
+  // Overview board
+  下一个请求: 'Next request',
+  请求模型: 'requested model',
+  以: 'with',
+  '回答了这个请求 ·': 'answered this request ·',
+  '· 对话': '· Chat',
+  '· 工具续接': '· Tool continuation',
+  内置工具: 'Built-in tools',
+  系统提示词附加项: 'System prompt extras',
+  工具定义: 'Tool definitions',
+  项目指令与技能规范: 'Project instructions & skills',
+  工作区文件: 'Workspace files',
+  其余工作区文件上下文: 'Other workspace file context',
+  其余工具调用返回结果: 'Other tool call results',
+  其余会话轮次消息: 'Other conversation turns',
+  当前模型上下文窗口剩余可用容量: 'Remaining capacity of the current model context window',
+  '· 默认': '· Default',
+
+  // Overview detail modal
+  系统提示词详情: 'System Prompt Details',
+  查看当前请求生效的系统提示词内容: 'System prompt in effect for the selected request',
+  客户端工具定义详情: 'Client Tool Definitions',
+  '查看当前请求挂载的客户端工具定义与 Token 占用':
+    'Client tool definitions attached to the selected request and their token usage',
+  文件上下文详情: 'File Context Details',
+  查看当前请求上下文中读取与引用的文件内容: 'Files read or referenced in the selected request context',
+  工具调用返回结果详情: 'Tool Result Details',
+  查看当前请求上下文中的工具执行输出内容: 'Tool execution output in the selected request context',
+  请求与响应详情: 'Request & Response Details',
+  '查看当前选中请求的协议、Token 明细、系统指令、用户输入、模型思考与输出全文':
+    'Protocol, token breakdown, system prompt, user input, reasoning and full output of the selected request',
+  剩余空间详情: 'Remaining Capacity Details',
+  查看当前模型上下文窗口剩余可用容量与预计可容纳请求数:
+    'Remaining context window capacity and estimated requests that still fit',
+  网关系统: 'Gateway system',
+  思考规则: 'Thinking rules',
+  '（网关未在审计记录中保存该模块的原文）': '(The gateway did not store the raw text of this module)',
+  '（本轮请求未附带额外系统提示词）': '(No additional system prompt in this request)',
+  '（网关未记录本轮请求的系统提示词原文）': '(The gateway did not record the system prompt for this request)',
+  '（当前请求未单独附带 AGENTS.md 或技能列表）': '(No separate AGENTS.md or skill list in this request)',
+  上下文模块: 'Context module',
+  账户: 'Account',
+  '系统提示词 (System Prompt)': 'System Prompt',
+  剩余可用空间占比: 'Remaining capacity share',
+  上下文剩余可用空间占比: 'Remaining context capacity share',
+  模块名称与分类: 'Module & category',
+  '模块 Token 占用': 'Module token usage',
+  占上下文窗口比例: 'Share of context window',
 }
 
 const ZH_TO_EN_PATTERNS: [RegExp, (...m: string[]) => string][] = [
+  // Validation, notices & confirmations
+  [
+    /^新管理员密码长度不能少于\s*(\d+)\s*位$/,
+    (_, n) => `New admin password must be at least ${n} characters`,
+  ],
+  [
+    /^自定义 Admin Token 长度不能少于\s*(\d+)\s*位$/,
+    (_, n) => `Custom Admin Token must be at least ${n} characters`,
+  ],
+  [
+    /^账户 ID「(.+)」已存在，请使用其他 ID 或编辑现有账户$/,
+    (_, id) => `Account ID "${id}" already exists. Use another ID or edit the existing account.`,
+  ],
+  [/^账户\s*(.+?)\s*授权验证成功，已恢复就绪状态$/, (_, id) => `Account ${id} verified and ready again`],
+  [/^账户\s*(.+?)\s*已启用$/, (_, id) => `Account ${id} enabled`],
+  [/^账户\s*(.+?)\s*已停用$/, (_, id) => `Account ${id} disabled`],
+  [/^已吊销密钥「(.+)」$/, (_, name) => `Revoked key "${name}"`],
+  [/^已更新密钥「(.+)」的独立策略$/, (_, name) => `Updated policy for key "${name}"`],
+  [/^控制台已加载的最近\s*(\d+)\s*个请求$/, (_, n) => `Latest ${n} requests loaded in the console`],
+  [/^已用\s*(\d+)%$/, (_, pct) => `${pct}% used`],
+  [/^网关(?:内耗时)?\s*((?:\d+(?:\.\d+)?\s*(?:毫秒|秒))|—)$/, (_, t) => `Gateway ${translateDurationEn(t)}`],
+  [/^另外\s*(\d+)\s*项结果$/, (_, n) => `+${n} more results`],
+  [
+    /^(.+?)\s*·\s*([0-9.]+[KMB]?)\s*token\s*\(占窗口\s*(\d+)%\)$/,
+    (_, cat, tok, pct) => `${translateString(cat, 'en')} · ${tok} token (${pct}% of window)`,
+  ],
+  [
+    /^当前请求中「(.+)」模块暂无内容（0 token）。$/,
+    (_, name) => `The "${translateString(name, 'en')}" module has no content in this request (0 token).`,
+  ],
+  [/^模型思考过程 \(Reasoning \/ Thinking Trace(.*)\)$/, (_, rest) => `Reasoning / Thinking Trace${rest}`],
+  [/^最近\s*(\d{2}:\d{2})$/, (_, hm) => `Last ${hm}`],
+  [
+    /^完成回答\s*·\s*([0-9.]+[KMB]?)\s*token\s*·\s*(.+?)\s*后出首字\s*·\s*请求缓存命中率\s*(\d+|—)%。?$/,
+    (_, tok, ttfb, cache) =>
+      `· ${tok} tokens · ${translateDurationEn(ttfb)} TTFB · ${cache}% cache hit.`,
+  ],
+
   // Top bar & Overview header
   [/^(\d+)\/(\d+)\s*账户正常$/, (_, a, b) => `${a}/${b} Accounts Ready`],
   [/^·\s*启用\s*(\d+)\s*个$/, (_, n) => `· ${n} Enabled`],
@@ -828,7 +977,7 @@ const ZH_TO_EN_PATTERNS: [RegExp, (...m: string[]) => string][] = [
   [/^绑定会话 ID:\s*(.+)$/, (_, id) => `Bound Session ID: ${id}`],
 
   // Overview Routing Trace Bullets (split text nodes & full phrases — placed after specific "X 个请求" patterns)
-  [/^(.+?)\s*请求$/, (_, client) => `${client} requested`],
+  [/^([^\u4e00-\u9fa5]+?)\s*请求$/, (_, client) => `${client} requested`],
   [/^(.+?)\s*\((.+?)\)\s*以$/, (_, name, model) => `${name} (${model}) with`],
   [
     /^完成回答\s*·\s*([0-9.]+[KMB]?)\s*token\s*·\s*(.+?)\s*后出首字\s*·\s*请求缓存命中率\s*(\d+)%。?$/,
@@ -1187,10 +1336,13 @@ export function translateString(raw: string, lang: Lang): string {
     return `${leading}${exact}${trailing}`
   }
 
-  for (const [regex, replacer] of ZH_TO_EN_PATTERNS) {
-    const match = norm.match(regex)
-    if (match) {
-      return `${leading}${replacer(...match)}${trailing}`
+  if (!trimmed.includes('\n')) {
+    for (const [regex, replacer] of ZH_TO_EN_PATTERNS) {
+      const match = norm.match(regex)
+      if (match) {
+        const replaced = replacer(...match)
+        return replaced === norm ? raw : `${leading}${replaced}${trailing}`
+      }
     }
   }
 
@@ -1212,6 +1364,11 @@ export function translateString(raw: string, lang: Lang): string {
 
 const originalTextMap = new WeakMap<Node, { zh: string; en: string }>()
 const TRANSLATABLE_ATTRS = ['placeholder', 'title', 'aria-label'] as const
+const SKIP_SELECTOR = '[translate="no"], [data-i18n-skip]'
+
+function isInSkippedSubtree(el: Element | null): boolean {
+  return Boolean(el?.closest(SKIP_SELECTOR))
+}
 
 export function useAutoI18n(lang: Lang): void {
   useEffect(() => {
@@ -1229,6 +1386,12 @@ export function useAutoI18n(lang: Lang): void {
         }
         const currentVal = node.nodeValue || ''
         let record = originalTextMap.get(node)
+        if (isInSkippedSubtree(node.parentElement)) {
+          if (record && record.en !== record.zh && currentVal === record.en) {
+            node.nodeValue = record.zh
+          }
+          return
+        }
 
         if (!record) {
           const enVal = translateString(currentVal, 'en')
@@ -1250,6 +1413,7 @@ export function useAutoI18n(lang: Lang): void {
 
       if (node.nodeType === Node.ELEMENT_NODE) {
         const el = node as HTMLElement
+        if (isInSkippedSubtree(el)) return
         for (const attr of TRANSLATABLE_ATTRS) {
           const val = el.getAttribute(attr)
           if (!val) continue

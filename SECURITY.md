@@ -19,14 +19,23 @@ We actively maintain and provide security updates for the latest release branch 
 
 Because **Antigravity ACP Gateway** manages multi-account OAuth credentials, northbound API keys (`sk-ag-*`), and local ACP subprocesses, operators should follow these deployment hardening practices:
 
-1. **Change Default Admin Credentials Immediately**
-   - Always override `server.admin_password` and `server.admin_token` in `config/config.yaml` (or via `AG_ADMIN_PASSWORD` / `AG_ADMIN_TOKEN` environment variables or `--admin-password` in `deploy.sh`) before exposing the gateway on any network.
+1. **Lock In Your Admin Credentials**
+   - By default (`admin_password: "auto"`, `admin_token: "auto"`) a random password and token are generated on every start and written to `<data_dir>/admin_credentials.txt` (mode `0600`); they are **not** printed to logs. Sign in with them and use **Change Password** in the console: the credentials are then fixed and stored as a salted PBKDF2-SHA256 hash in `gateway.db` (legacy unsalted SHA-256 hashes are upgraded on the next successful login). Minimum length: 8 characters for the password, 12 for a custom admin token.
+   - An initial password can be supplied via `AG_ADMIN_PASSWORD` (`deploy.sh --admin-password-stdin` passes it this way; it is never written to the git-tracked `config/config.yaml`). It only applies until the password is changed in the console.
+   - `Authorization: Bearer` on admin APIs accepts the admin token or a console session token, never the password. Failed credential attempts are rate-limited per IP on all endpoints.
 2. **Protect Account & Database Storage (`data/`)**
-   - The `data/` directory contains `gateway.db` (SQLite audit logs & issued API keys) and per-account `accounts/<id>/.gemini` OAuth session credentials. Ensure directory permissions are restricted to the service user (`chmod 700 data`).
-3. **ACP Binary Integrity Verification**
-   - The built-in deployment scripts (`deploy/deploy.sh`, `deploy/deploy.ps1`, `deploy/Dockerfile`) enforce **SHA-512** checksum verification for the official `agy` CLI and **SHA-256** verification for the Zed ACP package. Do not disable checksum verification when downloading binaries over untrusted networks.
-4. **Northbound API Access Control**
-   - Issue distinct `sk-ag-*` keys per client or team via the Admin Console so keys can be audited and revoked individually without disrupting other clients.
+   - The data directory contains `gateway.db` (SQLite audit logs & issued API keys), `admin_credentials.txt` and per-account `accounts/<id>/.gemini` OAuth session credentials. The gateway creates it with mode `0700`; `deploy.sh` also starts local processes with `umask 077` and keeps `gateway.log` at `0600`. Never commit it.
+3. **Run Unprivileged**
+   - `deploy.sh --mode service` runs the gateway as the dedicated system user `antigravity` under a hardened systemd unit (`NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome=tmpfs`, `PrivateTmp`, empty capability set, `UMask=0077`). The Docker image runs as UID `10001` and Compose publishes the port on `127.0.0.1` unless you set `AG_BIND=0.0.0.0`.
+4. **ACP Binary Integrity Verification (fail closed)**
+   - `deploy/deploy.sh`, `deploy/deploy.ps1` and `deploy/Dockerfile` verify the official `agy` CLI against the **SHA-512** in the release manifest and the Zed ACP package against a **pinned SHA-256** you supply (`ZED_ACP_SHA256` / `--zed-sha256` / build arg). A missing hash, missing hashing tool or unreachable manifest is an error unless you pass `--insecure-skip-verify` (`AG_INSECURE_SKIP_VERIFY=1` for Docker); a mismatch is always fatal. The official `install.sh` is only used with `--allow-install-script`, and is downloaded and shown before it runs (never `curl | bash`).
+5. **Northbound API Access Control**
+   - While no API key exists, `/v1/*` is only reachable without a key from loopback (`127.0.0.1` / `::1`). Issue distinct `sk-ag-*` keys per client or team so they can be audited and revoked individually. Keys bound to an account cannot be redirected with `X-ACP-Account-ID` / `?account_id=`, and sessions are isolated per key. `?key=` is accepted for the northbound API only; `?token=` is not accepted.
+6. **Built-in Isolation Defaults**
+   - State-changing admin endpoints require POST/PUT/DELETE, cross-origin state-changing requests are rejected, the session cookie is `SameSite=Strict`, and WebSocket upgrades check `Origin`.
+   - Admin API responses omit account `api_key` values and mask proxy passwords as `********`.
+   - `/v1/acp/ws` sessions always run inside the gateway-managed workspace; client `cwd` values outside it are rewritten. The internal MCP bridge `/mcp/sessions/*` only accepts loopback connections.
+   - ACP agent subprocesses do not inherit `AG_*` environment variables. Account IDs are restricted to `[A-Za-z0-9._-]` (1–64 characters).
 
 ### 3. Reporting a Vulnerability
 
@@ -67,14 +76,23 @@ If you discover a security vulnerability (such as authentication bypass, cross-a
 
 由于 **Antigravity ACP Gateway** 负责管理多账户 OAuth 授权凭据、北向调用令牌（`sk-ag-*`）以及底层 ACP 子进程池，在生产环境部署时请务必遵循以下安全规范：
 
-1. **立即修改默认管理员密码与令牌**
-   - 在公网或内网暴露服务前，必须通过 `config/config.yaml`、环境变量（`AG_ADMIN_PASSWORD` / `AG_ADMIN_TOKEN`）或一键部署脚本参数（`--admin-password`）替换默认的 `ag-admin-secret-key`。
+1. **尽快固定管理员凭证**
+   - 默认配置（`admin_password: "auto"`、`admin_token: "auto"`）会在每次启动时随机生成密码与 Token，并写入 `<data_dir>/admin_credentials.txt`（权限 `0600`），**不会打印到日志**。请用其登录后在控制台「修改密码」：凭证随即固定，并以加盐 PBKDF2-SHA256 哈希保存在 `gateway.db` 中（旧版无盐 SHA-256 哈希会在下次成功登录时自动升级）。密码至少 8 位，自定义管理 Token 至少 12 位。
+   - 初始密码可通过 `AG_ADMIN_PASSWORD` 提供（`deploy.sh --admin-password-stdin` 即以此方式传递，绝不会写入受 git 跟踪的 `config/config.yaml`），且仅在控制台修改密码之前生效。
+   - 管理 API 的 `Authorization: Bearer` 只接受管理 Token 或控制台会话 Token，不接受密码；所有端点的凭证失败尝试均按 IP 限速。
 2. **严格保护数据与凭据持久化目录（`data/`）**
-   - `data/` 目录存储了 SQLite 数据库 `gateway.db` 以及各隔离账户的 `accounts/<id>/.gemini` OAuth 认证状态文件。请确保该目录仅对网关运行用户可读写（建议设置 `chmod 700 data`），且切勿将其提交至版本控制系统。
-3. **保持 ACP 后端二进制哈希校验**
-   - `deploy/deploy.sh`、`deploy/deploy.ps1` 与 `deploy/Dockerfile` 在自动下载官方 `agy` CLI 时强制执行 **SHA-512** 校验，下载 Zed ACP 独立包时强制执行 **SHA-256** 校验。请勿在非受信网络下绕过校验逻辑。
-4. **按客户端独立签发北向 API Key**
-   - 建议在 Web 控制台为不同开发者或客户端工具（如 Codex CLI、Claude Code、Cursor）独立签发 `sk-ag-*` 密钥，以便按密钥进行细粒度审计或单独吊销。
+   - 数据目录存储了 SQLite 数据库 `gateway.db`、`admin_credentials.txt` 以及各隔离账户的 `accounts/<id>/.gemini` OAuth 认证状态文件。网关以 `0700` 权限创建该目录；`deploy.sh` 本地模式以 `umask 077` 启动并将 `gateway.log` 设为 `0600`。切勿将其提交至版本控制系统。
+3. **以非特权身份运行**
+   - `deploy.sh --mode service` 以专用系统用户 `antigravity` 运行，并启用 systemd 加固（`NoNewPrivileges`、`ProtectSystem=strict`、`ProtectHome=tmpfs`、`PrivateTmp`、清空能力集、`UMask=0077`）。Docker 镜像以 UID `10001` 运行，Compose 默认只在 `127.0.0.1` 上发布端口，需显式设置 `AG_BIND=0.0.0.0` 才对外开放。
+4. **ACP 后端二进制哈希校验（失败即中止）**
+   - `deploy/deploy.sh`、`deploy/deploy.ps1` 与 `deploy/Dockerfile` 使用发布清单中的 **SHA-512** 校验官方 `agy` CLI，使用您提供的**固定 SHA-256**（`ZED_ACP_SHA256` / `--zed-sha256` / 构建参数）校验 Zed ACP 包。缺少哈希、缺少哈希工具或清单获取失败均直接报错，除非显式传入 `--insecure-skip-verify`（Docker 为 `AG_INSECURE_SKIP_VERIFY=1`）；哈希不匹配始终报错。官方 `install.sh` 仅在传入 `--allow-install-script` 时使用，且会先下载并展示内容再执行（绝不 `curl | bash`）。
+5. **北向 API 访问控制**
+   - 尚未创建 API Key 时，`/v1/*` 仅允许回环地址（`127.0.0.1` / `::1`）免密访问。建议为不同开发者或客户端工具独立签发 `sk-ag-*` 密钥，以便单独审计与吊销。绑定账户的 Key 无法通过 `X-ACP-Account-ID` / `?account_id=` 改投其他账户，会话按 Key 隔离。`?key=` 仅对北向 API 有效，`?token=` 已不再接受。
+6. **内置隔离默认值**
+   - 改变状态的管理接口必须使用 POST/PUT/DELETE，跨站的状态变更请求会被拒绝，会话 Cookie 为 `SameSite=Strict`，WebSocket 升级会校验 `Origin`。
+   - 管理 API 响应不包含账户 `api_key`，代理密码显示为 `********`。
+   - `/v1/acp/ws` 会话始终运行在网关管理的工作区内，工作区外的客户端 `cwd` 会被改写；内部 MCP 桥 `/mcp/sessions/*` 仅接受回环连接。
+   - ACP 子进程不继承 `AG_*` 环境变量；账户 ID 仅允许 `[A-Za-z0-9._-]`（1–64 个字符）。
 
 ### 3. 安全漏洞私密报告流程
 

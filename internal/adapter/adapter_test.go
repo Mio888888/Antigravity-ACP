@@ -97,11 +97,15 @@ func TestParseOpenAIAndClaudeRequestsAndSystemPromptPolicy(t *testing.T) {
 	if !strings.Contains(clReq.SystemPrompt, "System rule 1.") || !strings.Contains(clReq.SystemPrompt, "System rule 2.") {
 		t.Fatalf("unexpected Claude system prompt: %q", clReq.SystemPrompt)
 	}
-	if len(clReq.ToolResults) != 1 || clReq.ToolResults[0].CallID != "call_claude_99" || clReq.ToolResults[0].Content != "Tool output ok" {
+	// Sibling text/image/document blocks in a tool_result message travel with the last tool result.
+	if len(clReq.ToolResults) != 1 || clReq.ToolResults[0].CallID != "call_claude_99" ||
+		!strings.HasPrefix(clReq.ToolResults[0].Content, "Tool output ok\n\nCheck this file") ||
+		!strings.Contains(clReq.ToolResults[0].Content, "[image omitted: image/jpeg]") ||
+		!strings.Contains(clReq.ToolResults[0].Content, "# Spec") {
 		t.Fatalf("unexpected Claude tool results: %+v", clReq.ToolResults)
 	}
-	if len(clReq.PromptBlocks) < 3 {
-		t.Fatalf("expected text, image, and resource prompt blocks, got %+v", clReq.PromptBlocks)
+	if len(clReq.PromptBlocks) != 1 || !strings.HasPrefix(clReq.PromptBlocks[0].Text, "[tool_result:call_claude_99]\nTool output ok") {
+		t.Fatalf("expected the trailing tool result rendered as the prompt, got %+v", clReq.PromptBlocks)
 	}
 
 	// 3. OpenAI Official Responses API request (/v1/responses) with instructions, previous_response_id, input items, and function_call_output
@@ -373,10 +377,13 @@ func TestOpenAIAndClaudeSSEWritersAntiBufferingAndKeepAlive(t *testing.T) {
 		t.Fatalf("expected X-Accel-Buffering: no on OpenAI SSE response")
 	}
 	oaBody := recOA.Body.String()
-	for _, want := range []string{": ping", `"reasoning_content":"Thinking step..."`, `"reasoning":"Thinking step..."`, `"content":"Final answer"`, `"tool_calls"`, `[DONE]`} {
+	for _, want := range []string{": ping", `"reasoning_content":"Thinking step..."`, `"content":"Final answer"`, `"tool_calls"`, `[DONE]`} {
 		if !strings.Contains(oaBody, want) {
 			t.Fatalf("expected %q in OpenAI SSE stream:\n%s", want, oaBody)
 		}
+	}
+	if strings.Contains(oaBody, `"reasoning":`) {
+		t.Fatalf("expected only reasoning_content (no duplicate reasoning key) in OpenAI SSE stream:\n%s", oaBody)
 	}
 
 	// OpenAI Official Responses SSE Writer
@@ -498,4 +505,3 @@ func TestClientContextWindowExtractionAcrossProtocols(t *testing.T) {
 		t.Fatalf("expected ContextWindow=180000 from Claude context_window, got %d", clReq.ContextWindow)
 	}
 }
-

@@ -37,8 +37,11 @@ func main() {
 		cfg.ACPPool.BinaryPath = *acpBinFlag
 	}
 
-	if err := os.MkdirAll(cfg.Server.DataDir, 0755); err != nil {
+	if err := os.MkdirAll(cfg.Server.DataDir, 0700); err != nil {
 		log.Fatalf("Failed to create data_dir %s: %v", cfg.Server.DataDir, err)
+	}
+	if err := os.Chmod(cfg.Server.DataDir, 0700); err != nil {
+		log.Printf("Warning: could not restrict data_dir %s to 0700: %v", cfg.Server.DataDir, err)
 	}
 
 	dbPath := filepath.Join(cfg.Server.DataDir, "gateway.db")
@@ -66,7 +69,7 @@ func main() {
 
 	go func() {
 		server.SyncTranscriptTokens(cfg.Server.DataDir, store, 120)
-		ticker := time.NewTicker(1500 * time.Millisecond)
+		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
 			server.SyncTranscriptTokens(cfg.Server.DataDir, store, 30)

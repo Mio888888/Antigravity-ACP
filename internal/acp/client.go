@@ -344,6 +344,10 @@ type WorkerClient struct {
 	wiretap          WiretapCallback
 	closeOnce        sync.Once
 	closedCh         chan struct{}
+	// Set by MultiAccountPool: the account config generation and egress relay this
+	// worker was started with.
+	poolGen     uint64
+	egressRelay *EgressRelay
 }
 
 func (w *WorkerClient) AddBoundSession(delta int32) {
@@ -380,7 +384,7 @@ func NewWorkerClient(ctx context.Context, id string, opts WorkerLaunchOptions, w
 		cmd.Dir = opts.WorkspaceDir
 	}
 
-	envList := os.Environ()
+	envList := SanitizedParentEnv()
 	for k, v := range opts.Env {
 		envList = append(envList, k+"="+v)
 	}
@@ -428,6 +432,42 @@ func NewWorkerClient(ctx context.Context, id string, opts WorkerLaunchOptions, w
 	return w, nil
 }
 
+// SanitizedParentEnv returns the gateway's environment without AG_* variables, which
+// carry gateway configuration and secrets (admin password/token) that agent
+// subprocesses must not see.
+func SanitizedParentEnv() []string {
+	parent := os.Environ()
+	out := make([]string, 0, len(parent))
+	for _, kv := range parent {
+		if strings.HasPrefix(strings.ToUpper(kv), "AG_") {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
+}
+
+// TryMarkBusy atomically moves an idle worker to Generating. It returns false if
+// another request already claimed the worker or it is no longer idle.
+func (w *WorkerClient) TryMarkBusy() bool {
+	return w.CompareAndSetState(StateIdle, StateGenerating)
+}
+
+// CompareAndSetState sets the state to `to` only if it is currently `from`.
+func (w *WorkerClient) CompareAndSetState(from, to WorkerState) bool {
+	if w == nil {
+		return false
+	}
+	w.stateMu.Lock()
+	defer w.stateMu.Unlock()
+	if w.state != from {
+		return false
+	}
+	w.state = to
+	w.lastActiveAt = time.Now()
+	return true
+}
+
 func (w *WorkerClient) GetState() WorkerState {
 	w.stateMu.RLock()
 	defer w.stateMu.RUnlock()
@@ -462,6 +502,8 @@ func (w *WorkerClient) readLoop() {
 			w.pending.Delete(key)
 			return true
 		})
+		// Reap the process (and its group) once stdout closes.
+		go func() { _ = w.Close() }()
 	}()
 
 	scanner := bufio.NewScanner(w.stdout)
@@ -499,13 +541,22 @@ func (w *WorkerClient) readLoop() {
 			continue
 		}
 
-		// Server notification (e.g. session/update)
+		// Server notification (e.g. session/update). Apply brief backpressure instead of
+		// dropping output chunks when the consumer is momentarily behind.
 		select {
 		case w.eventsCh <- &msg:
 		default:
+			t := time.NewTimer(eventSendTimeout)
+			select {
+			case w.eventsCh <- &msg:
+			case <-t.C:
+			}
+			t.Stop()
 		}
 	}
 }
+
+const eventSendTimeout = 2 * time.Second
 
 func (w *WorkerClient) handleServerReverseRPC(msg *RPCMessage) {
 	w.stateMu.RLock()

@@ -1,3 +1,7 @@
+# Published on 127.0.0.1 by default. To expose the gateway on all interfaces, opt in explicitly:
+#   AG_BIND=0.0.0.0 docker compose -f deploy/docker-compose.yml up -d --build
+# Remote (non-loopback) clients need an API key created in the Admin Console.
+# Optional secrets (e.g. AG_ADMIN_PASSWORD) go in deploy/gateway.env (gitignored; see gateway.env.example).
 services:
   antigravity-gateway:
     build:
@@ -5,22 +9,29 @@ services:
       dockerfile: deploy/Dockerfile
       args:
         AG_ACP_BACKEND: ${AG_ACP_BACKEND:-cli}
+        ZED_ACP_VERSION: ${ZED_ACP_VERSION:-1.4.5}
+        ZED_ACP_SHA256: ${ZED_ACP_SHA256:-}
+        AG_INSECURE_SKIP_VERIFY: ${AG_INSECURE_SKIP_VERIFY:-0}
     container_name: antigravity-gateway
     restart: unless-stopped
     ports:
-      - "${AG_PORT:-8080}:8080"
+      # The container always listens on 8080 (AG_PORT is fixed in the image); only the host side changes.
+      - "${AG_BIND:-127.0.0.1}:${AG_PORT:-8080}:8080"
+    env_file:
+      - path: gateway.env
+        required: false
     environment:
       - AGY_ACP_FORCE_FILE_STORAGE=1
       - AG_ACP_BACKEND=${AG_ACP_BACKEND:-cli}
-      - AG_ACP_BINARY_PATH=${AG_ACP_BINARY_PATH:-}
-      - AG_ADMIN_PASSWORD=${AG_ADMIN_PASSWORD:-}
+      - AG_ACP_BINARY_PATH=${AG_ACP_BINARY_PATH:-auto}
       - AG_DATA_DIR=/var/lib/antigravity-gateway
       - AG_WORKSPACE_DIR=/tmp/antigravity-gateway-workspace
     volumes:
       - ../config/config.yaml:/etc/antigravity-gateway/config.yaml:ro
+      # Optional custom ACP binaries; deploy.sh creates ../bin (Docker also creates a missing bind source).
       - ../bin:/opt/antigravity-acp:ro
       - gateway-data:/var/lib/antigravity-gateway
-      - gemini-home:/root/.gemini
+      - gemini-home:/home/agy/.gemini
 
 volumes:
   gateway-data:

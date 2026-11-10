@@ -90,6 +90,7 @@ func (gs *GatewayServer) enrichAccountSnapshotsWithUsage() []acp.AccountRuntimeS
 	gs.mu.RLock()
 	defer gs.mu.RUnlock()
 	for i := range snaps {
+		snaps[i].Account = snaps[i].Account.Redacted()
 		accID := snaps[i].Account.ID
 		u, ok := usageMap[accID]
 		if !ok {
@@ -239,16 +240,22 @@ func (gs *GatewayServer) handleAdminAccounts(w http.ResponseWriter, r *http.Requ
 			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		previous, prevErr := gs.store.GetAccount(strings.TrimSpace(acc.ID))
 		saved, err := gs.store.UpsertAccount(acc)
 		if err != nil {
 			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		if err := gs.pool.UpsertAccountPool(*saved); err != nil {
+			if prevErr == nil && previous != nil {
+				_, _ = gs.store.UpsertAccount(*previous)
+			} else {
+				_ = gs.store.DeleteAccount(saved.ID)
+			}
 			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		writeJSON(w, http.StatusOK, saved)
+		writeJSON(w, http.StatusOK, saved.Redacted())
 	default:
 		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
@@ -275,6 +282,14 @@ func (gs *GatewayServer) handleAdminAccountAction(w http.ResponseWriter, r *http
 
 	action := strings.Join(parts[1:], "/")
 	switch action {
+	case "login/status", "disabled-models":
+	default:
+		if r.Method != http.MethodPost {
+			writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+	}
+	switch action {
 	case "login/start", "login":
 		st, err := gs.pool.StartTerminalLogin(accountID)
 		if err != nil {
@@ -300,6 +315,10 @@ func (gs *GatewayServer) handleAdminAccountAction(w http.ResponseWriter, r *http
 		}
 		writeJSON(w, http.StatusOK, st)
 	case "login/status":
+		if r.Method != http.MethodGet {
+			writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
 		writeJSON(w, http.StatusOK, gs.pool.GetTerminalLoginStatus(accountID))
 	case "probe", "probe-net", "net-check":
 		var body struct {
@@ -411,7 +430,7 @@ func (gs *GatewayServer) handleAdminAccountAction(w http.ResponseWriter, r *http
 		writeJSON(w, http.StatusOK, map[string]any{
 			"account_id":      accountID,
 			"disabled_models": saved.DisabledModels,
-			"account":         saved,
+			"account":         saved.Redacted(),
 		})
 	default:
 		writeJSONError(w, http.StatusNotFound, "unknown account action")
@@ -429,11 +448,19 @@ func (gs *GatewayServer) handleAdminWorkers(w http.ResponseWriter, r *http.Reque
 }
 
 func (gs *GatewayServer) handleAdminWorkersScale(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
 	killed := gs.pool.RestartIdleWorkers()
 	writeJSON(w, http.StatusOK, map[string]any{"restarted_idle_workers": killed})
 }
 
 func (gs *GatewayServer) handleAdminWorkerKill(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodDelete {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
 	trimmed := strings.TrimPrefix(r.URL.Path, "/api/admin/workers/")
 	workerID := strings.TrimSuffix(trimmed, "/kill")
 	workerID = strings.Trim(workerID, "/")
@@ -501,6 +528,10 @@ func (gs *GatewayServer) handleAdminAuthEnv(w http.ResponseWriter, r *http.Reque
 }
 
 func (gs *GatewayServer) handleAdminDefaultLoginStart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
 	st, err := gs.pool.StartTerminalLogin("default")
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
@@ -510,6 +541,10 @@ func (gs *GatewayServer) handleAdminDefaultLoginStart(w http.ResponseWriter, r *
 }
 
 func (gs *GatewayServer) handleAdminDefaultLoginSubmit(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
 	var body struct {
 		Code string `json:"code"`
 	}
@@ -549,8 +584,16 @@ func (gs *GatewayServer) handleAdminSkills(w http.ResponseWriter, r *http.Reques
 }
 
 func (gs *GatewayServer) handleAdminSkillDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
 	idStr := strings.TrimPrefix(r.URL.Path, "/api/admin/skills/")
-	id, _ := strconv.ParseInt(strings.Trim(idStr, "/"), 10, 64)
+	id, err := strconv.ParseInt(strings.Trim(idStr, "/"), 10, 64)
+	if err != nil || id <= 0 {
+		writeJSONError(w, http.StatusBadRequest, "invalid skill id")
+		return
+	}
 	if err := gs.store.DeleteSkill(id); err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
@@ -607,15 +650,6 @@ func (gs *GatewayServer) handleAdminKeys(w http.ResponseWriter, r *http.Request)
 			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		_ = gs.cfg.UpdatePromptPolicy(config.PromptPolicyConfig{
-			Mode:                rec.PromptMode,
-			GlobalPrependPrompt: rec.GlobalPrependPrompt,
-			DisableBuiltinTools: rec.DisableBuiltinTools,
-		})
-		gs.cfg.UpdateSandboxPolicy(rec.SessionMode, "")
-		if gs.pool != nil {
-			gs.pool.UpdateSandboxPolicy(gs.cfg.GetSandboxPolicy())
-		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"plain_key": plainKey,
 			"record":    rec,
@@ -670,15 +704,6 @@ func (gs *GatewayServer) handleAdminKeyDelete(w http.ResponseWriter, r *http.Req
 			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		_ = gs.cfg.UpdatePromptPolicy(config.PromptPolicyConfig{
-			Mode:                updated.PromptMode,
-			GlobalPrependPrompt: updated.GlobalPrependPrompt,
-			DisableBuiltinTools: updated.DisableBuiltinTools,
-		})
-		gs.cfg.UpdateSandboxPolicy(updated.SessionMode, "")
-		if gs.pool != nil {
-			gs.pool.UpdateSandboxPolicy(gs.cfg.GetSandboxPolicy())
-		}
 		writeJSON(w, http.StatusOK, map[string]any{"record": updated})
 	default:
 		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -721,6 +746,10 @@ func (gs *GatewayServer) handleAdminPasswordLogin(w http.ResponseWriter, r *http
 		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+	if !isSameOriginRequest(r) {
+		writeJSONError(w, http.StatusForbidden, "cross-origin admin request rejected")
+		return
+	}
 	clientIP := clientIPFromRequest(r)
 	if !gs.checkLoginRateLimit(clientIP) {
 		writeJSONError(w, http.StatusTooManyRequests, "登录失败次数过多，请 5 分钟后再试")
@@ -740,7 +769,7 @@ func (gs *GatewayServer) handleAdminPasswordLogin(w http.ResponseWriter, r *http
 	if credential == "" {
 		credential = strings.TrimSpace(body.Token)
 	}
-	if !gs.verifyAdminCredential(credential) {
+	if !gs.verifyAdminLoginCredential(credential) {
 		gs.recordLoginFailure(clientIP)
 		writeJSONError(w, http.StatusUnauthorized, "管理员密码错误，请重新输入")
 		return
@@ -762,7 +791,8 @@ func (gs *GatewayServer) handleAdminPasswordLogin(w http.ResponseWriter, r *http
 		Value:    sessToken,
 		Path:     "/",
 		HttpOnly: true,
-		SameSite: http.SameSiteLaxMode,
+		SameSite: http.SameSiteStrictMode,
+		Secure:   r.TLS != nil,
 		MaxAge:   int(ttl.Seconds()),
 		Expires:  exp,
 	})
@@ -779,7 +809,11 @@ func (gs *GatewayServer) handleAdminLogout(w http.ResponseWriter, r *http.Reques
 		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	token := extractToken(r)
+	if !isSameOriginRequest(r) {
+		writeJSONError(w, http.StatusForbidden, "cross-origin admin request rejected")
+		return
+	}
+	token := extractToken(r, false)
 	if token != "" {
 		gs.revokeAdminSession(token)
 	}
@@ -791,7 +825,8 @@ func (gs *GatewayServer) handleAdminLogout(w http.ResponseWriter, r *http.Reques
 		Value:    "",
 		Path:     "/",
 		HttpOnly: true,
-		SameSite: http.SameSiteLaxMode,
+		SameSite: http.SameSiteStrictMode,
+		Secure:   r.TLS != nil,
 		MaxAge:   -1,
 	})
 	writeJSON(w, http.StatusOK, map[string]any{"logged_out": true})
@@ -825,35 +860,33 @@ func (gs *GatewayServer) handleAdminChangePassword(w http.ResponseWriter, r *htt
 	currentPwd := strings.TrimSpace(body.CurrentPassword)
 	newPwd := strings.TrimSpace(body.NewPassword)
 	newToken := strings.TrimSpace(body.NewAdminToken)
-	if !gs.verifyAdminCredential(currentPwd) {
+	clientIP := clientIPFromRequest(r)
+	if !gs.checkLoginRateLimit(clientIP) {
+		writeJSONError(w, http.StatusTooManyRequests, "认证失败次数过多，请 5 分钟后再试")
+		return
+	}
+	if !gs.verifyAdminLoginCredential(currentPwd) {
+		gs.recordLoginFailure(clientIP)
 		writeJSONError(w, http.StatusUnauthorized, "当前管理员密码或 Token 不正确")
 		return
 	}
-	if len(newPwd) < 6 {
-		writeJSONError(w, http.StatusBadRequest, "新密码长度不能少于 6 位")
+	if len(newPwd) < adminPasswordMinLen {
+		writeJSONError(w, http.StatusBadRequest, "新密码长度不能少于 8 位")
 		return
 	}
-	if newToken != "" && len(newToken) < 6 {
-		writeJSONError(w, http.StatusBadRequest, "自定义 Admin Token 长度不能少于 6 位")
+	if newToken != "" && len(newToken) < adminTokenMinLen {
+		writeJSONError(w, http.StatusBadRequest, "自定义 Admin Token 长度不能少于 12 位")
 		return
+	}
+	if gs.store != nil {
+		if err := gs.persistAdminCredentials(newPwd, newToken); err != nil {
+			writeJSONError(w, http.StatusInternalServerError, "保存新凭证失败: "+err.Error())
+			return
+		}
 	}
 	gs.cfg.SetAdminPassword(newPwd)
 	if newToken != "" {
 		gs.cfg.SetAdminToken(newToken)
-	}
-	if gs.store != nil {
-		_ = gs.store.SetSetting(adminPassSettingKey, sha256Hex(newPwd))
-		if newToken != "" {
-			_ = gs.store.SetSetting(adminTokenSettingKey, sha256Hex(newToken))
-		} else if existingTokHash, ok := gs.store.GetSetting(adminTokenSettingKey); !ok || strings.TrimSpace(existingTokHash) == "" {
-			activeTok := strings.TrimSpace(gs.cfg.GetAdminToken())
-			if activeTok != "" && !config.IsDynamicCredentialValue(activeTok) {
-				_ = gs.store.SetSetting(adminTokenSettingKey, sha256Hex(activeTok))
-			} else {
-				_ = gs.store.SetSetting(adminTokenSettingKey, sha256Hex(newPwd))
-			}
-		}
-		_ = gs.store.SetSetting(adminCredentialsLockedKey, "1")
 	}
 	gs.writeAdminCredentialsFile("", "", true)
 	gs.revokeAllAdminSessions()
@@ -867,7 +900,8 @@ func (gs *GatewayServer) handleAdminChangePassword(w http.ResponseWriter, r *htt
 		Value:    sessToken,
 		Path:     "/",
 		HttpOnly: true,
-		SameSite: http.SameSiteLaxMode,
+		SameSite: http.SameSiteStrictMode,
+		Secure:   r.TLS != nil,
 		MaxAge:   int((24 * time.Hour).Seconds()),
 		Expires:  exp,
 	})

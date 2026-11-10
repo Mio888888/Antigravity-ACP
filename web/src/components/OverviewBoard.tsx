@@ -5,21 +5,26 @@ import {
   Cpu,
   Grid,
   LayoutGrid,
+  RefreshCw,
   Sparkles,
   Terminal,
 } from 'lucide-react'
 import {
   AccountSnapshot,
-  APIKeyRecord,
-  AuditContextItem,
   AuditContextSnapshot,
   AuditLogRecord,
   OverviewResponse,
-  PromptPolicyConfig,
-  SkillRecord,
 } from '../api'
-import { TreemapDetailKey } from './OverviewDetailModal'
-import { Badge, Frame, FramePanel } from './reui/primitives'
+import { formatCompact, formatDurationCn } from '../lib/format'
+import type { TreemapDetailKey } from './OverviewDetailModal'
+import {
+  Badge,
+  Button,
+  Frame,
+  FramePanel,
+  InlineError,
+  Skeleton,
+} from './reui/primitives'
 
 export type RequestContextCategory =
   | 'all'
@@ -53,24 +58,16 @@ export interface ContextModuleSelection {
   items: NormalizedContextEntry[]
 }
 
-export interface ClientSettingsPreview {
-  selectedKey?: APIKeyRecord
-  protocolTab?: 'openai_official' | 'openai_compat' | 'claude'
-  effectiveModel?: string
-  accountBind?: string
-}
-
 interface OverviewBoardProps {
   overview: OverviewResponse | null
   accounts: AccountSnapshot[]
-  apiKeys?: APIKeyRecord[]
   auditLogs: AuditLogRecord[]
   selectedAuditLog: AuditLogRecord | undefined
   onSelectAuditLogId: (id: string) => void
-  policy: PromptPolicyConfig
-  skills: SkillRecord[]
   gatewayHostPort: string
-  clientSettings?: ClientSettingsPreview
+  loading: boolean
+  loadError: string
+  syncError: string
   fleetUsageSummary: {
     enabledCount: number
     readyCount: number
@@ -127,26 +124,8 @@ const CATEGORY_STYLE: Record<
   },
 }
 
-function formatCompactTokens(num: number): string {
-  if (!num || num <= 0) return '0'
-  if (num >= 1_000_000) return `${(num / 1_000_000).toFixed(2)}M`
-  if (num >= 100_000) return `${Math.round(num / 1_000)}K`
-  if (num >= 1_000) return `${(num / 1_000).toFixed(1)}K`
-  return String(Math.round(num))
-}
-
-function formatDurationCn(ms?: number): string {
-  if (!ms || ms <= 0) return '0 毫秒'
-  if (ms >= 1000) {
-    const sec = ms / 1000
-    return `${sec >= 10 ? Math.round(sec) : Number(sec.toFixed(1))} 秒`
-  }
-  return `${Math.round(ms)} 毫秒`
-}
-
 export function formatClientShortName(
   proto?: string,
-  protocolTab?: 'openai_official' | 'openai_compat' | 'claude',
   keyName?: string,
   log?: AuditLogRecord | null
 ): string {
@@ -172,9 +151,7 @@ export function formatClientShortName(
     if (p.includes('acp')) return 'ACP Studio'
     return proto
   }
-  if (protocolTab === 'claude') return 'Claude API'
-  if (protocolTab === 'openai_compat') return 'OpenAI API'
-  return 'Responses API'
+  return '—'
 }
 
 export function getModelContextCapacity(modelName: string): number {
@@ -214,9 +191,20 @@ export function resolveEffectiveContextCapacity(
   return modelDefault
 }
 
+const CACHE_LIMIT = 256
 const parsedSnapshotCache = new Map<string, AuditContextSnapshot | null>()
 const promptGoalCache = new Map<string, string>()
 const sessionTitleCache = new Map<string, string>()
+
+function boundedCacheSet<V>(cache: Map<string, V>, key: string, value: V): void {
+  if (!cache.has(key) && cache.size >= CACHE_LIMIT) {
+    const oldestKey = cache.keys().next().value
+    if (oldestKey !== undefined) {
+      cache.delete(oldestKey)
+    }
+  }
+  cache.set(key, value)
+}
 
 function extractSessionTitleFromText(rawText?: string): string {
   if (!rawText) return ''
@@ -279,13 +267,7 @@ export function extractSessionTitle(
     }
   }
   if (cacheKey && found) {
-    if (sessionTitleCache.size >= 256) {
-      const oldestKey = sessionTitleCache.keys().next().value
-      if (oldestKey !== undefined) {
-        sessionTitleCache.delete(oldestKey)
-      }
-    }
-    sessionTitleCache.set(cacheKey, found)
+    boundedCacheSet(sessionTitleCache, cacheKey, found)
   }
   return found
 }
@@ -309,13 +291,7 @@ export function parseAuditContextSnapshot(
   } catch {
     parsed = null
   }
-  if (parsedSnapshotCache.size >= 256) {
-    const oldestKey = parsedSnapshotCache.keys().next().value
-    if (oldestKey !== undefined) {
-      parsedSnapshotCache.delete(oldestKey)
-    }
-  }
-  parsedSnapshotCache.set(cacheKey, parsed)
+  boundedCacheSet(parsedSnapshotCache, cacheKey, parsed)
   return parsed
 }
 
@@ -374,6 +350,74 @@ export function resolvePureOutputTokens(
     return recorded > 0 ? Math.min(recorded, pureEst) : pureEst
   }
   return recorded
+}
+
+export interface RequestContextUsage {
+  parsedSnap: AuditContextSnapshot | null
+  inputTokens: number
+  outputTokens: number
+  totalTokens: number
+  contextCapacity: number
+  usedContextTokens: number
+  usedPct: number
+  remainingTokens: number
+  estRemainingReqs: number | null
+}
+
+export function computeRequestContextUsage(log?: AuditLogRecord | null): RequestContextUsage {
+  const parsedSnap = parseAuditContextSnapshot(log)
+  const inputTokens =
+    parsedSnap?.input_tokens && parsedSnap.input_tokens > 0
+      ? parsedSnap.input_tokens
+      : log?.prompt_tokens || 0
+  const outputTokens = resolvePureOutputTokens(log, parsedSnap)
+  const totalTokens = Math.max(inputTokens + outputTokens, log?.total_tokens || 0)
+  const baseModelWindow = resolveEffectiveContextCapacity(log?.model_name || '', parsedSnap)
+  const usedContextTokens = inputTokens > 0 ? inputTokens : totalTokens
+  const contextCapacity =
+    usedContextTokens > baseModelWindow
+      ? Math.ceil((usedContextTokens * 1.15) / 10_000) * 10_000
+      : baseModelWindow
+  const usedPct =
+    contextCapacity > 0 ? Math.min(100, Math.round((usedContextTokens / contextCapacity) * 100)) : 0
+  const remainingTokens = Math.max(0, contextCapacity - usedContextTokens)
+  const perTurnDelta = Math.max(800, outputTokens + Math.round(inputTokens * 0.06))
+  const estRemainingReqs =
+    usedContextTokens > 0 ? Math.max(1, Math.round(remainingTokens / perTurnDelta)) : null
+  return {
+    parsedSnap,
+    inputTokens,
+    outputTokens,
+    totalTokens,
+    contextCapacity,
+    usedContextTokens,
+    usedPct,
+    remainingTokens,
+    estRemainingReqs,
+  }
+}
+
+export function resolveSessionLogs(
+  activeLog: AuditLogRecord | undefined,
+  auditLogs: AuditLogRecord[]
+): AuditLogRecord[] {
+  if (!activeLog) return []
+  if (!activeLog.session_id) return [activeLog]
+  const matched = auditLogs.filter((l) => l.session_id === activeLog.session_id)
+  return matched.length > 0 ? matched : [activeLog]
+}
+
+export function formatPromptModeShort(mode?: string): string {
+  switch (mode) {
+    case 'pure_passthrough':
+      return '纯透传'
+    case 'prepend_global':
+      return '全局前置'
+    case 'native_hybrid':
+      return '原生混合'
+    default:
+      return mode || '—'
+  }
 }
 
 function cleanPromptSnippet(rawText: string): string {
@@ -467,7 +511,7 @@ function extractPromptGoalSummary(
     const s = cleanPromptSnippet(snap.prompt_summary)
     if (s && !s.startsWith('...[truncated]')) {
       const res = s.length > 36 ? `${s.slice(0, 36)}...` : s
-      if (cacheKey) promptGoalCache.set(cacheKey, res)
+      if (cacheKey) boundedCacheSet(promptGoalCache, cacheKey, res)
       return res
     }
   }
@@ -489,13 +533,7 @@ function extractPromptGoalSummary(
   }
   const finalSummary = candidate.length > 36 ? `${candidate.slice(0, 36)}...` : candidate
   if (cacheKey) {
-    if (promptGoalCache.size >= 256) {
-      const oldestKey = promptGoalCache.keys().next().value
-      if (oldestKey !== undefined) {
-        promptGoalCache.delete(oldestKey)
-      }
-    }
-    promptGoalCache.set(cacheKey, finalSummary)
+    boundedCacheSet(promptGoalCache, cacheKey, finalSummary)
   }
   return finalSummary
 }
@@ -506,8 +544,8 @@ interface ContextTreemapViewProps {
   categoryTotals: Record<Exclude<RequestContextCategory, 'all'>, number>
   groupedForTreemap: Record<Exclude<RequestContextCategory, 'all'>, NormalizedContextEntry[]>
   activeLogId?: string
-  disableBuiltinTools: boolean
-  promptMode: string
+  disableBuiltinTools?: boolean
+  promptMode?: string
   onOpenModal: (
     key: TreemapDetailKey,
     logId?: string,
@@ -549,7 +587,7 @@ const ContextTreemapView: React.FC<ContextTreemapViewProps> = React.memo(
           <span>{titleText}</span>
         </div>
         <div className="mt-0.5 text-xs text-zinc-400 tabular-nums">
-          {`${categoryLabel} · ${formatCompactTokens(tokens)} token · ${calcPct(tokens)}%`}
+          {`${categoryLabel} · ${formatCompact(tokens)} token · ${calcPct(tokens)}%`}
         </div>
       </div>
     )
@@ -631,7 +669,7 @@ const ContextTreemapView: React.FC<ContextTreemapViewProps> = React.memo(
                   {sysMainTitle}
                 </div>
                 <div className="text-xs text-violet-600/90 dark:text-violet-200/85 truncate w-full tabular-nums">
-                  {`${formatCompactTokens(sysMainTokens)} · 系统提示词`}
+                  {`${formatCompact(sysMainTokens)} · 系统提示词`}
                 </div>
               </div>
             </button>
@@ -674,7 +712,7 @@ const ContextTreemapView: React.FC<ContextTreemapViewProps> = React.memo(
                           {label}
                         </div>
                         <div className="text-xs text-violet-600/90 dark:text-violet-200/85 truncate w-full tabular-nums">
-                          {formatCompactTokens(tok)}
+                          {formatCompact(tok)}
                         </div>
                       </div>
                     </button>
@@ -713,7 +751,7 @@ const ContextTreemapView: React.FC<ContextTreemapViewProps> = React.memo(
                   {toolMainTitle}
                 </div>
                 <div className="text-xs text-sky-600/90 dark:text-sky-200/85 truncate w-full tabular-nums">
-                  {`${formatCompactTokens(toolMainTokens)} · 工具`}
+                  {`${formatCompact(toolMainTokens)} · 工具`}
                 </div>
               </div>
             </button>
@@ -754,7 +792,7 @@ const ContextTreemapView: React.FC<ContextTreemapViewProps> = React.memo(
                           {label}
                         </div>
                         <div className="text-xs text-sky-600/90 dark:text-sky-200/85 truncate w-full tabular-nums">
-                          {formatCompactTokens(tok)}
+                          {formatCompact(tok)}
                         </div>
                       </div>
                     </button>
@@ -779,7 +817,7 @@ const ContextTreemapView: React.FC<ContextTreemapViewProps> = React.memo(
               items: groupedForTreemap.skills,
             })
           }
-          aria-label={`技能 ${formatCompactTokens(skillTokens)}`}
+          aria-label={`技能 ${formatCompact(skillTokens)}`}
           className={`relative hidden lg:flex lg:w-3.5 shrink-0 rounded-xl border border-slate-500/35 bg-slate-500/14 dark:bg-slate-500/20 cursor-pointer hover:bg-slate-500/26 ${tileHoverClass(
             'hover:border-slate-500/80 hover:ring-1 hover:ring-slate-500/35'
           )}`}
@@ -819,7 +857,7 @@ const ContextTreemapView: React.FC<ContextTreemapViewProps> = React.memo(
                 {fileMainTitle}
               </div>
               <div className="text-xs text-emerald-600/90 dark:text-emerald-200/85 truncate w-full tabular-nums">
-                {`${formatCompactTokens(fileMainTokens)} · 文件`}
+                {`${formatCompact(fileMainTokens)} · 文件`}
               </div>
             </div>
           </button>
@@ -857,7 +895,7 @@ const ContextTreemapView: React.FC<ContextTreemapViewProps> = React.memo(
                         {fileItem.title}
                       </div>
                       <div className="text-xs text-emerald-600/90 dark:text-emerald-200/85 truncate w-full tabular-nums">
-                        {formatCompactTokens(fileItem.tokens)}
+                        {formatCompact(fileItem.tokens)}
                       </div>
                     </div>
                   </button>
@@ -892,7 +930,7 @@ const ContextTreemapView: React.FC<ContextTreemapViewProps> = React.memo(
                             {f3.title}
                           </div>
                           <div className="text-xs text-emerald-600/90 dark:text-emerald-200/85 truncate w-full tabular-nums">
-                            {formatCompactTokens(f3.tokens)}
+                            {formatCompact(f3.tokens)}
                           </div>
                         </div>
                       </button>
@@ -931,7 +969,7 @@ const ContextTreemapView: React.FC<ContextTreemapViewProps> = React.memo(
                                 {f4.title}
                               </div>
                               <div className="text-xs text-emerald-600/90 dark:text-emerald-200/85 truncate w-full tabular-nums">
-                                {formatCompactTokens(f4.tokens)}
+                                {formatCompact(f4.tokens)}
                               </div>
                             </div>
                           </button>
@@ -971,7 +1009,7 @@ const ContextTreemapView: React.FC<ContextTreemapViewProps> = React.memo(
                                   {extraLabel}
                                 </div>
                                 <div className="text-xs text-emerald-600/90 dark:text-emerald-200/85 truncate w-full tabular-nums">
-                                  {formatCompactTokens(extraTokens)}
+                                  {formatCompact(extraTokens)}
                                 </div>
                               </div>
                             </button>
@@ -1015,7 +1053,7 @@ const ContextTreemapView: React.FC<ContextTreemapViewProps> = React.memo(
                 {toolResMainTitle}
               </div>
               <div className="text-xs text-orange-600/90 dark:text-orange-200/85 truncate w-full tabular-nums">
-                {formatCompactTokens(toolResMainTokens)}
+                {formatCompact(toolResMainTokens)}
               </div>
             </div>
           </button>
@@ -1056,7 +1094,7 @@ const ContextTreemapView: React.FC<ContextTreemapViewProps> = React.memo(
                         {label}
                       </div>
                       <div className="text-xs text-orange-600/90 dark:text-orange-200/85 truncate w-full tabular-nums">
-                        {formatCompactTokens(tok)}
+                        {formatCompact(tok)}
                       </div>
                     </div>
                   </button>
@@ -1122,8 +1160,8 @@ const ContextTreemapView: React.FC<ContextTreemapViewProps> = React.memo(
                     </div>
                     <div className="text-xs text-indigo-600/90 dark:text-indigo-200/85 truncate w-full tabular-nums">
                       {isMultiCol
-                        ? formatCompactTokens(turnItem.tokens)
-                        : `${formatCompactTokens(turnItem.tokens)} · 会话内容`}
+                        ? formatCompact(turnItem.tokens)
+                        : `${formatCompact(turnItem.tokens)} · 会话内容`}
                     </div>
                   </div>
                 </button>
@@ -1165,7 +1203,7 @@ const ContextTreemapView: React.FC<ContextTreemapViewProps> = React.memo(
                         {turnItem.title}
                       </div>
                       <div className="text-xs text-indigo-600/90 dark:text-indigo-200/85 truncate w-full tabular-nums">
-                        {formatCompactTokens(turnItem.tokens)}
+                        {formatCompact(turnItem.tokens)}
                       </div>
                     </div>
                   </button>
@@ -1206,7 +1244,7 @@ const ContextTreemapView: React.FC<ContextTreemapViewProps> = React.memo(
                             {label}
                           </div>
                           <div className="text-xs text-indigo-600/90 dark:text-indigo-200/85 truncate w-full tabular-nums">
-                            {formatCompactTokens(tok)}
+                            {formatCompact(tok)}
                           </div>
                         </div>
                       </button>
@@ -1246,7 +1284,7 @@ const ContextTreemapView: React.FC<ContextTreemapViewProps> = React.memo(
             'bg-zinc-400',
             true
           )}
-          <span className="sr-only">{`剩余空间 ${formatCompactTokens(remainingTokens)}`}</span>
+          <span className="sr-only">{`剩余空间 ${formatCompact(remainingTokens)}`}</span>
         </button>
       </div>
     )
@@ -1256,14 +1294,13 @@ const ContextTreemapView: React.FC<ContextTreemapViewProps> = React.memo(
 export const OverviewBoard: React.FC<OverviewBoardProps> = React.memo(({
   overview,
   accounts,
-  apiKeys = [],
   auditLogs,
   selectedAuditLog,
   onSelectAuditLogId,
-  policy,
-  skills,
   gatewayHostPort,
-  clientSettings,
+  loading,
+  loadError,
+  syncError,
   fleetUsageSummary,
   onOpenModal,
   onNavigateTab,
@@ -1279,7 +1316,6 @@ export const OverviewBoard: React.FC<OverviewBoardProps> = React.memo(({
   const [requestMetricMode, setRequestMetricMode] = useState<'full' | 'compact'>('full')
   const [selectedAccountOrKeyFilter, setSelectedAccountOrKeyFilter] = useState<string>('')
 
-  const overviewDefaultModel = overview?.models?.[0]?.modelId
   const overviewTotalReqs = overview?.stats.total_requests
   const overviewSuccessReqs = overview?.stats.success_requests
   const fleetTotalReqs = fleetUsageSummary.totalRequests
@@ -1289,121 +1325,50 @@ export const OverviewBoard: React.FC<OverviewBoardProps> = React.memo(({
   const reqTelemetry = useMemo(() => {
     const enabledAccounts = accounts.filter((a) => a.account.enabled)
     const activeLog = selectedAuditLog || auditLogs[0]
+    const sessionLogs = resolveSessionLogs(activeLog, auditLogs)
 
-    // Find logs belonging to the same session (or recent logs on the same account/protocol)
-    const sessionLogs = (() => {
-      if (!activeLog) return []
-      if (activeLog.session_id) {
-        const matched = auditLogs.filter((l) => l.session_id === activeLog.session_id)
-        if (matched.length > 0) return matched
-      }
-      return auditLogs
-    })()
+    const usage = computeRequestContextUsage(activeLog)
+    const parsedSnap = usage.parsedSnap
 
-    // Parse context_json if recorded by backend (cached by request_id)
-    const parsedSnap = parseAuditContextSnapshot(activeLog)
+    // Attribution comes only from what the gateway recorded for this request, never from
+    // the live key/policy configuration, which may have changed since.
+    const effectivePromptMode = parsedSnap?.prompt_mode || ''
+    const effectiveSessionMode = parsedSnap?.session_mode || ''
+    const effectiveDisableBuiltin = parsedSnap?.disable_builtin_tools
+    const effectiveKeyName = parsedSnap?.key_name || ''
 
-    // Effective per-request client & key policy:
-    // Prioritize live Client Settings / selected API Key so any adjustment in "客户端 API Key" or
-    // "远程客户端接入" is immediately reflected in the Context Window without stale snapshot drift.
-    const selectedKey = clientSettings?.selectedKey
-    const effectivePromptMode =
-      selectedKey?.prompt_mode ||
-      policy.mode ||
-      parsedSnap?.prompt_mode ||
-      'native_hybrid'
-    const effectiveSessionMode =
-      selectedKey?.session_mode ||
-      policy.session_mode ||
-      parsedSnap?.session_mode ||
-      'yolo'
-    const effectiveDisableBuiltin =
-      selectedKey?.disable_builtin_tools !== undefined
-        ? selectedKey.disable_builtin_tools
-        : policy.disable_builtin_tools !== undefined
-          ? Boolean(policy.disable_builtin_tools)
-          : parsedSnap?.disable_builtin_tools !== undefined
-            ? parsedSnap.disable_builtin_tools
-            : true
-    const effectivePrependPrompt =
-      selectedKey?.global_prepend_prompt !== undefined
-        ? selectedKey.global_prepend_prompt
-        : policy.global_prepend_prompt || ''
-    const effectiveKeyName = selectedKey?.name || parsedSnap?.key_name || ''
-
-    const explicitBindAcc =
-      clientSettings?.accountBind && clientSettings.accountBind !== 'auto'
-        ? clientSettings.accountBind
-        : selectedKey?.bound_account_id && selectedKey.bound_account_id !== 'auto'
-          ? selectedKey.bound_account_id
-          : ''
-
-    const preferredBindAccId = explicitBindAcc || activeLog?.account_id
-
-    const routedSnap =
-      accounts.find((a) => a.account.id === preferredBindAccId) ||
-      accounts.find((a) => a.account.id === activeLog?.account_id) ||
-      enabledAccounts[0] ||
-      accounts[0]
-
-    const routedId = routedSnap?.account.id || activeLog?.account_id || 'default'
+    const routedSnap = activeLog?.account_id
+      ? accounts.find((a) => a.account.id === activeLog.account_id)
+      : undefined
+    const routedId = activeLog?.account_id || ''
     const routedName =
       routedSnap?.account.name && routedSnap.account.name !== 'Default Host Account'
         ? routedSnap.account.name
-        : routedId
-    const routedInitial = (routedName.trim()[0] || 'S').toUpperCase()
+        : routedId || '—'
+    const routedInitial = routedId ? (routedName.trim()[0] || '?').toUpperCase() : '—'
 
     const rawSnapClient =
       parsedSnap?.client_label && parsedSnap.client_label !== 'Codex'
         ? parsedSnap.client_label
         : ''
     const clientLabel =
-      rawSnapClient ||
-      formatClientShortName(
-        activeLog?.protocol,
-        clientSettings?.protocolTab,
-        effectiveKeyName,
-        activeLog
-      )
-    const requestedModel =
-      activeLog?.model_name ||
-      clientSettings?.effectiveModel ||
-      overviewDefaultModel ||
-      'gemini-4-argon'
+      rawSnapClient || formatClientShortName(activeLog?.protocol, effectiveKeyName, activeLog)
+    const requestedModel = activeLog?.model_name || ''
     const actualModel = requestedModel.includes('/')
       ? requestedModel.split('/').pop() || requestedModel
       : requestedModel
-    const thinkingLevel =
-      parsedSnap?.thinking_level || activeLog?.thinking_level || 'high'
+    const thinkingLevel = parsedSnap?.thinking_level || activeLog?.thinking_level || ''
 
-    //Per-request token metrics (NEVER cumulative across all requests!)
-    const reqInputTokens =
-      parsedSnap?.input_tokens && parsedSnap.input_tokens > 0
-        ? parsedSnap.input_tokens
-        : activeLog?.prompt_tokens || 0
-    const reqOutputTokens = resolvePureOutputTokens(activeLog, parsedSnap)
-    const reqTotalTokens = Math.max(
-      reqInputTokens + reqOutputTokens,
-      activeLog?.total_tokens || 0
-    )
-
-    // Context window capacity for this request's model (or client-configured override)
-    const baseModelWindow = resolveEffectiveContextCapacity(requestedModel, parsedSnap)
-    const usedContextTokens = reqInputTokens > 0 ? reqInputTokens : reqTotalTokens
-    const contextCapacity =
-      usedContextTokens > baseModelWindow
-        ? Math.ceil((usedContextTokens * 1.15) / 10_000) * 10_000
-        : baseModelWindow
-
-    const usedPct =
-      contextCapacity > 0
-        ? Math.min(100, Math.round((usedContextTokens / contextCapacity) * 100))
-        : 0
-    const remainingTokens = Math.max(0, contextCapacity - usedContextTokens)
-
-    const perTurnDelta = Math.max(800, reqOutputTokens + Math.round(reqInputTokens * 0.06))
-    const estRemainingReqs =
-      usedContextTokens > 0 ? Math.max(1, Math.round(remainingTokens / perTurnDelta)) : 32
+    const {
+      inputTokens: reqInputTokens,
+      outputTokens: reqOutputTokens,
+      totalTokens: reqTotalTokens,
+      contextCapacity,
+      usedContextTokens,
+      usedPct,
+      remainingTokens,
+      estRemainingReqs,
+    } = usage
 
     // Prompt cache metrics strictly from recorded telemetry
     const rawCachedTokens =
@@ -1420,27 +1385,26 @@ export const OverviewBoard: React.FC<OverviewBoardProps> = React.memo(({
         : 0
 
     // Per-request latency breakdown from real measured timestamps (prep_ms, ttfb_ms, latency_ms)
-    const latencyMs = Math.max(1, activeLog?.latency_ms || 0)
-    const recordedPrepMs = parsedSnap?.prep_ms && parsedSnap.prep_ms > 0 ? parsedSnap.prep_ms : 0
-    const recordedTtfb = parsedSnap?.ttfb_ms && parsedSnap.ttfb_ms > 0 ? parsedSnap.ttfb_ms : 0
-    const gwMs = activeLog
-      ? recordedPrepMs > 0
-        ? Math.min(latencyMs, recordedPrepMs)
-        : Math.min(latencyMs, Math.max(1, Math.round(latencyMs * 0.01)))
-      : 0
-    const firstWordMs = activeLog
-      ? recordedTtfb > 0
-        ? Math.min(latencyMs, Math.max(gwMs, recordedTtfb))
-        : latencyMs
-      : 0
-    const netMs = activeLog
-      ? routedSnap?.account.network_mode === 'proxy'
-        ? Math.min(Math.max(0, firstWordMs - gwMs), Math.max(5, Math.round(firstWordMs * 0.06)))
-        : Math.min(Math.max(0, firstWordMs - gwMs), 2)
-      : 0
-    const providerTtfbMs = activeLog ? Math.max(0, firstWordMs - gwMs - netMs) : 0
-    const streamMs = activeLog ? Math.max(0, latencyMs - firstWordMs) : 0
-    const providerMs = activeLog ? providerTtfbMs + streamMs : 0
+    const latencyMs: number | null =
+      activeLog?.latency_ms && activeLog.latency_ms > 0 ? activeLog.latency_ms : null
+    const gwMs: number | null =
+      parsedSnap?.prep_ms && parsedSnap.prep_ms > 0
+        ? latencyMs !== null
+          ? Math.min(latencyMs, parsedSnap.prep_ms)
+          : parsedSnap.prep_ms
+        : null
+    const firstWordMs: number | null =
+      parsedSnap?.ttfb_ms && parsedSnap.ttfb_ms > 0
+        ? latencyMs !== null
+          ? Math.min(latencyMs, parsedSnap.ttfb_ms)
+          : parsedSnap.ttfb_ms
+        : null
+    const providerTtfbMs: number | null =
+      firstWordMs !== null && gwMs !== null ? Math.max(0, firstWordMs - gwMs) : null
+    const streamMs: number | null =
+      latencyMs !== null && firstWordMs !== null ? Math.max(0, latencyMs - firstWordMs) : null
+    const providerMs: number | null =
+      latencyMs !== null && gwMs !== null ? Math.max(0, latencyMs - gwMs) : null
 
     const totalReqs = overviewTotalReqs ?? fleetTotalReqs
     const successReqs =
@@ -1476,7 +1440,7 @@ export const OverviewBoard: React.FC<OverviewBoardProps> = React.memo(({
         const cat = validCategories.has(it.category as Exclude<RequestContextCategory, 'all'>)
           ? (it.category as Exclude<RequestContextCategory, 'all'>)
           : 'conversation'
-        if (cat === 'tools' && effectiveDisableBuiltin && it.title.includes('内置工具')) {
+        if (cat === 'tools' && effectiveDisableBuiltin === true && it.title.includes('内置工具')) {
           return
         }
         const style = CATEGORY_STYLE[cat]
@@ -1541,10 +1505,9 @@ export const OverviewBoard: React.FC<OverviewBoardProps> = React.memo(({
       }
     } else if (activeLog && usedContextTokens > 0) {
       const rawSysTok = estimateTextTokens(activeLog.system_prompt)
-      const prependTok = estimateTextTokens(effectivePrependPrompt)
       const rawPromptTok = estimateTextTokens(activeLog.prompt_text)
 
-      if (rawSysTok > 0 || prependTok > 0) {
+      if (rawSysTok > 0) {
         entries.push({
           id: 'sys-agent',
           category: 'system_prompt',
@@ -1554,9 +1517,14 @@ export const OverviewBoard: React.FC<OverviewBoardProps> = React.memo(({
               ? '客户端系统提示词'
               : effectivePromptMode === 'prepend_global'
                 ? '全局前置与客户端提示词'
-                : 'agent 提示词',
-          subtitle: `策略 ${effectivePromptMode}${effectiveKeyName ? ` · Key:${effectiveKeyName}` : ''}`,
-          tokens: Math.max(1, rawSysTok + prependTok),
+                : '系统提示词',
+          subtitle: [
+            effectivePromptMode ? `策略 ${effectivePromptMode}` : '',
+            effectiveKeyName ? `Key:${effectiveKeyName}` : '',
+          ]
+            .filter(Boolean)
+            .join(' · '),
+          tokens: Math.max(1, rawSysTok),
           dotClass: CATEGORY_STYLE.system_prompt.dotClass,
           barClass: CATEGORY_STYLE.system_prompt.barClass,
         })
@@ -1569,7 +1537,7 @@ export const OverviewBoard: React.FC<OverviewBoardProps> = React.memo(({
           tag: 'turn',
           title: '当前请求上下文',
           subtitle: extractPromptGoalSummary(activeLog, null, sessionLogs),
-          tokens: Math.max(1, usedContextTokens - (rawSysTok + prependTok)),
+          tokens: Math.max(1, usedContextTokens - rawSysTok),
           dotClass: CATEGORY_STYLE.conversation.dotClass,
           barClass: CATEGORY_STYLE.conversation.barClass,
         })
@@ -1664,7 +1632,6 @@ export const OverviewBoard: React.FC<OverviewBoardProps> = React.memo(({
       effectivePromptMode,
       effectiveSessionMode,
       effectiveDisableBuiltin,
-      effectivePrependPrompt,
       effectiveKeyName,
       reqInputTokens,
       reqOutputTokens,
@@ -1679,7 +1646,6 @@ export const OverviewBoard: React.FC<OverviewBoardProps> = React.memo(({
       cacheHitPct,
       latencyMs,
       gwMs,
-      netMs,
       providerMs,
       providerTtfbMs,
       streamMs,
@@ -1701,21 +1667,11 @@ export const OverviewBoard: React.FC<OverviewBoardProps> = React.memo(({
   }, [
     accounts,
     auditLogs,
-    clientSettings?.accountBind,
-    clientSettings?.effectiveModel,
-    clientSettings?.protocolTab,
-    clientSettings?.selectedKey,
     fleetErrorReqs,
     fleetTotalReqs,
-    overviewDefaultModel,
     overviewSuccessReqs,
     overviewTotalReqs,
-    policy.disable_builtin_tools,
-    policy.global_prepend_prompt,
-    policy.mode,
-    policy.session_mode,
     selectedAuditLog,
-    skills.length,
   ])
 
   const filteredEntries = useMemo(() => {
@@ -1853,12 +1809,7 @@ export const OverviewBoard: React.FC<OverviewBoardProps> = React.memo(({
           Boolean(rowSid) &&
           (`sess:${rowSid}` === selectedAccountOrKeyFilter ||
             `sess:${log.session_id}` === selectedAccountOrKeyFilter)
-        const protoClient = formatClientShortName(
-          log.protocol,
-          clientSettings?.protocolTab,
-          snap?.key_name,
-          log
-        )
+        const protoClient = formatClientShortName(log.protocol, snap?.key_name, log)
         const clientMatch = `client:${protoClient}` === selectedAccountOrKeyFilter
         if (!keyMatch && !accMatch && !pidMatch && !sessMatch && !clientMatch) return false
       }
@@ -1999,7 +1950,7 @@ export const OverviewBoard: React.FC<OverviewBoardProps> = React.memo(({
             clientSessionId: clientSid,
             shortId: formatShortSessionId(clientSid),
             sessionTitle: '',
-            modelName: reqTelemetry.actualModel || 'gemini-4-argon',
+            modelName: '',
             attempts: 1,
             successes: 1,
             failures: 0,
@@ -2042,7 +1993,7 @@ export const OverviewBoard: React.FC<OverviewBoardProps> = React.memo(({
       const sessionKey = acpSid || clientSid
       if (!sessionKey) continue
 
-      const rawModel = log.model_name || reqTelemetry.actualModel || 'gemini-4-argon'
+      const rawModel = log.model_name || ''
       const cleanModel = rawModel.includes('/')
         ? rawModel.split('/').pop() || rawModel
         : rawModel
@@ -2114,16 +2065,14 @@ export const OverviewBoard: React.FC<OverviewBoardProps> = React.memo(({
   }, [
     accounts,
     auditLogs,
-    clientSettings?.protocolTab,
     overview?.workers,
-    reqTelemetry.actualModel,
     requestDateFilter,
     requestGroupMode,
     requestPurposeFilter,
     selectedAccountOrKeyFilter,
   ])
 
-  const cycleReplayOrNextRequest = () => {
+  const selectNextRequest = () => {
     if (auditLogs.length <= 1) {
       onRefresh()
       return
@@ -2138,9 +2087,39 @@ export const OverviewBoard: React.FC<OverviewBoardProps> = React.memo(({
       reqTelemetry.clientSessionId ||
       reqTelemetry.activeLog?.session_id ||
       reqTelemetry.activeLog?.request_id ||
-      '000000000000'
-    return formatShortSessionId(raw)
+      ''
+    return raw ? formatShortSessionId(raw) : '—'
   }, [reqTelemetry.activeLog, reqTelemetry.clientSessionId])
+
+  if (!overview && auditLogs.length === 0) {
+    const blockingError = loadError || syncError
+    if (blockingError && !loading) {
+      return (
+        <Frame>
+          <FramePanel className="p-5">
+            <InlineError title="概览加载失败" message={blockingError} onRetry={onRefresh} />
+          </FramePanel>
+        </Frame>
+      )
+    }
+    return (
+      <Frame>
+        <FramePanel className="p-5 flex flex-col gap-5">
+          <div className="flex flex-col gap-2">
+            <Skeleton className="h-5 w-48" />
+            <Skeleton className="h-4 w-80" />
+          </div>
+          <div className="flex flex-col gap-3 lg:flex-row">
+            <Skeleton className="h-20 lg:w-40" />
+            <Skeleton className="h-20 lg:w-40" />
+            <Skeleton className="h-20 flex-1" />
+          </div>
+          <Skeleton className="h-48 w-full" />
+          <Skeleton className="h-64 w-full" />
+        </FramePanel>
+      </Frame>
+    )
+  }
 
   return (
     <Frame>
@@ -2149,13 +2128,16 @@ export const OverviewBoard: React.FC<OverviewBoardProps> = React.memo(({
         <div className="flex flex-col gap-1">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div className="flex items-center gap-2">
-              <span className="text-base font-bold tracking-tight text-foreground">
+              <span className="text-base font-bold tracking-tight text-foreground" translate="no">
                 {reqTelemetry.routedName}
               </span>
               <span className="text-sm text-muted-foreground">
                 {`· 启用 ${reqTelemetry.enabledAccounts.length} 个`}
               </span>
               {(() => {
+                if (syncError) {
+                  return <Badge variant="destructive-light">同步中断</Badge>
+                }
                 const busyCount = accounts.reduce((sum, a) => sum + (a.busy_workers || 0), 0)
                 return busyCount > 0 ? (
                   <Badge variant="info-light">
@@ -2196,10 +2178,10 @@ export const OverviewBoard: React.FC<OverviewBoardProps> = React.memo(({
                 <span className="absolute inline-flex h-full w-full rounded-full bg-indigo-400 opacity-75 animate-ping motion-reduce:animate-none" />
                 <span className="relative inline-flex size-1.5 rounded-full bg-indigo-500" />
               </span>
-              <span>{reqTelemetry.clientLabel}</span>
+              <span translate="no">{reqTelemetry.clientLabel}</span>
             </div>
-            <div className="mt-0.5 font-mono text-xs text-muted-foreground truncate max-w-[144px]">
-              {reqTelemetry.requestedModel}
+            <div className="mt-0.5 font-mono text-xs text-muted-foreground truncate max-w-[144px]" translate="no">
+              {reqTelemetry.requestedModel || '—'}
             </div>
           </div>
 
@@ -2234,11 +2216,11 @@ export const OverviewBoard: React.FC<OverviewBoardProps> = React.memo(({
               <span className="flex size-5 shrink-0 items-center justify-center rounded bg-slate-900 text-xs font-bold text-sky-400 dark:bg-sky-500/20 dark:text-sky-300">
                 {reqTelemetry.routedInitial}
               </span>
-              <span className="text-xs font-bold text-foreground truncate">
+              <span className="text-xs font-bold text-foreground truncate" translate="no">
                 {reqTelemetry.routedName}
               </span>
-              <span className="rounded-md bg-muted px-2 py-0.5 font-mono text-xs text-muted-foreground truncate">
-                {reqTelemetry.actualModel}
+              <span className="rounded-md bg-muted px-2 py-0.5 font-mono text-xs text-muted-foreground truncate" translate="no">
+                {reqTelemetry.actualModel || '—'}
               </span>
             </div>
 
@@ -2246,7 +2228,10 @@ export const OverviewBoard: React.FC<OverviewBoardProps> = React.memo(({
               {reqTelemetry.activeLog ? (
                 <>
                   <span className="truncate">
-                    {`回答了这个请求 · ${reqTelemetry.sessionTitle || reqTelemetry.promptSummary}`}
+                    <span>回答了这个请求 · </span>
+                    <span translate="no">
+                      {reqTelemetry.sessionTitle || reqTelemetry.promptSummary}
+                    </span>
                   </span>
                   <span
                     title={`会话 ID: ${reqTelemetry.clientSessionId || sessionDisplayId}`}
@@ -2273,7 +2258,7 @@ export const OverviewBoard: React.FC<OverviewBoardProps> = React.memo(({
           <div className="flex items-center gap-8 tabular-nums">
             <div>
               <div className="text-lg font-bold tracking-tight text-foreground">
-                {formatCompactTokens(reqTelemetry.totalReqs)}
+                {formatCompact(reqTelemetry.totalReqs)}
               </div>
               <div className="text-xs text-muted-foreground">请求</div>
             </div>
@@ -2317,10 +2302,10 @@ export const OverviewBoard: React.FC<OverviewBoardProps> = React.memo(({
               </button>
               <button
                 type="button"
-                onClick={cycleReplayOrNextRequest}
+                onClick={selectNextRequest}
                 className="hover:text-foreground transition-colors"
               >
-                重放
+                下一个请求
               </button>
             </div>
           </div>
@@ -2330,12 +2315,13 @@ export const OverviewBoard: React.FC<OverviewBoardProps> = React.memo(({
             <li className="flex items-center gap-2">
               <span className="size-1.5 shrink-0 rounded-full bg-muted-foreground/70" />
               <span>
-                {`${reqTelemetry.clientLabel} 请求 `}
-                <span className="font-mono">{reqTelemetry.requestedModel}</span>
+                <span translate="no">{reqTelemetry.clientLabel}</span>
+                {' 请求模型 '}
+                <span className="font-mono" translate="no">{reqTelemetry.requestedModel || '—'}</span>
                 {': 由 '}
-                <strong className="font-semibold">{reqTelemetry.routedName}</strong>
+                <strong className="font-semibold" translate="no">{reqTelemetry.routedName}</strong>
                 {' 提供，向厂商请求的模型是 '}
-                <span className="font-mono">{reqTelemetry.actualModel}</span>
+                <span className="font-mono" translate="no">{reqTelemetry.actualModel || '—'}</span>
               </span>
             </li>
 
@@ -2362,13 +2348,16 @@ export const OverviewBoard: React.FC<OverviewBoardProps> = React.memo(({
                   {reqTelemetry.routedInitial}
                 </span>
                 <span>
-                  {`${reqTelemetry.routedName} (${reqTelemetry.actualModel}) 以 `}
-                  <span className="font-mono">{reqTelemetry.thinkingLevel}</span>
+                  <span translate="no">
+                    {`${reqTelemetry.routedName} (${reqTelemetry.actualModel || '—'})`}
+                  </span>
+                  {' 以 '}
+                  <span className="font-mono" translate="no">{reqTelemetry.thinkingLevel || '—'}</span>
                   {' 推理强度 用 '}
                   <strong className="font-semibold">
                     {formatDurationCn(reqTelemetry.latencyMs)}
                   </strong>
-                  {` 完成回答 · ${formatCompactTokens(reqTelemetry.reqTotalTokens)} token · ${formatDurationCn(reqTelemetry.firstWordMs)} 后出首字 · 请求缓存命中率 ${reqTelemetry.cacheHitPct}%。`}
+                  {` 完成回答 · ${formatCompact(reqTelemetry.reqTotalTokens)} token · ${formatDurationCn(reqTelemetry.firstWordMs)} 后出首字 · 请求缓存命中率 ${reqTelemetry.cacheHitPct}%。`}
                 </span>
               </span>
             </li>
@@ -2382,11 +2371,7 @@ export const OverviewBoard: React.FC<OverviewBoardProps> = React.memo(({
                 </span>
                 <span className="inline-flex items-center gap-1.5">
                   <span className="size-2 rounded-xs bg-indigo-500" />
-                  <span>{`网关 ${reqTelemetry.gwMs} 毫秒`}</span>
-                </span>
-                <span className="inline-flex items-center gap-1.5">
-                  <span className="size-2 rounded-xs bg-amber-600" />
-                  <span>{`网络 ${formatDurationCn(reqTelemetry.netMs)}`}</span>
+                  <span>{`网关 ${formatDurationCn(reqTelemetry.gwMs)}`}</span>
                 </span>
                 <span className="inline-flex items-center gap-1.5">
                   <span className="size-2 rounded-xs bg-foreground/75" />
@@ -2396,48 +2381,39 @@ export const OverviewBoard: React.FC<OverviewBoardProps> = React.memo(({
 
               {/* Segmented Horizontal Timing Bar */}
               <div className="ps-3.5 flex flex-col gap-1.5">
-                <div className="flex h-1.5 w-full max-w-xl overflow-hidden rounded-full bg-muted gap-0.5">
-                  <div
-                    className="h-full bg-indigo-500"
-                    style={{
-                      width: `${Math.max(
-                        3,
-                        Math.round((reqTelemetry.gwMs / Math.max(1, reqTelemetry.latencyMs)) * 100)
-                      )}%`,
-                    }}
-                  />
-                  <div
-                    className="h-full bg-amber-600"
-                    style={{
-                      width: `${Math.max(
-                        8,
-                        Math.round((reqTelemetry.netMs / Math.max(1, reqTelemetry.latencyMs)) * 100)
-                      )}%`,
-                    }}
-                  />
-                  <div
-                    className="h-full bg-foreground/75"
-                    style={{
-                      width: `${Math.max(
-                        15,
-                        Math.round(
-                          (reqTelemetry.providerTtfbMs / Math.max(1, reqTelemetry.latencyMs)) * 100
-                        )
-                      )}%`,
-                    }}
-                  />
-                  <div className="h-full flex-1 bg-foreground/45" />
-                </div>
+                {(() => {
+                  const total = reqTelemetry.latencyMs
+                  if (total === null) return null
+                  const segments: { key: string; cls: string; ms: number }[] = []
+                  if (reqTelemetry.gwMs !== null) {
+                    segments.push({ key: 'gw', cls: 'bg-indigo-500', ms: reqTelemetry.gwMs })
+                  }
+                  if (reqTelemetry.providerTtfbMs !== null) {
+                    segments.push({ key: 'ttfb', cls: 'bg-foreground/75', ms: reqTelemetry.providerTtfbMs })
+                  } else if (reqTelemetry.gwMs === null && reqTelemetry.firstWordMs !== null) {
+                    segments.push({ key: 'ttfb', cls: 'bg-foreground/75', ms: reqTelemetry.firstWordMs })
+                  }
+                  if (reqTelemetry.streamMs !== null) {
+                    segments.push({ key: 'stream', cls: 'bg-foreground/45', ms: reqTelemetry.streamMs })
+                  }
+                  return (
+                    <div className="flex h-1.5 w-full max-w-xl overflow-hidden rounded-full bg-muted gap-0.5">
+                      {segments.map((seg) => (
+                        <div
+                          key={seg.key}
+                          className={`h-full ${seg.cls}`}
+                          style={{ width: `${Math.min(100, (seg.ms / total) * 100)}%` }}
+                        />
+                      ))}
+                    </div>
+                  )
+                })()}
 
                 {/* 2-Row Detailed Sub-legend */}
                 <div className="flex flex-wrap items-center gap-4 text-xs text-muted-foreground tabular-nums">
                   <span className="inline-flex items-center gap-1.5">
                     <span className="size-1.5 rounded-xs bg-indigo-500" />
-                    <span>{`网关内耗时 ${reqTelemetry.gwMs} 毫秒`}</span>
-                  </span>
-                  <span className="inline-flex items-center gap-1.5">
-                    <span className="size-1.5 rounded-xs bg-amber-600" />
-                    <span>{`发送请求 ${formatDurationCn(reqTelemetry.netMs)}`}</span>
+                    <span>{`网关内耗时 ${formatDurationCn(reqTelemetry.gwMs)}`}</span>
                   </span>
                   <span className="inline-flex items-center gap-1.5">
                     <span className="size-1.5 rounded-xs bg-foreground/75" />
@@ -2481,12 +2457,12 @@ export const OverviewBoard: React.FC<OverviewBoardProps> = React.memo(({
                 <span className="inline-flex size-4 items-center justify-center rounded-full bg-indigo-500/15 text-indigo-600 dark:text-indigo-300">
                   <Terminal className="size-2.5" />
                 </span>
-                <span>{reqTelemetry.clientLabel}</span>
+                <span translate="no">{reqTelemetry.clientLabel}</span>
               </span>
               {reqTelemetry.effectiveKeyName && (
                 <>
                   <span>›</span>
-                  <span className="font-mono text-muted-foreground">
+                  <span className="font-mono text-muted-foreground" translate="no">
                     Key:{reqTelemetry.effectiveKeyName}
                   </span>
                 </>
@@ -2494,17 +2470,25 @@ export const OverviewBoard: React.FC<OverviewBoardProps> = React.memo(({
               <span>›</span>
               <span className="inline-flex items-center gap-1 font-mono text-muted-foreground">
                 <Sparkles className="size-3 text-muted-foreground" />
-                <span>{reqTelemetry.requestedModel}</span>
+                <span translate="no">{reqTelemetry.requestedModel || '—'}</span>
               </span>
-              <Badge variant="outline">
-                {`${
-                  reqTelemetry.effectivePromptMode === 'pure_passthrough'
-                    ? '纯透传'
-                    : reqTelemetry.effectivePromptMode === 'prepend_global'
-                      ? '全局前置'
-                      : '原生混合'
-                } · ${reqTelemetry.effectiveDisableBuiltin ? '仅客户端工具' : '含内置工具'}`}
-              </Badge>
+              {(reqTelemetry.effectivePromptMode ||
+                reqTelemetry.effectiveDisableBuiltin !== undefined) && (
+                <Badge variant="outline">
+                  {[
+                    reqTelemetry.effectivePromptMode
+                      ? formatPromptModeShort(reqTelemetry.effectivePromptMode)
+                      : '',
+                    reqTelemetry.effectiveDisableBuiltin === undefined
+                      ? ''
+                      : reqTelemetry.effectiveDisableBuiltin
+                        ? '仅客户端工具'
+                        : '含内置工具',
+                  ]
+                    .filter(Boolean)
+                    .join(' · ')}
+                </Badge>
+              )}
               <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-500/15 px-2.5 py-0.5 text-xs font-medium text-emerald-700 dark:text-emerald-300">
                 <span className="size-1.5 rounded-full bg-emerald-500" />
                 <span>已计数</span>
@@ -2538,14 +2522,16 @@ export const OverviewBoard: React.FC<OverviewBoardProps> = React.memo(({
                   </div>
                   <div className="flex items-baseline gap-1.5 tabular-nums">
                     <span className="text-3xl font-bold tracking-tight text-foreground">
-                      {formatCompactTokens(reqTelemetry.usedContextTokens)}
+                      {formatCompact(reqTelemetry.usedContextTokens)}
                     </span>
                     <span className="text-sm text-muted-foreground">
-                      / {formatCompactTokens(reqTelemetry.contextCapacity)} token
+                      / {formatCompact(reqTelemetry.contextCapacity)} token
                     </span>
                   </div>
                   <div className="text-xs text-muted-foreground tabular-nums">
-                    {`已用 ${reqTelemetry.usedPct}% · 约还能容纳 ${reqTelemetry.estRemainingReqs} 个请求`}
+                    {reqTelemetry.estRemainingReqs === null
+                      ? `已用 ${reqTelemetry.usedPct}%`
+                      : `已用 ${reqTelemetry.usedPct}% · 约还能容纳 ${reqTelemetry.estRemainingReqs} 个请求`}
                   </div>
                 </div>
 
@@ -2561,11 +2547,11 @@ export const OverviewBoard: React.FC<OverviewBoardProps> = React.memo(({
                   <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
                     <div
                       className="h-full rounded-full bg-emerald-600 dark:bg-emerald-500"
-                      style={{ width: `${Math.max(2, reqTelemetry.cacheHitPct)}%` }}
+                      style={{ width: `${reqTelemetry.cacheHitPct}%` }}
                     />
                   </div>
                   <div className="text-xs text-muted-foreground tabular-nums">
-                    {`${formatCompactTokens(reqTelemetry.cachedTokens)} 来自缓存 · ${formatCompactTokens(reqTelemetry.newInputTokens)} 新增`}
+                    {`${formatCompact(reqTelemetry.cachedTokens)} 来自缓存 · ${formatCompact(reqTelemetry.newInputTokens)} 新增`}
                   </div>
                 </div>
               </div>
@@ -2638,36 +2624,36 @@ export const OverviewBoard: React.FC<OverviewBoardProps> = React.memo(({
                   <span className="inline-flex items-center gap-1.5">
                     <span className="size-2 rounded-xs bg-violet-500" />
                     <span>
-                      {`系统提示词 ${formatCompactTokens(reqTelemetry.categoryTotals.system_prompt)}`}
+                      {`系统提示词 ${formatCompact(reqTelemetry.categoryTotals.system_prompt)}`}
                     </span>
                   </span>
                   <span className="inline-flex items-center gap-1.5">
                     <span className="size-2 rounded-xs bg-sky-500" />
-                    <span>{`工具 ${formatCompactTokens(reqTelemetry.categoryTotals.tools)}`}</span>
+                    <span>{`工具 ${formatCompact(reqTelemetry.categoryTotals.tools)}`}</span>
                   </span>
                   <span className="inline-flex items-center gap-1.5">
                     <span className="size-2 rounded-xs bg-slate-500" />
-                    <span>{`技能 ${formatCompactTokens(reqTelemetry.categoryTotals.skills)}`}</span>
+                    <span>{`技能 ${formatCompact(reqTelemetry.categoryTotals.skills)}`}</span>
                   </span>
                   <span className="inline-flex items-center gap-1.5">
                     <span className="size-2 rounded-xs bg-emerald-500" />
-                    <span>{`文件 ${formatCompactTokens(reqTelemetry.categoryTotals.files)}`}</span>
+                    <span>{`文件 ${formatCompact(reqTelemetry.categoryTotals.files)}`}</span>
                   </span>
                   <span className="inline-flex items-center gap-1.5">
                     <span className="size-2 rounded-xs bg-orange-500" />
                     <span>
-                      {`工具结果 ${formatCompactTokens(reqTelemetry.categoryTotals.tool_results)}`}
+                      {`工具结果 ${formatCompact(reqTelemetry.categoryTotals.tool_results)}`}
                     </span>
                   </span>
                   <span className="inline-flex items-center gap-1.5">
                     <span className="size-2 rounded-xs bg-indigo-500" />
                     <span>
-                      {`会话内容 ${formatCompactTokens(reqTelemetry.categoryTotals.conversation)}`}
+                      {`会话内容 ${formatCompact(reqTelemetry.categoryTotals.conversation)}`}
                     </span>
                   </span>
                   <span className="inline-flex items-center gap-1.5">
                     <span className="size-2 rounded-xs border border-border bg-muted/60" />
-                    <span>{`剩余空间 ${formatCompactTokens(reqTelemetry.remainingTokens)}`}</span>
+                    <span>{`剩余空间 ${formatCompact(reqTelemetry.remainingTokens)}`}</span>
                   </span>
                 </div>
 
@@ -2776,7 +2762,7 @@ export const OverviewBoard: React.FC<OverviewBoardProps> = React.memo(({
                             {item.title}
                           </span>
                           {item.subtitle && (
-                            <span className="text-muted-foreground truncate">
+                            <span className="text-muted-foreground truncate" translate="no">
                               {item.subtitle}
                             </span>
                           )}
@@ -2796,7 +2782,7 @@ export const OverviewBoard: React.FC<OverviewBoardProps> = React.memo(({
                             />
                           </div>
                           <span className="w-12 text-end font-mono font-medium text-foreground">
-                            {formatCompactTokens(item.tokens)}
+                            {formatCompact(item.tokens)}
                           </span>
                         </div>
                       </button>
@@ -2821,11 +2807,12 @@ export const OverviewBoard: React.FC<OverviewBoardProps> = React.memo(({
               <div className="flex flex-col gap-2 border-t border-border/70 pt-3">
                 <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
                   <div className="flex items-center gap-1.5 truncate">
-                    <span>{reqTelemetry.clientLabel}</span>
+                    <span translate="no">{reqTelemetry.clientLabel}</span>
                     <span>›</span>
                     <span
                       title={reqTelemetry.sessionTitle || reqTelemetry.promptSummary}
                       className="font-medium text-foreground truncate max-w-md"
+                      translate="no"
                     >
                       {reqTelemetry.sessionTitle || reqTelemetry.promptSummary}
                     </span>
@@ -2834,7 +2821,7 @@ export const OverviewBoard: React.FC<OverviewBoardProps> = React.memo(({
                       reqTelemetry.sessionTitle !== reqTelemetry.promptSummary && (
                         <>
                           <span>·</span>
-                          <span className="truncate max-w-xs text-muted-foreground">
+                          <span className="truncate max-w-xs text-muted-foreground" translate="no">
                             {reqTelemetry.promptSummary}
                           </span>
                         </>
@@ -2886,7 +2873,7 @@ export const OverviewBoard: React.FC<OverviewBoardProps> = React.memo(({
                           strokeWidth={pt.isSelected ? 2 : 0}
                         >
                           <title>
-                            {`请求 #${idx + 1} · ${formatCompactTokens(pt.tokens)} token (点击切换检视该请求)`}
+                            {`请求 #${idx + 1} · ${formatCompact(pt.tokens)} token (点击切换检视该请求)`}
                           </title>
                         </circle>
                       ))}
@@ -2933,7 +2920,7 @@ export const OverviewBoard: React.FC<OverviewBoardProps> = React.memo(({
 
                   <div className="flex flex-wrap items-center gap-3.5 text-xs text-muted-foreground">
                     <span className="tabular-nums">
-                      {`网关保留的最近 ${auditLogs.length} 个请求`}
+                      {`控制台已加载的最近 ${auditLogs.length} 个请求`}
                     </span>
                     <button
                       type="button"
@@ -2965,13 +2952,6 @@ export const OverviewBoard: React.FC<OverviewBoardProps> = React.memo(({
                       <span>{requestMetricMode === 'full' ? '指标 · 完整' : '指标 · 精简'}</span>
                       <ChevronDown className="size-3" />
                     </button>
-                    <button
-                      type="button"
-                      onClick={cycleReplayOrNextRequest}
-                      className="transition-colors hover:text-foreground cursor-pointer"
-                    >
-                      全部重放
-                    </button>
                   </div>
                 </div>
 
@@ -2999,7 +2979,7 @@ export const OverviewBoard: React.FC<OverviewBoardProps> = React.memo(({
                         <button
                           key={b.key}
                           type="button"
-                          title={`共 ${b.count} 次请求 · 峰值上下文 ${formatCompactTokens(b.maxTokens)} token`}
+                          title={`共 ${b.count} 次请求 · 峰值上下文 ${formatCompact(b.maxTokens)} token`}
                           onClick={() => {
                             setRequestDateFilter(b.key)
                             if (b.logs[0]) {
@@ -3126,42 +3106,42 @@ export const OverviewBoard: React.FC<OverviewBoardProps> = React.memo(({
                           rowAccSnap?.account.name &&
                           rowAccSnap.account.name !== 'Default Host Account'
                             ? rowAccSnap.account.name
-                            : log.account_id || reqTelemetry.routedName
-                        const rowAccInitial = (rowAccName.trim()[0] || 'S').toUpperCase()
+                            : log.account_id || '—'
+                        const rowAccInitial = log.account_id
+                          ? (rowAccName.trim()[0] || '?').toUpperCase()
+                          : '—'
 
-                        const rawModel =
-                          log.model_name || reqTelemetry.actualModel || 'gemini-4-argon'
+                        const rawModel = log.model_name || ''
                         const shortModel = rawModel.includes('/')
                           ? rawModel.split('/').pop() || rawModel
                           : rawModel
-                        const clientPrefix =
-                          snap?.key_name ||
-                          clientSettings?.selectedKey?.name ||
-                          log.account_id ||
-                          formatClientShortName(
-                            log.protocol,
-                            clientSettings?.protocolTab
-                          ).toLowerCase()
+                        const clientPrefix = snap?.key_name || log.account_id || ''
                         const displayPath = rawModel.includes('/')
                           ? rawModel
-                          : `${clientPrefix}/${shortModel}`
+                          : clientPrefix
+                            ? `${clientPrefix}/${shortModel || '—'}`
+                            : shortModel || '—'
 
                         const rowThinkingLevel =
-                          snap?.thinking_level || log.thinking_level || 'high'
+                          snap?.thinking_level || log.thinking_level || '—'
                         const rowSessionIdFull =
                           snap?.client_session_id || log.session_id || log.request_id
                         const rowSessionShortId = formatShortSessionId(rowSessionIdFull)
                         const rowSessionTitle = extractSessionTitle(log, snap, rowSessLogs)
                         const rowTurnSummary = extractPromptGoalSummary(log, snap, rowSessLogs)
-                        const rowFirstWordMs =
+                        const rowFirstWordMs: number | null =
                           snap?.ttfb_ms && snap.ttfb_ms > 0
                             ? Math.min(log.latency_ms || snap.ttfb_ms, snap.ttfb_ms)
-                            : log.latency_ms || 0
+                            : null
                         const isUnparkedContinuation =
-                          !log.response_text && Boolean(log.tool_calls_json) && rowFirstWordMs <= 50
-                        const rowStreamSec = isUnparkedContinuation
-                          ? 0
-                          : Math.max(0, ((log.latency_ms || 0) - rowFirstWordMs) / 1000)
+                          !log.response_text &&
+                          Boolean(log.tool_calls_json) &&
+                          rowFirstWordMs !== null &&
+                          rowFirstWordMs <= 50
+                        const rowStreamSec =
+                          isUnparkedContinuation || rowFirstWordMs === null
+                            ? 0
+                            : Math.max(0, ((log.latency_ms || 0) - rowFirstWordMs) / 1000)
                         const tokPerSec =
                           rowOutputTok > 10 && rowStreamSec >= 0.4
                             ? Math.round(rowOutputTok / rowStreamSec)
@@ -3222,7 +3202,7 @@ export const OverviewBoard: React.FC<OverviewBoardProps> = React.memo(({
                                     <span className="inline-flex size-4 shrink-0 items-center justify-center rounded-full bg-indigo-500/15 text-indigo-600 dark:text-indigo-400">
                                       <Terminal className="size-2.5" />
                                     </span>
-                                    <span className="font-mono text-xs font-semibold text-foreground truncate max-w-[165px]">
+                                    <span className="font-mono text-xs font-semibold text-foreground truncate max-w-[165px]" translate="no">
                                       {displayPath}
                                     </span>
 
@@ -3234,17 +3214,17 @@ export const OverviewBoard: React.FC<OverviewBoardProps> = React.memo(({
                                     <span className="inline-flex size-4 shrink-0 items-center justify-center rounded bg-slate-900 text-xs font-bold text-sky-400 dark:bg-sky-500/20 dark:text-sky-300">
                                       {rowAccInitial}
                                     </span>
-                                    <span className="text-xs font-semibold text-foreground shrink-0">
+                                    <span className="text-xs font-semibold text-foreground shrink-0" translate="no">
                                       {rowAccName}
                                     </span>
 
                                     <span className="text-muted-foreground shrink-0">·</span>
-                                    <span className="font-mono text-xs text-foreground truncate max-w-[130px]">
-                                      {shortModel}
+                                    <span className="font-mono text-xs text-foreground truncate max-w-[130px]" translate="no">
+                                      {shortModel || '—'}
                                     </span>
 
                                     <span className="text-muted-foreground shrink-0">·</span>
-                                    <span className="font-mono text-xs text-muted-foreground shrink-0">
+                                    <span className="font-mono text-xs text-muted-foreground shrink-0" translate="no">
                                       {rowThinkingLevel}
                                     </span>
                                   </div>
@@ -3254,6 +3234,7 @@ export const OverviewBoard: React.FC<OverviewBoardProps> = React.memo(({
                                       <span
                                         title={rowSessionTitle || rowTurnSummary}
                                         className="hidden sm:inline-block text-xs text-muted-foreground truncate max-w-[140px]"
+                                        translate="no"
                                       >
                                         {rowSessionTitle || rowTurnSummary}
                                       </span>
@@ -3279,20 +3260,20 @@ export const OverviewBoard: React.FC<OverviewBoardProps> = React.memo(({
                                   <span>{`首字耗时 ${formatDurationCn(rowFirstWordMs)}`}</span>
                                   <span>·</span>
                                   <span>
-                                    {`${formatCompactTokens(rowTotalTok).toLowerCase()} token (${rowUsedPct}%)`}
+                                    {`${formatCompact(rowTotalTok).toLowerCase()} token (${rowUsedPct}%)`}
                                   </span>
                                   <span>·</span>
                                   <span>{`缓存 ${rowCachePct}%`}</span>
                                   {requestGroupMode === 'session' && totalOutputTokens > 0 ? (
                                     <>
                                       <span>·</span>
-                                      <span>{`累计输出 ${formatCompactTokens(totalOutputTokens)}`}</span>
+                                      <span>{`累计输出 ${formatCompact(totalOutputTokens)}`}</span>
                                     </>
                                   ) : (
                                     rowOutputTok > 0 && (
                                       <>
                                         <span>·</span>
-                                        <span>{`输出 ${formatCompactTokens(rowOutputTok)}`}</span>
+                                        <span>{`输出 ${formatCompact(rowOutputTok)}`}</span>
                                       </>
                                     )
                                   )}
@@ -3303,9 +3284,15 @@ export const OverviewBoard: React.FC<OverviewBoardProps> = React.memo(({
                                     </>
                                   )}
                                   <span className="text-muted-foreground/70">·</span>
-                                  <span className="truncate text-muted-foreground/85">
-                                    {isToolTurn ? '工具续接' : rowTurnSummary || '对话'}
-                                  </span>
+                                  {isToolTurn || !rowTurnSummary ? (
+                                    <span className="truncate text-muted-foreground/85">
+                                      {isToolTurn ? '工具续接' : '对话'}
+                                    </span>
+                                  ) : (
+                                    <span className="truncate text-muted-foreground/85" translate="no">
+                                      {rowTurnSummary}
+                                    </span>
+                                  )}
                                 </div>
 
                                 {/* Row 3 (Session Mode Only): Quick Turn Switcher within Selected Session */}
@@ -3367,8 +3354,17 @@ export const OverviewBoard: React.FC<OverviewBoardProps> = React.memo(({
 
                 <div className="rounded-2xl border border-border bg-card divide-y divide-border/70 overflow-hidden max-h-[380px] overflow-y-auto">
                   {workerProcessGroups.length === 0 ? (
-                    <div className="flex flex-col items-center justify-center gap-2 py-10 px-4 text-center">
+                    <div className="flex flex-col items-center justify-center gap-3 py-10 px-4 text-center">
                       <div className="text-xs text-muted-foreground">当前暂无运行中的底层进程</div>
+                      <div className="flex flex-wrap items-center justify-center gap-2">
+                        <Button variant="outline" size="xs" onClick={onRefresh}>
+                          <RefreshCw className="size-3.5" />
+                          刷新
+                        </Button>
+                        <Button variant="outline" size="xs" onClick={() => onNavigateTab('accounts')}>
+                          管理号池与进程
+                        </Button>
+                      </div>
                     </div>
                   ) : (
                     workerProcessGroups.map((wp) => {
@@ -3400,7 +3396,7 @@ export const OverviewBoard: React.FC<OverviewBoardProps> = React.memo(({
                               <span className="rounded bg-muted px-1.5 py-0.5 font-mono text-xs text-muted-foreground truncate">
                                 {wp.workerId}
                               </span>
-                              <span className="text-xs text-muted-foreground truncate">
+                              <span className="text-xs text-muted-foreground truncate" translate="no">
                                 · {wp.accountName}
                               </span>
                             </div>
@@ -3457,12 +3453,19 @@ export const OverviewBoard: React.FC<OverviewBoardProps> = React.memo(({
                                               : 'bg-emerald-500'
                                           }`}
                                         />
-                                        <span
-                                          title={bs.sessionTitle || `会话 #${bs.shortId}`}
-                                          className="text-xs font-semibold text-foreground truncate"
-                                        >
-                                          {bs.sessionTitle || `会话 #${bs.shortId}`}
-                                        </span>
+                                        {bs.sessionTitle ? (
+                                          <span
+                                            title={bs.sessionTitle}
+                                            className="text-xs font-semibold text-foreground truncate"
+                                            translate="no"
+                                          >
+                                            {bs.sessionTitle}
+                                          </span>
+                                        ) : (
+                                          <span className="text-xs font-semibold text-foreground truncate">
+                                            {`会话 #${bs.shortId}`}
+                                          </span>
+                                        )}
                                       </div>
 
                                       <span
@@ -3474,8 +3477,8 @@ export const OverviewBoard: React.FC<OverviewBoardProps> = React.memo(({
                                     </div>
 
                                     <div className="ps-3 flex flex-wrap items-center gap-2 text-xs text-muted-foreground tabular-nums">
-                                      <span className="font-mono text-foreground/85">
-                                        {bs.modelName}
+                                      <span className="font-mono text-foreground/85" translate="no">
+                                        {bs.modelName || '—'}
                                       </span>
                                       <span>·</span>
                                       <span>{`${bs.attempts} 轮请求`}</span>

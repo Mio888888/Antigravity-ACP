@@ -19,7 +19,8 @@
 - **Symptom**: Gateway logs report `ACP binary not found` or `incompatible binary header`.
 - **Solution**:
   - Run `./deploy/deploy.sh --action install-acp --backend cli` (or `.\deploy\deploy.ps1 -Action install-acp -Backend cli` on Windows) to download and verify the native `agy` binary for your OS/Architecture into `./bin/`.
-  - In Docker containers, ensure you are not forcing a macOS/Windows host binary path via `AG_ACP_BINARY_PATH`. Leave `binary_path: "auto"` so the container automatically selects `/usr/local/bin/agy`.
+  - In Docker containers, ensure you are not forcing a macOS/Windows host binary path via `AG_ACP_BINARY_PATH`. Compose defaults it to `auto`, so the container automatically selects `/usr/local/bin/agy`.
+  - If the install stops with a missing or mismatched SHA-512/SHA-256, do not bypass it blindly: a mismatch is always fatal by design. For the Zed package, supply `ZED_ACP_SHA256` / `--zed-sha256` from a trusted source.
 
 #### B. Headless OAuth Sign-In Fails on Remote Linux Server
 - **Symptom**: After clicking **Terminal Login (OAuth)** in the Account Pool tab, the browser redirects to `http://localhost:...` on your local laptop and fails to connect.
@@ -32,6 +33,11 @@
   - Verify `sandbox_policy.session_mode` is set to `"yolo"` or `"sticky_conversation"` in `config/config.yaml`.
   - Ensure `acp_pool.max_workers` is large enough for your concurrent active conversations so active workers are not evicted under load.
   - Check whether the client is sending `X-ACP-Session-ID`, `prompt_cache_key`, `previous_response_id`, or consistent conversation history prefixes.
+
+#### D. Remote Clients Get `401 Unauthorized` on `/v1/*`
+- **Symptom**: Requests work from the gateway host itself but fail from another machine or from the Docker host.
+- **Solution**:
+  - While no API key exists, the northbound API only accepts unauthenticated requests from loopback. Create an `sk-ag-*` key in the **API Keys** tab and send it as `Authorization: Bearer`, `x-api-key`, or `?key=` (`?token=` is no longer accepted).
 
 ### 3. Information to Include When Asking for Help
 
@@ -60,7 +66,8 @@ When opening an issue, please include (with secrets redacted):
 - **现象**：网关启动日志提示未找到 ACP 可执行文件，或跳过不兼容宿主机的二进制。
 - **排查与解决**：
   - 执行 `./deploy/deploy.sh --action install-acp --backend cli`（Windows 下执行 `.\deploy\deploy.ps1 -Action install-acp -Backend cli`），脚本会自动按当前系统与架构下载并校验官方 `agy` 至 `./bin/`。
-  - 若使用 Docker 部署，请保持 `binary_path: "auto"`，切勿通过环境变量将宿主机 macOS/Windows 的二进制路径硬编码注入容器。
+  - 若使用 Docker 部署，请保持 `AG_ACP_BINARY_PATH` 为默认的 `auto`，切勿通过环境变量将宿主机 macOS/Windows 的二进制路径硬编码注入容器。
+  - 若安装因缺少或不匹配的 SHA-512/SHA-256 而中止，请勿盲目绕过：哈希不匹配按设计始终报错。Zed 包请通过 `ZED_ACP_SHA256` / `--zed-sha256` 提供可信来源的哈希。
 
 #### B. 远程无桌面 Linux 服务器上进行 OAuth 终端登录失败
 - **现象**：在控制台点击 **「终端登录（OAuth）」** 并用本地电脑浏览器打开授权链接后，浏览器跳转至 `http://localhost:...` 显示无法访问此网站。
@@ -73,6 +80,11 @@ When opening an issue, please include (with secrets redacted):
   - 检查 `config/config.yaml` 中 `sandbox_policy.session_mode` 是否配置为 `"yolo"` 或 `"sticky_conversation"`。
   - 检查 `acp_pool.max_workers` 是否大于当前并发活跃会话数，避免所有 Worker 均处于满载时触发会话淘汰。
   - 在控制台 **「运行总览（Overview）」** 底部的进程与绑定会话面板中观察客户端会话 ID（`X-ACP-Session-ID`、`prompt_cache_key`、`previous_response_id` 或历史指纹）是否一致。
+
+#### D. 远程客户端访问 `/v1/*` 返回 `401 Unauthorized`
+- **现象**：在网关所在主机上请求正常，从其他机器或 Docker 宿主机访问失败。
+- **排查与解决**：
+  - 尚未创建任何 API Key 时，北向 API 只接受回环地址的免密请求。请在 **「北向令牌（API Keys）」** 标签页创建 `sk-ag-*` 密钥，并通过 `Authorization: Bearer`、`x-api-key` 或 `?key=` 传入（`?token=` 已不再接受）。
 
 ### 3. 提交求助 Issue 时建议附带的诊断信息
 

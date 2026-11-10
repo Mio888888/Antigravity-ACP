@@ -93,12 +93,13 @@ export function FrameFooter({
   )
 }
 
-export function InlineDot() {
-  return <span aria-hidden="true" className="bg-muted-foreground/40 size-1 shrink-0 rounded-full" />
-}
-
 export function Skeleton({ className = '' }: { className?: string }) {
-  return <div aria-hidden="true" className={`animate-pulse rounded-md bg-muted/60 ${className}`} />
+  return (
+    <div
+      aria-hidden="true"
+      className={`animate-pulse motion-reduce:animate-none rounded-md bg-muted/60 ${className}`}
+    />
+  )
 }
 
 export function ProgressBar({
@@ -230,7 +231,9 @@ export function Alert({
     destructive: 'border-destructive/30 bg-destructive/8 text-destructive-foreground',
   }
   return (
-    <div role="status" className={`flex items-start gap-3 rounded-lg border px-3.5 py-2.5 text-xs ${styles[variant]} ${className}`}>
+    <div
+      role={variant === 'destructive' ? 'alert' : 'status'}
+      className={`flex items-start gap-3 rounded-lg border px-3.5 py-2.5 text-xs ${styles[variant]} ${className}`}>
       {children}
     </div>
   )
@@ -277,7 +280,6 @@ export function Button({
   disabled = false,
   className = '',
   ariaLabel,
-  ariaCurrent,
 }: {
   children: React.ReactNode
   onClick?: () => void
@@ -287,7 +289,6 @@ export function Button({
   disabled?: boolean
   className?: string
   ariaLabel?: string
-  ariaCurrent?: 'page' | 'location' | boolean
 }) {
   const vMap = {
     default: 'bg-primary text-primary-foreground hover:opacity-90 border-transparent',
@@ -305,7 +306,6 @@ export function Button({
     <button
       type={type}
       aria-label={ariaLabel}
-      aria-current={ariaCurrent}
       disabled={disabled}
       onClick={onClick}
       className={`inline-flex shrink-0 cursor-pointer whitespace-nowrap items-center justify-center gap-1.5 rounded-md border font-medium transition-colors duration-150 focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 ${vMap[variant]} ${sMap[size]} ${className}`}
@@ -325,6 +325,9 @@ export function Input({
   autoFocus = false,
   autoComplete,
   disabled = false,
+  readOnly = false,
+  inputMode,
+  invalid = false,
   onKeyDown,
 }: {
   value: string | number
@@ -336,6 +339,9 @@ export function Input({
   autoFocus?: boolean
   autoComplete?: string
   disabled?: boolean
+  readOnly?: boolean
+  inputMode?: React.HTMLAttributes<HTMLInputElement>['inputMode']
+  invalid?: boolean
   onKeyDown?: React.KeyboardEventHandler<HTMLInputElement>
 }) {
   return (
@@ -347,9 +353,14 @@ export function Input({
       autoFocus={autoFocus}
       autoComplete={autoComplete}
       disabled={disabled}
+      readOnly={readOnly}
+      inputMode={inputMode}
+      aria-invalid={invalid || undefined}
       onKeyDown={onKeyDown}
       onChange={(e) => onChange(e.target.value)}
-      className={`h-8 w-full rounded-md border border-input bg-background px-2.5 text-xs text-foreground placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 ${className}`}
+      className={`h-8 w-full rounded-md border bg-background px-2.5 text-xs text-foreground placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 read-only:bg-muted/40 read-only:text-muted-foreground ${
+        invalid ? 'border-destructive/60' : 'border-input'
+      } ${className}`}
     />
   )
 }
@@ -435,20 +446,23 @@ export function DataGridView<T>({
   getRowId,
   emptyTitle,
   emptyDescription,
-  onRowClick,
+  emptyAction,
 }: {
   columns: DataGridColumn<T>[]
   rows: T[]
   getRowId: (row: T) => string
   emptyTitle: string
   emptyDescription: string
-  onRowClick?: (row: T) => void
+  emptyAction?: React.ReactNode
 }) {
   if (rows.length === 0) {
     return (
-      <div className="flex flex-col items-center justify-center py-10 text-center">
-        <p className="text-sm font-medium text-foreground">{emptyTitle}</p>
-        <p className="mt-1 text-xs text-muted-foreground">{emptyDescription}</p>
+      <div className="flex flex-col items-center justify-center gap-3 py-10 text-center">
+        <div className="flex flex-col gap-1">
+          <p className="text-sm font-medium text-foreground">{emptyTitle}</p>
+          <p className="text-xs text-muted-foreground">{emptyDescription}</p>
+        </div>
+        {emptyAction}
       </div>
     )
   }
@@ -474,10 +488,7 @@ export function DataGridView<T>({
           <div
             key={getRowId(row)}
             role="row"
-            onClick={onRowClick ? () => onRowClick(row) : undefined}
-            className={`grid items-center px-3 py-2.5 hover:bg-muted/25 transition-colors duration-150 ${
-              onRowClick ? 'cursor-pointer' : ''
-            }`}
+            className="grid items-center px-3 py-2.5 hover:bg-muted/25 transition-colors duration-150"
             style={{ gridTemplateColumns: `repeat(${columns.length}, minmax(0, 1fr))` }}
           >
             {columns.map((col) => (
@@ -565,14 +576,18 @@ export function CodeBlock({
   code,
   collapsible = false,
   defaultOpen = true,
+  translatable = false,
+  translateTitle = true,
 }: {
   title: string
   language: string
   code: string
   collapsible?: boolean
   defaultOpen?: boolean
+  translatable?: boolean
+  translateTitle?: boolean
 }) {
-  const [copied, setCopied] = React.useState(false)
+  const [copyState, setCopyState] = React.useState<'idle' | 'ok' | 'fail'>('idle')
   const [open, setOpen] = React.useState(collapsible ? defaultOpen : true)
   const containerRef = React.useRef<HTMLDivElement>(null)
   const codeRef = React.useRef<HTMLElement>(null)
@@ -594,12 +609,12 @@ export function CodeBlock({
           sel.selectAllChildren(codeRef.current)
         }
       }
+      setCopyState(ok ? 'ok' : 'fail')
+      if (timerRef.current !== null) {
+        window.clearTimeout(timerRef.current)
+      }
+      timerRef.current = window.setTimeout(() => setCopyState('idle'), ok ? 1500 : 2500)
     })
-    setCopied(true)
-    if (timerRef.current !== null) {
-      window.clearTimeout(timerRef.current)
-    }
-    timerRef.current = window.setTimeout(() => setCopied(false), 1500)
   }
 
   return (
@@ -640,7 +655,12 @@ export function CodeBlock({
               <path d="m6 9 6 6 6-6" />
             </svg>
           )}
-          <span className="font-mono font-medium text-foreground truncate">{title}</span>
+          <span
+            translate={translateTitle ? undefined : 'no'}
+            className="font-mono font-medium text-foreground truncate"
+          >
+            {title}
+          </span>
         </div>
         <div
           className="flex items-center gap-2 shrink-0"
@@ -654,17 +674,81 @@ export function CodeBlock({
             </span>
           )}
           <Button size="xs" variant="outline" onClick={copy}>
-            {copied ? '已复制' : '复制'}
+            {copyState === 'ok' ? '已复制' : copyState === 'fail' ? '复制失败，已选中文本' : '复制'}
           </Button>
         </div>
       </div>
       {open && (
-        <pre className="overflow-x-auto p-3.5 font-mono text-xs leading-relaxed text-foreground">
+        <pre
+          translate={translatable ? undefined : 'no'}
+          className="overflow-x-auto p-3.5 font-mono text-xs leading-relaxed text-foreground"
+        >
           <code ref={codeRef}>{code}</code>
         </pre>
       )}
     </div>
   )
+}
+
+export function InlineError({
+  title,
+  message,
+  onRetry,
+  retryLabel = '重试',
+  retrying = false,
+  className = '',
+}: {
+  title: string
+  message: string
+  onRetry?: () => void
+  retryLabel?: string
+  retrying?: boolean
+  className?: string
+}) {
+  return (
+    <Alert variant="destructive" className={className}>
+      <div className="flex w-full items-center justify-between gap-3">
+        <div className="flex-1 min-w-0">
+          <AlertTitle>{title}</AlertTitle>
+          <AlertDescription>{message}</AlertDescription>
+        </div>
+        {onRetry && (
+          <Button size="xs" variant="outline" disabled={retrying} onClick={onRetry}>
+            {retrying ? '重试中...' : retryLabel}
+          </Button>
+        )}
+      </div>
+    </Alert>
+  )
+}
+
+const FOCUSABLE_SELECTOR = [
+  'a[href]',
+  'button:not([disabled])',
+  'input:not([disabled]):not([type="hidden"])',
+  'select:not([disabled])',
+  'textarea:not([disabled])',
+  '[tabindex]:not([tabindex="-1"])',
+].join(',')
+
+const openDialogStack: number[] = []
+let dialogSeq = 0
+let scrollLockCount = 0
+let savedBodyOverflow = ''
+
+function lockBodyScroll() {
+  if (scrollLockCount === 0) {
+    savedBodyOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+  }
+  scrollLockCount += 1
+}
+
+function unlockBodyScroll() {
+  scrollLockCount = Math.max(0, scrollLockCount - 1)
+  if (scrollLockCount === 0) {
+    document.body.style.overflow = savedBodyOverflow
+  }
 }
 
 export function DialogModal({
@@ -675,42 +759,123 @@ export function DialogModal({
   children,
   footer,
   maxWidthClass = 'max-w-xl',
+  translateTitle = true,
 }: {
   open: boolean
   onClose: () => void
-  title: string
+  title: React.ReactNode
   description?: string
   children: React.ReactNode
   footer?: React.ReactNode
   maxWidthClass?: string
+  translateTitle?: boolean
 }) {
+  const titleId = React.useId()
+  const descriptionId = React.useId()
+  const panelRef = React.useRef<HTMLDivElement>(null)
+  const onCloseRef = React.useRef(onClose)
+  const [revealed, setRevealed] = React.useState(false)
+
+  React.useLayoutEffect(() => {
+    onCloseRef.current = onClose
+  })
+
   React.useEffect(() => {
-    if (!open) return
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose()
+    if (!open) {
+      setRevealed(false)
+      return
     }
-    window.addEventListener('keydown', onKeyDown)
-    return () => window.removeEventListener('keydown', onKeyDown)
-  }, [open, onClose])
+    dialogSeq += 1
+    const dialogId = dialogSeq
+    openDialogStack.push(dialogId)
+    const previouslyFocused =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null
+    lockBodyScroll()
+
+    const frame = window.requestAnimationFrame(() => {
+      setRevealed(true)
+      const panel = panelRef.current
+      if (panel && !panel.contains(document.activeElement)) {
+        panel.focus({ preventScroll: true })
+      }
+    })
+
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (openDialogStack[openDialogStack.length - 1] !== dialogId) return
+      if (e.key === 'Escape') {
+        e.preventDefault()
+        e.stopPropagation()
+        onCloseRef.current()
+        return
+      }
+      if (e.key !== 'Tab') return
+      const panel = panelRef.current
+      if (!panel) return
+      const focusables = Array.from(
+        panel.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)
+      ).filter((el) => el.getClientRects().length > 0)
+      if (focusables.length === 0) {
+        e.preventDefault()
+        panel.focus({ preventScroll: true })
+        return
+      }
+      const first = focusables[0]
+      const last = focusables[focusables.length - 1]
+      const active = document.activeElement
+      const outside = !active || !panel.contains(active)
+      if (e.shiftKey && (active === first || active === panel || outside)) {
+        e.preventDefault()
+        last.focus()
+      } else if (!e.shiftKey && (active === last || outside)) {
+        e.preventDefault()
+        first.focus()
+      }
+    }
+    document.addEventListener('keydown', onKeyDown)
+
+    return () => {
+      window.cancelAnimationFrame(frame)
+      document.removeEventListener('keydown', onKeyDown)
+      const idx = openDialogStack.lastIndexOf(dialogId)
+      if (idx >= 0) openDialogStack.splice(idx, 1)
+      unlockBodyScroll()
+      if (previouslyFocused && previouslyFocused.isConnected) {
+        previouslyFocused.focus({ preventScroll: true })
+      }
+    }
+  }, [open])
 
   if (!open) return null
 
   return (
     <div
-      role="dialog"
-      aria-modal="true"
-      aria-label={title}
       className="fixed inset-0 z-50 flex items-center justify-center bg-background/75 backdrop-blur-xs p-4"
       onClick={(e) => {
         if (e.target === e.currentTarget) onClose()
       }}
     >
-      <div className={`w-full ${maxWidthClass} animate-in fade-in zoom-in-95 duration-150`}>
+      <div
+        ref={panelRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        aria-describedby={description ? descriptionId : undefined}
+        tabIndex={-1}
+        className={`w-full ${maxWidthClass} outline-none transition-[opacity,transform] duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] motion-reduce:transition-none ${
+          revealed ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-1'
+        }`}
+      >
         <Frame className="shadow-lg max-h-[88vh] flex flex-col">
           <FrameHeader>
-            <div>
-              <FrameTitle>{title}</FrameTitle>
-              {description && <FrameDescription>{description}</FrameDescription>}
+            <div className="min-w-0">
+              <div id={titleId} translate={translateTitle ? undefined : 'no'}>
+                <FrameTitle>{title}</FrameTitle>
+              </div>
+              {description && (
+                <div id={descriptionId}>
+                  <FrameDescription>{description}</FrameDescription>
+                </div>
+              )}
             </div>
             <Button size="xs" variant="ghost" onClick={onClose}>
               关闭
@@ -721,5 +886,54 @@ export function DialogModal({
         </Frame>
       </div>
     </div>
+  )
+}
+
+export function ConfirmDialog({
+  open,
+  title,
+  description,
+  confirmLabel,
+  busy = false,
+  error = '',
+  onConfirm,
+  onCancel,
+  children,
+}: {
+  open: boolean
+  title: string
+  description?: string
+  confirmLabel: string
+  busy?: boolean
+  error?: string
+  onConfirm: () => void
+  onCancel: () => void
+  children?: React.ReactNode
+}) {
+  return (
+    <DialogModal
+      open={open}
+      onClose={() => {
+        if (!busy) onCancel()
+      }}
+      title={title}
+      description={description}
+      maxWidthClass="max-w-md"
+      footer={
+        <div className="ms-auto flex items-center gap-2">
+          <Button size="sm" variant="outline" disabled={busy} onClick={onCancel}>
+            取消
+          </Button>
+          <Button size="sm" variant="destructive" disabled={busy} onClick={onConfirm}>
+            {busy ? '正在处理...' : confirmLabel}
+          </Button>
+        </div>
+      }
+    >
+      <div className="flex flex-col gap-3">
+        {children}
+        {error && <InlineError title="操作失败" message={error} />}
+      </div>
+    </DialogModal>
   )
 }

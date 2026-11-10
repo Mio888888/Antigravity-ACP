@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Antigravity ACP Gateway — Admin console not built</title>
+  <style>
+    body { font-family: system-ui, -apple-system, sans-serif; max-width: 42rem; margin: 4rem auto; padding: 0 1rem; line-height: 1.6; color: #1f2937; }
+    code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background: #f3f4f6; border-radius: 4px; }
+    code { padding: 0.1rem 0.3rem; }
+    pre { padding: 0.75rem 1rem; overflow-x: auto; }
+  </style>
+</head>
+<body>
+  <h1>Admin console not built / 管理控制台未构建</h1>
+  <p>This gateway binary was built without the embedded web console. The API endpoints (<code>/v1/*</code>, <code>/healthz</code>) work normally.</p>
+  <p>当前网关二进制未内嵌 Web 管理控制台；北向 API（<code>/v1/*</code>）与 <code>/healthz</code> 可正常使用。请按以下步骤重新构建：</p>
+  <pre>cd web &amp;&amp; npm ci &amp;&amp; npm run build &amp;&amp; cd ..
+go build -tags webui -o bin/antigravity-gateway ./cmd/gateway</pre>
+  <p>Or use <code>./deploy/deploy.sh --action build</code>, which does both. / 或直接执行 <code>./deploy/deploy.sh --action build</code>。</p>
+</body>
+</html>
