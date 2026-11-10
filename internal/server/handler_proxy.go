@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -20,6 +21,8 @@ import (
 	"antigravity-gateway/internal/adapter"
 	"antigravity-gateway/internal/config"
 	"antigravity-gateway/internal/storage"
+
+	_ "modernc.org/sqlite"
 )
 
 const universalThinkingSystemPrompt = "EXECUTION & REASONING RULES:\n" +
@@ -1509,6 +1512,7 @@ func (gs *GatewayServer) executeNorthboundTurn(w http.ResponseWriter, r *http.Re
 
 	promptDoneCh := make(chan error, 1)
 	sess.SetPromptDoneCh(promptDoneCh)
+	sess.SetLastPromptUsage(nil)
 
 	var blocks []acp.PromptBlock
 	if isNewACPSession && (len(canReq.Messages) > 1 || len(canReq.ToolResults) > 0) {
@@ -1534,10 +1538,16 @@ func (gs *GatewayServer) executeNorthboundTurn(w http.ResponseWriter, r *http.Re
 		}
 	}
 	go func(sID string) {
-		_, pErr := worker.Call(context.Background(), "session/prompt", acp.PromptParams{
+		resp, pErr := worker.Call(context.Background(), "session/prompt", acp.PromptParams{
 			SessionID: sID,
 			Prompt:    blocks,
 		})
+		if pErr == nil && resp != nil && len(resp.Result) > 0 {
+			var pr acp.PromptResult
+			if json.Unmarshal(resp.Result, &pr) == nil && pr.Usage != nil {
+				sess.SetLastPromptUsage(pr.Usage)
+			}
+		}
 		promptDoneCh <- pErr
 	}(acpSessID)
 
@@ -1654,6 +1664,290 @@ func resolveTranscriptPath(dataDir, accountID, acpSessionID string) (string, os.
 	return "", nil, lastErr
 }
 
+func resolveCLIConversationDBPath(dataDir, accountID, acpSessionID string) (string, os.FileInfo, error) {
+	if accountID == "" {
+		accountID = "default"
+	}
+	var candidates []string
+	if dataDir != "" {
+		for _, subDir := range []string{"antigravity-cli", "antigravity-acp"} {
+			candidates = append(candidates, filepath.Join(dataDir, "accounts", accountID, ".gemini", subDir, "conversations", acpSessionID+".db"))
+		}
+	}
+	if userHome, err := os.UserHomeDir(); err == nil && userHome != "" {
+		for _, subDir := range []string{"antigravity-cli", "antigravity-acp"} {
+			candidates = append(candidates, filepath.Join(userHome, ".gemini", subDir, "conversations", acpSessionID+".db"))
+		}
+	}
+	var lastErr error
+	for _, p := range candidates {
+		st, err := os.Stat(p)
+		if err == nil && st.Size() > 0 {
+			return p, st, nil
+		}
+		if err != nil {
+			lastErr = err
+		}
+	}
+	if lastErr == nil {
+		lastErr = os.ErrNotExist
+	}
+	return "", nil, lastErr
+}
+
+func readProtoVarint(buf []byte, pos int) (uint64, int, bool) {
+	var val uint64
+	var shift uint
+	for pos < len(buf) {
+		b := buf[pos]
+		pos++
+		val |= uint64(b&0x7f) << shift
+		if b&0x80 == 0 {
+			return val, pos, true
+		}
+		shift += 7
+		if shift >= 64 {
+			return 0, pos, false
+		}
+	}
+	return 0, pos, false
+}
+
+func parseCLIStepMetadataProto(meta []byte) (createdAt time.Time, totalIn, cachedIn, outTok int64) {
+	pos := 0
+	var uncachedIn, cacheRead int64
+	for pos < len(meta) {
+		tagWire, nextPos, ok := readProtoVarint(meta, pos)
+		if !ok {
+			break
+		}
+		pos = nextPos
+		fieldNum := tagWire >> 3
+		wireType := tagWire & 0x7
+		switch wireType {
+		case 0:
+			_, nextPos, ok = readProtoVarint(meta, pos)
+			if !ok {
+				return
+			}
+			pos = nextPos
+		case 1:
+			pos += 8
+		case 5:
+			pos += 4
+		case 2:
+			ln, nextPos2, ok2 := readProtoVarint(meta, pos)
+			if !ok2 || nextPos2+int(ln) > len(meta) {
+				return
+			}
+			sub := meta[nextPos2 : nextPos2+int(ln)]
+			pos = nextPos2 + int(ln)
+			switch fieldNum {
+			case 1: // created_at google.protobuf.Timestamp
+				var sec, nanos int64
+				sPos := 0
+				for sPos < len(sub) {
+					tw, np, ok3 := readProtoVarint(sub, sPos)
+					if !ok3 {
+						break
+					}
+					sPos = np
+					if tw&0x7 == 0 {
+						v, np2, ok4 := readProtoVarint(sub, sPos)
+						if !ok4 {
+							break
+						}
+						sPos = np2
+						if (tw >> 3) == 1 {
+							sec = int64(v)
+						} else if (tw >> 3) == 2 {
+							nanos = int64(v)
+						}
+					} else {
+						break
+					}
+				}
+				if sec > 0 {
+					createdAt = time.Unix(sec, nanos).UTC()
+				}
+			case 9: // ModelUsage submessage: 2=input_tokens (uncached), 3=output_tokens, 5=cache_read_tokens
+				sPos := 0
+				for sPos < len(sub) {
+					tw, np, ok3 := readProtoVarint(sub, sPos)
+					if !ok3 {
+						break
+					}
+					sPos = np
+					wt := tw & 0x7
+					fn := tw >> 3
+					if wt == 0 {
+						v, np2, ok4 := readProtoVarint(sub, sPos)
+						if !ok4 {
+							break
+						}
+						sPos = np2
+						switch fn {
+						case 2:
+							uncachedIn = int64(v)
+						case 3:
+							outTok = int64(v)
+						case 5:
+							cacheRead = int64(v)
+						}
+					} else if wt == 2 {
+						l2, np2, ok4 := readProtoVarint(sub, sPos)
+						if !ok4 || np2+int(l2) > len(sub) {
+							break
+						}
+						sPos = np2 + int(l2)
+					} else if wt == 1 {
+						sPos += 8
+					} else if wt == 5 {
+						sPos += 4
+					} else {
+						break
+					}
+				}
+			}
+		default:
+			return
+		}
+	}
+	cachedIn = cacheRead
+	totalIn = uncachedIn + cacheRead
+	return
+}
+
+func parseCLIStepPayloadProto(payload []byte) (thinking string, toolCallCount int) {
+	pos := 0
+	for pos < len(payload) {
+		tagWire, nextPos, ok := readProtoVarint(payload, pos)
+		if !ok {
+			break
+		}
+		pos = nextPos
+		fieldNum := tagWire >> 3
+		wireType := tagWire & 0x7
+		switch wireType {
+		case 0:
+			_, nextPos, ok = readProtoVarint(payload, pos)
+			if !ok {
+				return
+			}
+			pos = nextPos
+		case 1:
+			pos += 8
+		case 5:
+			pos += 4
+		case 2:
+			ln, nextPos2, ok2 := readProtoVarint(payload, pos)
+			if !ok2 || nextPos2+int(ln) > len(payload) {
+				return
+			}
+			sub := payload[nextPos2 : nextPos2+int(ln)]
+			pos = nextPos2 + int(ln)
+			if fieldNum == 20 { // PlannerResponse submessage: 3=thinking, 7=tool_calls
+				sPos := 0
+				for sPos < len(sub) {
+					tw, np, ok3 := readProtoVarint(sub, sPos)
+					if !ok3 {
+						break
+					}
+					sPos = np
+					wt := tw & 0x7
+					fn := tw >> 3
+					if wt == 0 {
+						_, np2, ok4 := readProtoVarint(sub, sPos)
+						if !ok4 {
+							break
+						}
+						sPos = np2
+					} else if wt == 2 {
+						l2, np2, ok4 := readProtoVarint(sub, sPos)
+						if !ok4 || np2+int(l2) > len(sub) {
+							break
+						}
+						valBytes := sub[np2 : np2+int(l2)]
+						sPos = np2 + int(l2)
+						if fn == 3 && thinking == "" {
+							thinking = strings.TrimSpace(string(valBytes))
+						} else if fn == 7 {
+							toolCallCount++
+						}
+					} else if wt == 1 {
+						sPos += 8
+					} else if wt == 5 {
+						sPos += 4
+					} else {
+						break
+					}
+				}
+			}
+		default:
+			return
+		}
+	}
+	return
+}
+
+func extractCurrentToolStepInfoFromCLIDB(dataDir, accountID, acpSessionID string, minStepIndex int) (transcriptStepInfo, bool) {
+	info := transcriptStepInfo{stepIndex: -1}
+	dbPath, st, err := resolveCLIConversationDBPath(dataDir, accountID, acpSessionID)
+	if err != nil {
+		return info, false
+	}
+	modNano := st.ModTime().UnixNano()
+	size := st.Size()
+	if walSt, wErr := os.Stat(dbPath + "-wal"); wErr == nil {
+		if walSt.ModTime().UnixNano() > modNano {
+			modNano = walSt.ModTime().UnixNano()
+		}
+		size += walSt.Size()
+	}
+
+	lastToolStepCacheMu.Lock()
+	if cached, ok := lastToolStepCache[dbPath]; ok && cached.modTimeNano == modNano && cached.size == size {
+		step := cached.step
+		lastToolStepCacheMu.Unlock()
+		return applyMinStepIndexFilter(step, minStepIndex), true
+	}
+	lastToolStepCacheMu.Unlock()
+
+	dsn := fmt.Sprintf("file:%s?mode=ro&_pragma=busy_timeout(1000)", filepath.ToSlash(dbPath))
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return info, false
+	}
+	defer db.Close()
+
+	info.hasTranscriptFile = true
+	var idx int
+	var meta, payload []byte
+	err = db.QueryRow(`SELECT idx, metadata, step_payload FROM steps WHERE step_type = 15 ORDER BY idx DESC LIMIT 1`).Scan(&idx, &meta, &payload)
+	if err == nil {
+		_, totalIn, cachedIn, outTok := parseCLIStepMetadataProto(meta)
+		thinking, tcCount := parseCLIStepPayloadProto(payload)
+		info.stepIndex = idx
+		info.inputTokens = totalIn
+		info.cachedTokens = cachedIn
+		info.outputTokens = outTok
+		info.reasoning = thinking
+		info.expectedToolCalls = tcCount
+	}
+
+	lastToolStepCacheMu.Lock()
+	if len(lastToolStepCache) > 256 {
+		lastToolStepCache = make(map[string]cachedLastToolStepEntry, 64)
+	}
+	lastToolStepCache[dbPath] = cachedLastToolStepEntry{
+		modTimeNano: modNano,
+		size:        size,
+		step:        info,
+	}
+	lastToolStepCacheMu.Unlock()
+	return applyMinStepIndexFilter(info, minStepIndex), true
+}
+
 func extractCurrentToolStepInfo(dataDir, accountID, acpSessionID string, minStepIndex int) transcriptStepInfo {
 	info := transcriptStepInfo{stepIndex: -1}
 	if accountID == "" {
@@ -1664,6 +1958,9 @@ func extractCurrentToolStepInfo(dataDir, accountID, acpSessionID string, minStep
 	}
 	transcriptPath, st, err := resolveTranscriptPath(dataDir, accountID, acpSessionID)
 	if err != nil {
+		if cliInfo, ok := extractCurrentToolStepInfoFromCLIDB(dataDir, accountID, acpSessionID, minStepIndex); ok {
+			return cliInfo
+		}
 		return info
 	}
 	modNano := st.ModTime().UnixNano()
@@ -2143,14 +2440,14 @@ func (gs *GatewayServer) streamOrCollectWorkerOutput(
 			}
 
 			// Detect when this turn is unparking a subsequent tool call from an already-generated
-			// PLANNER_RESPONSE step in memory (no LLM call occurred; tool call arrived in <=80ms
-			// with zero thought/message chunks), so we do not double-bill prompt_tokens in audit_logs.
-			isSubToolStep := len(canReq.ToolResults) > 0 &&
+			// PLANNER_RESPONSE step in memory (no LLM call occurred), so we do not double-bill
+			// prompt_tokens in audit_logs.
+			isToolOnlyTurn := len(canReq.ToolResults) > 0 &&
 				!sawNativeThought &&
 				strings.TrimSpace(fullThinking.String()) == "" &&
-				strings.TrimSpace(fullText.String()) == "" &&
-				firstByteMs <= 80
-			if !isSubToolStep && stepInfo.stepIndex >= 0 && lastStepIdx >= 0 && stepInfo.stepIndex == lastStepIdx {
+				strings.TrimSpace(fullText.String()) == ""
+			isSubToolStep := isToolOnlyTurn && firstByteMs <= 80
+			if !isSubToolStep && isToolOnlyTurn && firstByteMs <= 3500 && stepInfo.stepIndex >= 0 && lastStepIdx >= 0 && stepInfo.stepIndex == lastStepIdx {
 				isSubToolStep = true
 			}
 
@@ -2161,7 +2458,7 @@ func (gs *GatewayServer) streamOrCollectWorkerOutput(
 			needAsyncTranscriptSync := false
 			if stepInfo.stepIndex > lastStepIdx {
 				sess.SetLastTranscriptStep(stepInfo.stepIndex)
-			} else if stepInfo.hasTranscriptFile && stepInfo.inputTokens == 0 && !isSubToolStep {
+			} else if stepInfo.hasTranscriptFile && !isSubToolStep {
 				needAsyncTranscriptSync = true
 			}
 			if v, ok := activeReqTurnMeta.Load(reqID); ok {
@@ -2246,11 +2543,25 @@ func (gs *GatewayServer) streamOrCollectWorkerOutput(
 			effectivePromptTokens := promptTokens
 			var cachedTokens int64
 			needAsyncTranscriptSync := false
+			promptUsage := sess.ConsumeLastPromptUsage()
 			if stepInfo.stepIndex > lastStepIdx && stepInfo.inputTokens > 0 {
 				effectivePromptTokens = stepInfo.inputTokens
 				cachedTokens = stepInfo.cachedTokens
 				sess.SetLastTranscriptStep(stepInfo.stepIndex)
 				sess.SetLastTokenUsage(effectivePromptTokens, cachedTokens)
+			} else if promptUsage != nil && (promptUsage.InputTokens > 0 || promptUsage.CachedReadTokens > 0 || promptUsage.TotalTokens > 0) {
+				totalIn := promptUsage.InputTokens + promptUsage.CachedReadTokens
+				if totalIn <= 0 && promptUsage.TotalTokens > promptUsage.OutputTokens {
+					totalIn = promptUsage.TotalTokens - promptUsage.OutputTokens - promptUsage.ThoughtTokens
+				}
+				if totalIn > 0 {
+					effectivePromptTokens = totalIn
+					cachedTokens = promptUsage.CachedReadTokens
+					sess.SetLastTokenUsage(effectivePromptTokens, cachedTokens)
+				}
+				if stepInfo.stepIndex > lastStepIdx {
+					sess.SetLastTranscriptStep(stepInfo.stepIndex)
+				}
 			} else {
 				if lastIn, lastCached := sess.GetLastTokenUsage(); lastIn > 0 {
 					effectivePromptTokens = lastIn + estimateTurnDeltaTokens(canReq)
@@ -2264,6 +2575,8 @@ func (gs *GatewayServer) streamOrCollectWorkerOutput(
 			compTokens := estimateTokens(fullText.String())
 			if stepInfo.stepIndex > lastStepIdx && stepInfo.outputTokens > 0 && stepInfo.outputTokens < compTokens {
 				compTokens = stepInfo.outputTokens
+			} else if promptUsage != nil && promptUsage.OutputTokens > 0 && promptUsage.OutputTokens < compTokens {
+				compTokens = promptUsage.OutputTokens
 			}
 			effectiveFirstByteMs := firstOutputByteMs
 			if effectiveFirstByteMs == 0 {
@@ -3245,6 +3558,74 @@ var (
 	transcriptStepsCache   = make(map[string]cachedTranscriptStepsEntry)
 )
 
+func readCLIPlannerStepsFromDB(dataDir, accountID, acpSessionID string) []parsedTranscriptPlannerStep {
+	dbPath, st, err := resolveCLIConversationDBPath(dataDir, accountID, acpSessionID)
+	if err != nil {
+		return nil
+	}
+	modNano := st.ModTime().UnixNano()
+	size := st.Size()
+	if walSt, wErr := os.Stat(dbPath + "-wal"); wErr == nil {
+		if walSt.ModTime().UnixNano() > modNano {
+			modNano = walSt.ModTime().UnixNano()
+		}
+		size += walSt.Size()
+	}
+
+	transcriptStepsCacheMu.Lock()
+	if cached, ok := transcriptStepsCache[dbPath]; ok && cached.modTimeNano == modNano && cached.size == size {
+		steps := cached.steps
+		transcriptStepsCacheMu.Unlock()
+		return steps
+	}
+	transcriptStepsCacheMu.Unlock()
+
+	dsn := fmt.Sprintf("file:%s?mode=ro&_pragma=busy_timeout(1000)", filepath.ToSlash(dbPath))
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil
+	}
+	defer db.Close()
+
+	rows, err := db.Query(`SELECT idx, metadata FROM steps WHERE step_type = 15 ORDER BY idx ASC`)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	var steps []parsedTranscriptPlannerStep
+	for rows.Next() {
+		var idx int
+		var meta []byte
+		if err := rows.Scan(&idx, &meta); err != nil {
+			continue
+		}
+		ts, totalIn, cachedIn, outTok := parseCLIStepMetadataProto(meta)
+		if totalIn <= 0 {
+			continue
+		}
+		steps = append(steps, parsedTranscriptPlannerStep{
+			stepIndex:    idx,
+			createdAt:    ts,
+			inputTokens:  totalIn,
+			cachedTokens: cachedIn,
+			outputTokens: outTok,
+		})
+	}
+
+	transcriptStepsCacheMu.Lock()
+	if len(transcriptStepsCache) > 256 {
+		transcriptStepsCache = make(map[string]cachedTranscriptStepsEntry, 64)
+	}
+	transcriptStepsCache[dbPath] = cachedTranscriptStepsEntry{
+		modTimeNano: modNano,
+		size:        size,
+		steps:       steps,
+	}
+	transcriptStepsCacheMu.Unlock()
+	return steps
+}
+
 func readTranscriptPlannerSteps(dataDir, accountID, acpSessionID string) []parsedTranscriptPlannerStep {
 	if accountID == "" {
 		accountID = "default"
@@ -3254,7 +3635,7 @@ func readTranscriptPlannerSteps(dataDir, accountID, acpSessionID string) []parse
 	}
 	transcriptPath, st, err := resolveTranscriptPath(dataDir, accountID, acpSessionID)
 	if err != nil {
-		return nil
+		return readCLIPlannerStepsFromDB(dataDir, accountID, acpSessionID)
 	}
 	modNano := st.ModTime().UnixNano()
 	size := st.Size()
@@ -3486,12 +3867,13 @@ func SyncTranscriptTokens(dataDir string, store *storage.Store, limit int) int {
 			strings.TrimSpace(l.ResponseText) == "" &&
 			l.LatencyMs > 0 && l.LatencyMs <= 1500 &&
 			(snap.TTFBMs <= 80)
-		isSubTool := snap.SubToolStep || isFastToolOnly
+		isSubTool := isFastToolOnly
 
 		// Compute request start time. In transcript.jsonl, PLANNER_RESPONSE.created_at is the
 		// step START timestamp truncated to whole seconds (YYYY-MM-DDTHH:MM:SSZ).
-		// Comparing against l.CreatedAt + 200ms previously caused the last sub-tool call of Turn K
-		// to falsely match Turn K+1's PLANNER_RESPONSE that started in the same whole second.
+		// Any PLANNER_RESPONSE whose created_at equals l.CreatedAt.Truncate(time.Second) (when
+		// reqStart was in an earlier second) actually started in the same whole second that Turn K
+		// finished — i.e., it belongs to Turn K+1, not Turn K.
 		reqStart := l.CreatedAt
 		if l.LatencyMs > 0 {
 			reqStart = l.CreatedAt.Add(-time.Duration(l.LatencyMs) * time.Millisecond)
@@ -3501,9 +3883,11 @@ func SyncTranscriptTokens(dataDir string, store *storage.Store, limit int) int {
 			// A sub-tool dispatch belongs to the PLANNER_RESPONSE that started BEFORE this sub-request began.
 			cutoff = reqStart.Add(50 * time.Millisecond)
 		} else {
-			// A real LLM turn's PLANNER_RESPONSE starts before the response finishes.
-			cutoff = l.CreatedAt.Add(-50 * time.Millisecond)
-			if cutoff.Before(reqStart.Truncate(time.Second)) {
+			startSec := reqStart.Truncate(time.Second)
+			endSec := l.CreatedAt.Truncate(time.Second)
+			if startSec.Before(endSec) {
+				cutoff = endSec.Add(-1 * time.Millisecond)
+			} else {
 				cutoff = l.CreatedAt
 			}
 		}
@@ -3555,7 +3939,7 @@ func SyncTranscriptTokens(dataDir string, store *storage.Store, limit int) int {
 
 		needUpdate := l.PromptTokens != auditPrompt || l.CachedTokens != auditCached || l.CompletionTokens != targetOut
 		if hasValidSnap {
-			if snap.InputTokens != targetContextPrompt || snap.CachedTokens != targetContextCached || snap.OutputTokens != targetOut || snap.SubToolStep != isSubTool {
+			if snap.InputTokens != targetContextPrompt || snap.CachedTokens != targetContextCached || snap.OutputTokens != targetOut || snap.SubToolStep != isSubTool || (matched.stepIndex > 0 && snap.StepIndex != matched.stepIndex) {
 				needUpdate = true
 			}
 		}

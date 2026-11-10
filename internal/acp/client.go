@@ -133,6 +133,9 @@ func discoverZedACPBinary() string {
 
 	for _, c := range candidates {
 		if isCompatibleExecutable(c) {
+			if abs, err := filepath.Abs(c); err == nil {
+				return abs
+			}
 			return c
 		}
 	}
@@ -192,6 +195,9 @@ func discoverCLIACPBinary() string {
 	}
 	for _, c := range candidates {
 		if isCompatibleExecutable(c) {
+			if abs, err := filepath.Abs(c); err == nil {
+				return abs
+			}
 			return c
 		}
 	}
@@ -211,6 +217,9 @@ func ResolveACPBinaryPath(backendType, configuredPath string) string {
 	if trimmed != "" && trimmed != "auto" {
 		if isCompatibleExecutable(trimmed) {
 			pathExists = true
+			if abs, err := filepath.Abs(trimmed); err == nil {
+				trimmed = abs
+			}
 		} else if !strings.ContainsAny(trimmed, `/\`) {
 			if p, err := exec.LookPath(trimmed); err == nil && isCompatibleExecutable(p) {
 				pathExists = true
@@ -330,6 +339,8 @@ type WorkerClient struct {
 	lastActiveAt     time.Time
 	boundSessions    atomic.Int32
 	internalApproval string
+	thinkingConfigID string
+	supportsYoloMode *bool
 	wiretap          WiretapCallback
 	closeOnce        sync.Once
 	closedCh         chan struct{}
@@ -357,6 +368,11 @@ func (w *WorkerClient) BoundSessionCount() int {
 
 func NewWorkerClient(ctx context.Context, id string, opts WorkerLaunchOptions, wiretap WiretapCallback) (*WorkerClient, error) {
 	bin, args := BuildCommandAndArgs(opts)
+	if strings.ContainsAny(bin, `/\`) && !filepath.IsAbs(bin) {
+		if absBin, err := filepath.Abs(bin); err == nil {
+			bin = absBin
+		}
+	}
 	cmd := exec.Command(bin, args...)
 	configureWorkerProcAttr(cmd)
 	if opts.WorkspaceDir != "" {
@@ -627,6 +643,7 @@ func (w *WorkerClient) NewSession(ctx context.Context, params NewSessionParams) 
 	if err := json.Unmarshal(resp.Result, &res); err != nil {
 		return nil, fmt.Errorf("decode session/new result: %w", err)
 	}
+	w.recordSessionConfigCapabilities(&res)
 	return &res, nil
 }
 
@@ -642,7 +659,46 @@ func (w *WorkerClient) ResumeSession(ctx context.Context, params ResumeSessionPa
 	if err := json.Unmarshal(resp.Result, &res); err != nil {
 		return nil, fmt.Errorf("decode session/resume result: %w", err)
 	}
+	w.recordSessionConfigCapabilities(&res)
 	return &res, nil
+}
+
+func (w *WorkerClient) recordSessionConfigCapabilities(res *NewSessionResult) {
+	if w == nil || res == nil || len(res.ConfigOptions) == 0 {
+		return
+	}
+	var thinkID string
+	var hasModeOpt bool
+	var hasYolo bool
+	for _, opt := range res.ConfigOptions {
+		idLower := strings.ToLower(strings.TrimSpace(opt.ID))
+		catLower := strings.ToLower(strings.TrimSpace(opt.Category))
+		if idLower == "thinking_level" || idLower == "thought_level" || catLower == "thinking_level" || catLower == "thought_level" {
+			if strings.TrimSpace(opt.ID) != "" {
+				thinkID = strings.TrimSpace(opt.ID)
+			}
+		}
+		if idLower == "mode" || catLower == "mode" {
+			if len(opt.Options) > 0 {
+				hasModeOpt = true
+				for _, v := range opt.Options {
+					if strings.EqualFold(strings.TrimSpace(v.Value), "yolo") {
+						hasYolo = true
+						break
+					}
+				}
+			}
+		}
+	}
+	w.stateMu.Lock()
+	if thinkID != "" {
+		w.thinkingConfigID = thinkID
+	}
+	if hasModeOpt {
+		yoloSupported := hasYolo
+		w.supportsYoloMode = &yoloSupported
+	}
+	w.stateMu.Unlock()
 }
 
 func (w *WorkerClient) CloseSession(ctx context.Context, sessionID string) error {
@@ -651,10 +707,71 @@ func (w *WorkerClient) CloseSession(ctx context.Context, sessionID string) error
 }
 
 func (w *WorkerClient) SetConfigOption(ctx context.Context, sessionID, configID, value string) error {
+	effectiveID := strings.TrimSpace(configID)
+	effectiveVal := strings.TrimSpace(value)
+
+	w.stateMu.RLock()
+	thinkID := w.thinkingConfigID
+	yoloPtr := w.supportsYoloMode
+	w.stateMu.RUnlock()
+
+	if strings.EqualFold(effectiveID, "thinking_level") || strings.EqualFold(effectiveID, "thought_level") {
+		if thinkID != "" {
+			effectiveID = thinkID
+		}
+		_, err := w.Call(ctx, "session/set_config_option", SetConfigOptionParams{
+			SessionID: sessionID,
+			ConfigID:  effectiveID,
+			Value:     effectiveVal,
+		})
+		if err != nil {
+			altID := "thought_level"
+			if strings.EqualFold(effectiveID, "thought_level") {
+				altID = "thinking_level"
+			}
+			if _, err2 := w.Call(ctx, "session/set_config_option", SetConfigOptionParams{
+				SessionID: sessionID,
+				ConfigID:  altID,
+				Value:     effectiveVal,
+			}); err2 == nil {
+				w.stateMu.Lock()
+				w.thinkingConfigID = altID
+				w.stateMu.Unlock()
+				return nil
+			}
+		}
+		return err
+	}
+
+	if strings.EqualFold(effectiveID, "mode") && strings.EqualFold(effectiveVal, "yolo") {
+		if yoloPtr != nil && !*yoloPtr {
+			effectiveVal = "auto"
+		}
+		_, err := w.Call(ctx, "session/set_config_option", SetConfigOptionParams{
+			SessionID: sessionID,
+			ConfigID:  effectiveID,
+			Value:     effectiveVal,
+		})
+		if err != nil && strings.EqualFold(effectiveVal, "yolo") {
+			if _, err2 := w.Call(ctx, "session/set_config_option", SetConfigOptionParams{
+				SessionID: sessionID,
+				ConfigID:  effectiveID,
+				Value:     "auto",
+			}); err2 == nil {
+				yoloSupported := false
+				w.stateMu.Lock()
+				w.supportsYoloMode = &yoloSupported
+				w.stateMu.Unlock()
+				return nil
+			}
+		}
+		return err
+	}
+
 	_, err := w.Call(ctx, "session/set_config_option", SetConfigOptionParams{
 		SessionID: sessionID,
-		ConfigID:  configID,
-		Value:     value,
+		ConfigID:  effectiveID,
+		Value:     effectiveVal,
 	})
 	return err
 }

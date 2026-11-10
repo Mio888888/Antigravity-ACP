@@ -1239,11 +1239,15 @@ func TestSyncTranscriptTokensSubToolDeduplicationAndStepAlignment(t *testing.T) 
 	if err := os.MkdirAll(cliTranscriptDir, 0755); err != nil {
 		t.Fatalf("MkdirAll cliTranscriptDir failed: %v", err)
 	}
-	cliTranscriptContent := `{"step_index":3,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-10T09:50:10Z","input_tokens":7481,"cache_read_tokens":32423,"output_tokens":214}` + "\n"
+	cliTranscriptContent := strings.Join([]string{
+		`{"step_index":3,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-10T09:50:10Z","input_tokens":7481,"cache_read_tokens":32423,"output_tokens":214}`,
+		`{"step_index":5,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-10T09:50:15Z","input_tokens":8100,"cache_read_tokens":39904,"output_tokens":180}`,
+	}, "\n") + "\n"
 	if err := os.WriteFile(filepath.Join(cliTranscriptDir, "transcript.jsonl"), []byte(cliTranscriptContent), 0644); err != nil {
 		t.Fatalf("WriteFile cli transcript.jsonl failed: %v", err)
 	}
 	tCliDone, _ := time.Parse(time.RFC3339Nano, "2026-11-10T09:50:15.500Z")
+	tCliNextDone, _ := time.Parse(time.RFC3339Nano, "2026-11-10T09:50:25.200Z")
 	_ = store.RecordAuditLog(storage.AuditLog{
 		RequestID:        "resp_cli_step3",
 		Protocol:         "openai_responses",
@@ -1257,12 +1261,30 @@ func TestSyncTranscriptTokensSubToolDeduplicationAndStepAlignment(t *testing.T) 
 		ContextJSON:      `{"input_tokens":5000,"cached_tokens":0,"output_tokens":20,"ttfb_ms":3100,"items":[]}`,
 		CreatedAt:        tCliDone,
 	})
+	_ = store.RecordAuditLog(storage.AuditLog{
+		RequestID:        "resp_cli_step5",
+		Protocol:         "openai_responses",
+		AccountID:        "default",
+		SessionID:        cliSessID,
+		ModelName:        "gemini-4-argon",
+		PromptTokens:     0,
+		CompletionTokens: 25,
+		LatencyMs:        9400,
+		StatusCode:       200,
+		ContextJSON:      `{"input_tokens":39904,"cached_tokens":32423,"output_tokens":25,"ttfb_ms":8900,"sub_tool_step":true,"items":[]}`,
+		CreatedAt:        tCliNextDone,
+	})
 	server.SyncTranscriptTokens(dataDir, store, 10)
 	logsAfter, _ := store.ListAuditLogs(10)
 	for _, l := range logsAfter {
 		if l.RequestID == "resp_cli_step3" {
 			if l.PromptTokens != 39904 || l.CachedTokens != 32423 {
-				t.Fatalf("expected antigravity-cli transcript to resolve prompt=39904 cached=32423, got prompt=%d cached=%d", l.PromptTokens, l.CachedTokens)
+				t.Fatalf("expected antigravity-cli step 3 to resolve prompt=39904 cached=32423, got prompt=%d cached=%d", l.PromptTokens, l.CachedTokens)
+			}
+		}
+		if l.RequestID == "resp_cli_step5" {
+			if l.PromptTokens != 48004 || l.CachedTokens != 39904 {
+				t.Fatalf("expected antigravity-cli step 5 (started in same whole second step 3 ended) to resolve prompt=48004 cached=39904, got prompt=%d cached=%d", l.PromptTokens, l.CachedTokens)
 			}
 		}
 	}

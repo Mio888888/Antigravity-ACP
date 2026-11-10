@@ -26,7 +26,8 @@ func main() {
 
 func runProbe(args []string) {
 	fs := flag.NewFlagSet("probe", flag.ExitOnError)
-	binPath := fs.String("bin", "/Users/wanlitong/Library/Application Support/Zed/external_agents/registry/antigravity-acp/v_1.4.5_6c2906ba8ee98ee2_d38096e037b307b2/agy_acp_server.par", "Path to agy or agy_acp_server.par")
+	backend := fs.String("backend", "cli", "ACP backend type: cli | zed | zen | auto")
+	binPath := fs.String("bin", "auto", "Path to agy or agy_acp_server.par (or 'auto')")
 	cwd := fs.String("cwd", "/tmp", "Working directory for session/new")
 	clientName := fs.String("client", "zed", "ClientInfo.name to report on initialize")
 	_ = fs.Parse(args)
@@ -35,7 +36,8 @@ func runProbe(args []string) {
 	defer cancel()
 
 	w, err := acp.NewWorkerClient(ctx, "probe_1", acp.WorkerLaunchOptions{
-		BinaryPath:        *binPath,
+		BackendType:       *backend,
+		BinaryPath:        acp.ResolveACPBinaryPath(*backend, *binPath),
 		WorkspaceDir:      *cwd,
 		ProcessPerSession: true,
 		DisableTelemetry:  true,

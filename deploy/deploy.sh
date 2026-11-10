@@ -516,18 +516,57 @@ print_admin_credentials_banner() {
   echo "=============================================================================="
 }
 
+find_running_gateway_pids() {
+  local pid_file="$ROOT_DIR/data/gateway.pid"
+  local pids=()
+  if [[ -f "$pid_file" ]]; then
+    local file_pid
+    file_pid="$(cat "$pid_file" 2>/dev/null || true)"
+    if [[ -n "$file_pid" ]] && kill -0 "$file_pid" 2>/dev/null; then
+      pids+=("$file_pid")
+    fi
+  fi
+  if command -v lsof >/dev/null 2>&1; then
+    local port_pids
+    port_pids="$(lsof -tiTCP:"${PORT}" -sTCP:LISTEN 2>/dev/null || true)"
+    for p in $port_pids; do
+      if [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null; then
+        local seen=0
+        for ep in "${pids[@]:-}"; do
+          [[ "$ep" == "$p" ]] && seen=1
+        done
+        [[ "$seen" == "0" ]] && pids+=("$p")
+      fi
+    done
+  fi
+  if command -v pgrep >/dev/null 2>&1; then
+    local pg_pids
+    pg_pids="$(pgrep -f "$ROOT_DIR/bin/antigravity-gateway" 2>/dev/null || true)"
+    for p in $pg_pids; do
+      if [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null; then
+        local seen=0
+        for ep in "${pids[@]:-}"; do
+          [[ "$ep" == "$p" ]] && seen=1
+        done
+        [[ "$seen" == "0" ]] && pids+=("$p")
+      fi
+    done
+  fi
+  echo "${pids[*]:-}"
+}
+
 start_local() {
   mkdir -p "$ROOT_DIR/data"
   local pid_file="$ROOT_DIR/data/gateway.pid"
   local log_file="$ROOT_DIR/data/gateway.log"
-  if [[ -f "$pid_file" ]]; then
-    local old_pid
-    old_pid="$(cat "$pid_file" 2>/dev/null || true)"
-    if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
-      msg ">>> 网关已在运行 (PID: $old_pid)，正在平滑重启..." ">>> Gateway already running (PID: $old_pid), restarting..."
-      kill "$old_pid" 2>/dev/null || true
-      sleep 1
-    fi
+  local existing_pids
+  existing_pids="$(find_running_gateway_pids)"
+  if [[ -n "$existing_pids" ]]; then
+    msg ">>> 网关已在运行 (PID: $existing_pids)，正在平滑重启..." ">>> Gateway already running (PID: $existing_pids), restarting..."
+    for opid in $existing_pids; do
+      kill "$opid" 2>/dev/null || true
+    done
+    sleep 1
   fi
 
   nohup "$ROOT_DIR/bin/antigravity-gateway" \
@@ -551,28 +590,26 @@ start_local() {
 
 stop_local() {
   local pid_file="$ROOT_DIR/data/gateway.pid"
-  if [[ -f "$pid_file" ]]; then
-    local pid
-    pid="$(cat "$pid_file" 2>/dev/null || true)"
-    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+  local existing_pids
+  existing_pids="$(find_running_gateway_pids)"
+  if [[ -n "$existing_pids" ]]; then
+    for pid in $existing_pids; do
       kill "$pid" 2>/dev/null || true
-      rm -f "$pid_file"
-      msg ">>> 已停止网关进程 (PID: $pid)" ">>> Stopped gateway process (PID: $pid)"
-      return 0
-    fi
+    done
+    rm -f "$pid_file"
+    msg ">>> 已停止网关进程 (PID: $existing_pids)" ">>> Stopped gateway process (PID: $existing_pids)"
+    return 0
   fi
-  msg ">>> 未发现通过 pid 文件运行的网关进程" ">>> No running gateway process found via pid file"
+  rm -f "$pid_file"
+  msg ">>> 未发现运行中的网关进程" ">>> No running gateway process found"
 }
 
 status_local() {
-  local pid_file="$ROOT_DIR/data/gateway.pid"
-  if [[ -f "$pid_file" ]]; then
-    local pid
-    pid="$(cat "$pid_file" 2>/dev/null || true)"
-    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-      msg ">>> 运行中 (PID: $pid) | http://localhost:${PORT}" ">>> Running (PID: $pid) | http://localhost:${PORT}"
-      return 0
-    fi
+  local existing_pids
+  existing_pids="$(find_running_gateway_pids)"
+  if [[ -n "$existing_pids" ]]; then
+    msg ">>> 运行中 (PID: $existing_pids) | http://localhost:${PORT}" ">>> Running (PID: $existing_pids) | http://localhost:${PORT}"
+    return 0
   fi
   msg ">>> 未运行" ">>> Stopped"
 }

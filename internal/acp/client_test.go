@@ -231,9 +231,15 @@ for line in sys.stdin:
 		t.Fatalf("NewSession failed: res=%+v, err=%v", sessRes, err)
 	}
 
-	// Test SetConfigOption
+	// Test SetConfigOption (model, thinking_level -> thought_level fallback, mode: yolo -> auto fallback)
 	if err := w.SetConfigOption(ctx, sessRes.SessionID, "model", "claude-sonnet-4-5"); err != nil {
-		t.Fatalf("SetConfigOption failed: %v", err)
+		t.Fatalf("SetConfigOption(model) failed: %v", err)
+	}
+	if err := w.SetConfigOption(ctx, sessRes.SessionID, "thinking_level", "high"); err != nil {
+		t.Fatalf("SetConfigOption(thinking_level) failed: %v", err)
+	}
+	if err := w.SetConfigOption(ctx, sessRes.SessionID, "mode", "yolo"); err != nil {
+		t.Fatalf("SetConfigOption(mode=yolo) failed: %v", err)
 	}
 
 	// Test session/prompt with >100KB thought chunk + permission auto-approval

@@ -52,6 +52,7 @@ type ManagedSession struct {
 	LastThinkingLevel         string
 	ToolCallNotifyCh          chan *ParkedToolCall
 	PromptDoneCh              chan error
+	LastPromptUsage           *PromptUsage
 	LastTranscriptStep        int
 	LastInputTokens           int64
 	LastCachedTokens          int64
@@ -218,6 +219,7 @@ func (ms *ManagedSession) SetACPSession(acpSessionID string, lastStep int) {
 		ms.LastThinkingLevel = ""
 		ms.LastInputTokens = 0
 		ms.LastCachedTokens = 0
+		ms.LastPromptUsage = nil
 		ms.ClientCompactionRequested = false
 		ms.ClientCompactionWaitTurns = 0
 	}
@@ -263,6 +265,27 @@ func (ms *ManagedSession) SetPromptDoneCh(ch chan error) {
 	ms.PromptDoneCh = ch
 	ms.UpdatedAt = time.Now()
 	ms.mu.Unlock()
+}
+
+func (ms *ManagedSession) SetLastPromptUsage(u *PromptUsage) {
+	if ms == nil {
+		return
+	}
+	ms.mu.Lock()
+	ms.LastPromptUsage = u
+	ms.UpdatedAt = time.Now()
+	ms.mu.Unlock()
+}
+
+func (ms *ManagedSession) ConsumeLastPromptUsage() *PromptUsage {
+	if ms == nil {
+		return nil
+	}
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	u := ms.LastPromptUsage
+	ms.LastPromptUsage = nil
+	return u
 }
 
 type SessionManager struct {

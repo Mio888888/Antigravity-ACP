@@ -240,6 +240,19 @@ func (mp *MultiAccountPool) UpsertAccountPool(acc storage.Account) error {
 	if acc.IsolationEnabled {
 		_ = os.MkdirAll(filepath.Join(geminiHome, "antigravity-acp"), 0700)
 		_ = os.MkdirAll(filepath.Join(geminiHome, "antigravity-cli"), 0700)
+		acpTok := filepath.Join(geminiHome, "antigravity-acp", "acp_token.json")
+		cliTok := filepath.Join(geminiHome, "antigravity-cli", "acp_token.json")
+		if _, err := os.Stat(acpTok); err == nil {
+			if _, err2 := os.Stat(cliTok); os.IsNotExist(err2) {
+				if raw, rerr := os.ReadFile(acpTok); rerr == nil {
+					_ = os.WriteFile(cliTok, raw, 0600)
+				}
+			}
+		} else if _, err := os.Stat(cliTok); err == nil {
+			if raw, rerr := os.ReadFile(cliTok); rerr == nil {
+				_ = os.WriteFile(acpTok, raw, 0600)
+			}
+		}
 	} else if userHome, err := os.UserHomeDir(); err == nil && userHome != "" {
 		hostGemini := filepath.Join(userHome, ".gemini")
 		for _, authEntry := range []string{"antigravity-acp", "antigravity-cli", "oauth_creds.json", "google_accounts.json", "installation_id", "state.json"} {
