@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository / 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Node.js / 配置 Node.js 环境
         uses: actions/setup-node@v4
