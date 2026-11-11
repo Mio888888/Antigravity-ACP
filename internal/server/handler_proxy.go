@@ -295,18 +295,8 @@ func isToolCallOnlyAssistant(content string) bool {
 			continue
 		}
 		openIdx := strings.Index(l, "(")
-		if openIdx > 0 && strings.HasSuffix(l, ")") {
-			fnName := l[:openIdx]
-			validFn := true
-			for _, r := range fnName {
-				if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' || r == ':' || r == '.') {
-					validFn = false
-					break
-				}
-			}
-			if validFn {
-				continue
-			}
+		if openIdx > 0 && strings.HasSuffix(l, ")") && isToolFnName(l[:openIdx]) {
+			continue
 		}
 		return false
 	}
@@ -410,10 +400,26 @@ func compactOversizedClientCompactionSystemPrompt(sys string) string {
 	return cleaned[:headBudget] + "\n\n...[middle of raw conversation history omitted to stay within compaction budget]...\n\n" + cleaned[tailStart:]
 }
 
+// patchedSessionCeiling returns the compaction ceiling a context-patched agy enforces for
+// tier: the tier itself, bounded by the model's physical window minus agy's output reserve
+// (tier 0 removes the clamp, leaving only the physical bound).
+func patchedSessionCeiling(tier int64, model string) int64 {
+	physical := modelContextCapacityForAudit(model, 0) - 40000
+	if tier <= 0 || tier > physical {
+		return physical
+	}
+	return tier
+}
+
 // acpCompactionWatermark returns the ACP-session token count at which the gateway
-// compacts locally: acpCompactionTriggerTokens, or 85% of a smaller client window.
+// compacts locally: 85% of the patched session ceiling when context patching is active,
+// otherwise acpCompactionTriggerTokens (sized for agy's unpatched 256K clamp), lowered to
+// 85% of a smaller client window either way.
 func acpCompactionWatermark(canReq *adapter.CanonicalRequest) int64 {
 	watermark := acpCompactionTriggerTokens
+	if canReq != nil && canReq.SessionCeilingTokens > 0 {
+		watermark = (canReq.SessionCeilingTokens * 85) / 100
+	}
 	if canReq != nil && canReq.ContextWindow > 0 {
 		if winTrigger := (canReq.ContextWindow * 85) / 100; winTrigger > 0 && winTrigger < watermark {
 			watermark = winTrigger
@@ -878,37 +884,28 @@ func BuildPromptBlocksWithHistory(canReq *adapter.CanonicalRequest) []acp.Prompt
 		return canReq.PromptBlocks
 	}
 
-	maxInitialGoalBytes := 12 * 1024
-	maxMiddleBudget := 56 * 1024
-	maxFinalTurnBytes := 36 * 1024
-	if canReq.ContextWindow >= 400000 {
-		maxInitialGoalBytes = 20 * 1024
-		maxMiddleBudget = 96 * 1024
-		maxFinalTurnBytes = 48 * 1024
-	} else if canReq.ContextWindow >= 200000 {
-		maxInitialGoalBytes = 16 * 1024
-		maxMiddleBudget = 76 * 1024
-		maxFinalTurnBytes = 42 * 1024
-	}
+	b := historyBudgetsFor(canReq)
+	maxInitialGoalBytes := b.initialGoal
+	maxMiddleBudget := b.middle
+	maxFinalTurnBytes := b.finalTurn
 
-	type cleanMsg struct {
-		role    string
-		content string
-	}
 	var cleaned []cleanMsg
+	seenRetained := make(map[string]bool)
 	for _, m := range canReq.Messages {
 		role := strings.ToUpper(strings.TrimSpace(m.Role))
 		if role == "" {
 			role = "USER"
 		}
 		content := strings.TrimSpace(m.Content)
+		var retained []string
 		if role == "USER" {
+			retained = extractRetainedOwnerContext(content)
 			content = stripTurnContextBlocks(content)
 		}
-		if content == "" {
-			continue
+		if content != "" {
+			cleaned = append(cleaned, cleanMsg{role: role, content: content})
 		}
-		cleaned = append(cleaned, cleanMsg{role: role, content: content})
+		cleaned = attachRetainedOwnerContext(cleaned, retained, seenRetained)
 	}
 	if len(cleaned) == 0 {
 		return canReq.PromptBlocks
@@ -966,6 +963,9 @@ func BuildPromptBlocksWithHistory(canReq *adapter.CanonicalRequest) []acp.Prompt
 		historySlice = cleaned[:lastIdx]
 	}
 
+	toolNames := pairToolResultNames(cleaned)
+	inActiveTaskAt := func(i int) bool { return i > lastRealUserIdx || lastProseAsstBeforeUserIdx < 0 }
+
 	var sb strings.Builder
 	sb.WriteString("<conversation_history>\n")
 
@@ -985,38 +985,49 @@ func BuildPromptBlocksWithHistory(canReq *adapter.CanonicalRequest) []acp.Prompt
 		// history when no prior task completed) were just read by the model; keep the
 		// most recent ones large enough that a mid-task rebuild (tool_search unlock or
 		// local compaction) does not force the model to re-read them.
-		const maxActiveTaskTools = 12
+		maxActiveTaskTools := b.activeTools
 		activeTaskTools := 0
 		for i := len(historySlice) - 1; i >= startRecentFloor && activeTaskTools < maxActiveTaskTools; i-- {
-			if historySlice[i].role == "TOOL" && (i > lastRealUserIdx || lastProseAsstBeforeUserIdx < 0) {
+			if historySlice[i].role == "TOOL" && inActiveTaskAt(i) {
 				activeTaskTools++
 			}
 		}
-		activeToolBytes := 1400
+		activeToolBytes := b.olderTool
 		if activeTaskTools > 0 {
 			activeToolBytes = (maxMiddleBudget * 3 / 4) / activeTaskTools
-			if activeToolBytes > 8000 {
-				activeToolBytes = 8000
-			} else if activeToolBytes < 1400 {
-				activeToolBytes = 1400
+			if activeToolBytes > b.activeToolCap {
+				activeToolBytes = b.activeToolCap
+			} else if activeToolBytes < b.olderTool {
+				activeToolBytes = b.olderTool
 			}
 		}
 
-		var recentFormatted []string
+		// Skill instructions (load_skill / read_skill_resource output) are loaded once at
+		// the start of a task and steer every later step; they stay pinned even once the
+		// middle budget overflows, otherwise a rebuilt session forgets the workflow and
+		// restarts it from the top.
+		var recentFormatted, pinnedFormatted []string
 		usedBytes := 0
+		pinnedBytes := 0
 		skippedCount := 0
 		recentToolCount := 0
+		overflowed := false
 		for i := len(historySlice) - 1; i >= startRecentFloor; i-- {
 			m := historySlice[i]
 			if m.role == "ASSISTANT" && isSyntheticCompactionAckAssistant(m.content) {
 				continue
 			}
 			if lastProseAsstBeforeUserIdx >= 0 && i < lastProseAsstBeforeUserIdx {
-				if m.role == "TOOL" || (m.role == "ASSISTANT" && isToolCallOnlyAssistant(m.content)) {
+				if m.role == "TOOL" || m.role == "CONTEXT" || (m.role == "ASSISTANT" && isToolCallOnlyAssistant(m.content)) {
 					continue
 				}
 			}
-			inActiveTask := i > lastRealUserIdx || lastProseAsstBeforeUserIdx < 0
+			inActiveTask := inActiveTaskAt(i)
+			isSkill := (m.role == "TOOL" || m.role == "CONTEXT") && inActiveTask && isSkillInstructionResult(toolNames[i], m.content)
+			if overflowed && !isSkill {
+				skippedCount++
+				continue
+			}
 			if m.role == "TOOL" && inActiveTask {
 				recentToolCount++
 			}
@@ -1025,6 +1036,8 @@ func BuildPromptBlocksWithHistory(canReq *adapter.CanonicalRequest) []acp.Prompt
 			switch {
 			case strings.Contains(m.content, "# Handoff Summary"):
 				maxEntryContent = 32 * 1024
+			case isSkill:
+				maxEntryContent = b.skillTool
 			case i == lastProseAsstBeforeUserIdx:
 				maxEntryContent = 24 * 1024
 			case i == lastRealUserIdx:
@@ -1034,24 +1047,38 @@ func BuildPromptBlocksWithHistory(canReq *adapter.CanonicalRequest) []acp.Prompt
 			case m.role == "TOOL" && inActiveTask && recentToolCount <= maxActiveTaskTools:
 				maxEntryContent = activeToolBytes
 			case m.role == "TOOL":
-				maxEntryContent = 1400
+				maxEntryContent = b.olderTool
 			}
 			c := truncateUTF8Middle(m.content, maxEntryContent, "\n...[historical output compressed]...\n")
 			entry := fmt.Sprintf("[%s]:\n%s\n\n", m.role, c)
-			if usedBytes+len(entry) > maxMiddleBudget && len(recentFormatted) >= 2 {
-				skippedCount = i - startRecentFloor + 1
-				break
+			if !overflowed && usedBytes+len(entry) > maxMiddleBudget && len(recentFormatted) >= 2 {
+				overflowed = true
+			}
+			if overflowed {
+				if isSkill && pinnedBytes+len(entry) <= b.skillTool*2 {
+					pinnedFormatted = append(pinnedFormatted, entry)
+					pinnedBytes += len(entry)
+				} else {
+					skippedCount++
+				}
+				continue
 			}
 			recentFormatted = append(recentFormatted, entry)
 			usedBytes += len(entry)
 		}
 
+		for i := len(pinnedFormatted) - 1; i >= 0; i-- {
+			sb.WriteString(pinnedFormatted[i])
+		}
 		if skippedCount > 0 {
 			sb.WriteString(fmt.Sprintf("[... %d earlier historical messages omitted to stay within context window ...]\n\n", skippedCount))
 		}
 		for i := len(recentFormatted) - 1; i >= 0; i-- {
 			sb.WriteString(recentFormatted[i])
 		}
+	}
+	if ledger := executedToolCallLedger(historySlice, inActiveTaskAt, b.ledger); ledger != "" {
+		sb.WriteString(ledger)
 	}
 
 	const historyContinuityNote = "[Context Continuity Note: All files, tool outputs, and # Handoff Summary entries in <conversation_history> above have already been read in this session. Continue directly from this state—do NOT redundantly re-run find_files / git_status or re-read already summarized files.]\n\n"
@@ -1089,6 +1116,285 @@ func BuildPromptBlocksWithHistory(canReq *adapter.CanonicalRequest) []acp.Prompt
 
 func buildPromptBlocksWithHistory(canReq *adapter.CanonicalRequest) []acp.PromptBlock {
 	return BuildPromptBlocksWithHistory(canReq)
+}
+
+type cleanMsg struct {
+	role    string
+	content string
+}
+
+// historyBudgets holds the byte budgets used to pack a rebuilt <conversation_history>.
+type historyBudgets struct {
+	initialGoal   int
+	middle        int
+	finalTurn     int
+	activeTools   int
+	activeToolCap int
+	olderTool     int
+	skillTool     int
+	ledger        int
+}
+
+// historyBudgetsFor sizes the rebuilt history to the window the new ACP session will
+// actually have. Unpatched agy clamps every session near 256K, so the client window only
+// nudges the legacy budgets; with context patching the session ceiling is known and large
+// tiers get proportionally larger budgets (kept far below the compaction watermark so the
+// rebuilt session does not rotate again right away).
+func historyBudgetsFor(canReq *adapter.CanonicalRequest) historyBudgets {
+	window := canReq.ContextWindow
+	if ceiling := canReq.SessionCeilingTokens; ceiling > 0 {
+		if window <= 0 || window > ceiling {
+			window = ceiling
+		}
+		switch {
+		case window >= 800000:
+			return historyBudgets{initialGoal: 32 * 1024, middle: 320 * 1024, finalTurn: 64 * 1024,
+				activeTools: 40, activeToolCap: 12000, olderTool: 3000, skillTool: 48 * 1024, ledger: 40 * 1024}
+		case window >= 400000:
+			return historyBudgets{initialGoal: 20 * 1024, middle: 160 * 1024, finalTurn: 48 * 1024,
+				activeTools: 24, activeToolCap: 8000, olderTool: 2000, skillTool: 32 * 1024, ledger: 20 * 1024}
+		}
+	}
+	b := historyBudgets{initialGoal: 12 * 1024, middle: 56 * 1024, finalTurn: 36 * 1024,
+		activeTools: 12, activeToolCap: 8000, olderTool: 1400, skillTool: 24 * 1024, ledger: 8 * 1024}
+	switch {
+	case window >= 400000:
+		b.initialGoal, b.middle, b.finalTurn = 20*1024, 96*1024, 48*1024
+	case window >= 200000:
+		b.initialGoal, b.middle, b.finalTurn = 16*1024, 76*1024, 42*1024
+	case window > 0:
+		b.skillTool = 16 * 1024
+	}
+	return b
+}
+
+type toolCallRef struct {
+	name string
+	args string
+}
+
+func isToolFnName(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' || r == ':' || r == '.') {
+			return false
+		}
+	}
+	return true
+}
+
+// parseToolCallLines extracts the `name(args)` lines adapters render for assistant tool calls.
+func parseToolCallLines(content string) []toolCallRef {
+	var calls []toolCallRef
+	for _, line := range strings.Split(content, "\n") {
+		l := strings.TrimSpace(line)
+		openIdx := strings.Index(l, "(")
+		if openIdx <= 0 || !strings.HasSuffix(l, ")") || !isToolFnName(l[:openIdx]) {
+			continue
+		}
+		calls = append(calls, toolCallRef{name: l[:openIdx], args: l[openIdx+1 : len(l)-1]})
+	}
+	return calls
+}
+
+// pairToolResultNames maps each TOOL message index to the name of the call it answers,
+// pairing outputs in order with the calls of the preceding assistant step.
+func pairToolResultNames(msgs []cleanMsg) map[int]string {
+	names := make(map[int]string)
+	var pending []string
+	prevTool := false
+	for i, m := range msgs {
+		switch m.role {
+		case "ASSISTANT":
+			if prevTool {
+				pending = nil
+			}
+			for _, c := range parseToolCallLines(m.content) {
+				pending = append(pending, c.name)
+			}
+			prevTool = false
+		case "TOOL":
+			if len(pending) > 0 {
+				names[i] = pending[0]
+				pending = pending[1:]
+			}
+			prevTool = true
+		default:
+			pending = nil
+			prevTool = false
+		}
+	}
+	return names
+}
+
+func isSkillInstructionTool(name string) bool {
+	n := strings.ToLower(name)
+	return n == "skill" || strings.HasSuffix(n, "load_skill") || strings.HasSuffix(n, "read_skill_resource")
+}
+
+// isSkillInstructionResult also recognizes skill text that reaches the model through other
+// calls, e.g. Sailry's read_tool_output re-reading a stored load_skill result
+// (`Result bytes 0–N of N\n{"skill":...,"content":...}`) or a retained owner context section.
+func isSkillInstructionResult(name, content string) bool {
+	if isSkillInstructionTool(name) || strings.Contains(content, retainedOwnerContextMarker+"skill:") {
+		return true
+	}
+	idx := strings.Index(content, `{"skill":"`)
+	return idx >= 0 && idx < 256 && strings.Contains(content, `"content":"`)
+}
+
+const retainedOwnerContextMarker = "Retained owner context: "
+
+// extractRetainedOwnerContext returns the `Retained owner context:` sections of the
+// <turn-context> blocks in s. Sailry answers load_skill / read_skill_resource with a stub
+// ("Full content is supplied in retained owner context") and re-attaches the exact result in
+// the next turn's <turn-context>; unlike the environment snapshot around it, that section is
+// task state and must survive the turn-context stripping of a history rebuild.
+func extractRetainedOwnerContext(s string) []string {
+	var sections []string
+	pos := 0
+	for {
+		start := strings.Index(s[pos:], "<turn-context>")
+		if start < 0 {
+			break
+		}
+		start += pos + len("<turn-context>")
+		end := strings.Index(s[start:], "</turn-context>")
+		if end < 0 {
+			end = len(s) - start
+		}
+		block := s[start : start+end]
+		pos = start + end
+		for {
+			idx := strings.Index(block, retainedOwnerContextMarker)
+			if idx < 0 {
+				break
+			}
+			block = block[idx:]
+			next := strings.Index(block[len(retainedOwnerContextMarker):], "\n"+retainedOwnerContextMarker)
+			section := block
+			if next >= 0 {
+				section = block[:len(retainedOwnerContextMarker)+next]
+			}
+			block = block[len(section):]
+			if trimmed := strings.TrimSpace(section); trimmed != "" {
+				sections = append(sections, trimmed)
+			}
+		}
+	}
+	return sections
+}
+
+// attachRetainedOwnerContext folds retained owner context sections into the tool result they
+// belong to (the latest TOOL whose stub names the same path, else the latest TOOL of the
+// current run), mirroring how the live turn delivered them. A resource already attached earlier
+// is replaced by a one-line reference so repeated loads of one skill are not duplicated.
+func attachRetainedOwnerContext(cleaned []cleanMsg, sections []string, seen map[string]bool) []cleanMsg {
+	for _, section := range sections {
+		header, _, _ := strings.Cut(section, "\n")
+		header = strings.TrimSpace(header)
+		text := section
+		if seen[header] {
+			text = "[" + header + " — same content as the copy shown earlier in this history]"
+		}
+		seen[header] = true
+
+		target := -1
+		path := retainedOwnerContextPath(header)
+		for i := len(cleaned) - 1; i >= 0 && cleaned[i].role == "TOOL"; i-- {
+			if target < 0 {
+				target = i
+			}
+			if path != "" && strings.Contains(cleaned[i].content, `"path":"`+path+`"`) {
+				target = i
+				break
+			}
+		}
+		if target < 0 {
+			cleaned = append(cleaned, cleanMsg{role: "CONTEXT", content: text})
+			continue
+		}
+		cleaned[target].content += "\n\n" + text
+	}
+	return cleaned
+}
+
+// retainedOwnerContextPath returns the resource path of a `Retained owner context:
+// skill:<package>:<skill>:<path>` header, or "" when the header has another shape.
+func retainedOwnerContextPath(header string) string {
+	id := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(header), retainedOwnerContextMarker))
+	parts := strings.SplitN(id, ":", 4)
+	if len(parts) != 4 || parts[0] != "skill" {
+		return ""
+	}
+	return parts[3]
+}
+
+// executedToolCallLedger lists the distinct tool calls already made in the active task so a
+// rebuilt session knows what has been done even when the matching outputs were compressed or
+// omitted; without it the model re-runs the workflow from the first step after every rotation.
+func executedToolCallLedger(msgs []cleanMsg, inActiveTask func(int) bool, budget int) string {
+	if budget <= 0 {
+		return ""
+	}
+	type ledgerEntry struct {
+		text  string
+		count int
+		last  int
+	}
+	byKey := make(map[string]*ledgerEntry)
+	var entries []*ledgerEntry
+	total := 0
+	for i, m := range msgs {
+		if m.role != "ASSISTANT" || !inActiveTask(i) {
+			continue
+		}
+		for _, c := range parseToolCallLines(m.content) {
+			total++
+			key := c.name + "(" + c.args + ")"
+			if e, ok := byKey[key]; ok {
+				e.count++
+				e.last = total
+				continue
+			}
+			e := &ledgerEntry{text: truncateUTF8Middle(key, 200, "…"), count: 1, last: total}
+			byKey[key] = e
+			entries = append(entries, e)
+		}
+	}
+	if total < 2 {
+		return ""
+	}
+	sort.SliceStable(entries, func(a, b int) bool { return entries[a].last < entries[b].last })
+
+	var kept []string
+	used := 0
+	for j := len(entries) - 1; j >= 0; j-- {
+		line := "- " + entries[j].text
+		if entries[j].count > 1 {
+			line += fmt.Sprintf(" ×%d", entries[j].count)
+		}
+		line += "\n"
+		if used+len(line) > budget {
+			break
+		}
+		kept = append(kept, line)
+		used += len(line)
+	}
+
+	var sb strings.Builder
+	sb.WriteString("[Executed Tool Calls In This Task]\n")
+	sb.WriteString(fmt.Sprintf("These %d tool calls (%d distinct) already ran in this task; their results are shown in this prompt or were compressed. Do NOT repeat them or restart the workflow from its first step—continue with the next unfinished step, and re-run a call only when you need exact content that is no longer shown.\n", total, len(entries)))
+	if omitted := len(entries) - len(kept); omitted > 0 {
+		sb.WriteString(fmt.Sprintf("- ... (%d older distinct calls omitted)\n", omitted))
+	}
+	for j := len(kept) - 1; j >= 0; j-- {
+		sb.WriteString(kept[j])
+	}
+	sb.WriteString("\n")
+	return sb.String()
 }
 
 // ComputeNorthboundUsageInputTokens is exported for unit testing the client-first,
@@ -1701,6 +2007,11 @@ func (gs *GatewayServer) executeNorthboundTurn(w http.ResponseWriter, r *http.Re
 	if canReq.ContextWindow <= 0 {
 		if keyRec, ok := ctx.Value(ctxKeyAPIKey).(*storage.APIKey); ok && keyRec != nil && keyRec.ContextWindow > 0 {
 			canReq.ContextWindow = keyRec.ContextWindow
+		}
+	}
+	if gs.pool != nil {
+		if tier, ok := gs.pool.ContextPatchTier(canReq.ContextWindow); ok {
+			canReq.SessionCeilingTokens = patchedSessionCeiling(tier, canReq.Model)
 		}
 	}
 	isClientCompaction := IsClientCompactionRequest(canReq)
@@ -4150,7 +4461,7 @@ func (gs *GatewayServer) reconcileAuditWithTranscript(
 					sess.SetLastTranscriptStep(stepInfo.stepIndex)
 				}
 				sess.SetLastTokenUsage(stepInfo.inputTokens, stepInfo.cachedTokens)
-				if stepInfo.inputTokens >= acpCompactionTriggerTokens {
+				if stepInfo.inputTokens >= acpCompactionWatermark(canReq) {
 					alreadyReq, waitTurns := sess.GetClientCompactionState()
 					if !alreadyReq {
 						sess.SetClientCompactionState(true, waitTurns)

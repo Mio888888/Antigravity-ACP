@@ -30,21 +30,24 @@ type CanonicalToolCall struct {
 }
 
 type CanonicalRequest struct {
-	Protocol          string                `json:"protocol"` // "openai" | "openai_responses" | "claude"
-	Model             string                `json:"model"`
-	Stream            bool                  `json:"stream"`
-	ThinkingLevel     string                `json:"thinking_level"` // "low" | "medium" | "high"
-	ContextWindow     int64                 `json:"context_window,omitempty"`
-	SessionHeader     string                `json:"session_header"`
-	ClientSessionID   string                `json:"client_session_id,omitempty"`
-	SessionTitle      string                `json:"session_title,omitempty"`
-	SystemPrompt      string                `json:"system_prompt"`
-	Messages          []CanonicalMessage    `json:"messages"`
-	PromptBlocks      []acp.PromptBlock     `json:"prompt_blocks"`
-	Tools             []acp.ToolDefinition  `json:"tools"`
-	ToolResults       []CanonicalToolResult `json:"tool_results"`
-	HistoryHashBefore string                `json:"history_hash_before"`
-	HistoryHashFull   string                `json:"history_hash_full"`
+	Protocol      string `json:"protocol"` // "openai" | "openai_responses" | "claude"
+	Model         string `json:"model"`
+	Stream        bool   `json:"stream"`
+	ThinkingLevel string `json:"thinking_level"` // "low" | "medium" | "high"
+	ContextWindow int64  `json:"context_window,omitempty"`
+	// SessionCeilingTokens is the compaction ceiling the serving ACP backend actually
+	// enforces (set by the gateway when context patching is active; 0 = unpatched default).
+	SessionCeilingTokens int64                 `json:"-"`
+	SessionHeader        string                `json:"session_header"`
+	ClientSessionID      string                `json:"client_session_id,omitempty"`
+	SessionTitle         string                `json:"session_title,omitempty"`
+	SystemPrompt         string                `json:"system_prompt"`
+	Messages             []CanonicalMessage    `json:"messages"`
+	PromptBlocks         []acp.PromptBlock     `json:"prompt_blocks"`
+	Tools                []acp.ToolDefinition  `json:"tools"`
+	ToolResults          []CanonicalToolResult `json:"tool_results"`
+	HistoryHashBefore    string                `json:"history_hash_before"`
+	HistoryHashFull      string                `json:"history_hash_full"`
 	// SessionNamespace scopes session keys and history hashes (e.g. per API key) so
 	// different callers can never match each other's sessions. Set by the server.
 	SessionNamespace string `json:"-"`

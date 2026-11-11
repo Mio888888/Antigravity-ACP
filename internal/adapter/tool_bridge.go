@@ -74,6 +74,31 @@ func sanitizeSchemaNode(node map[string]any) map[string]any {
 		}
 	}
 
+	// Gemini rejects function declarations whose enum contains an empty string
+	// ("enum[N]: cannot be empty"), failing the whole turn with INVALID_ARGUMENT. Clients
+	// commonly use "" (or null) to mean "unset", so drop those values; omission already
+	// expresses "unset", and null is preserved as nullable.
+	if rawEnum, ok := node["enum"].([]any); ok {
+		kept := make([]any, 0, len(rawEnum))
+		for _, v := range rawEnum {
+			switch ev := v.(type) {
+			case nil:
+				node["nullable"] = true
+				continue
+			case string:
+				if strings.TrimSpace(ev) == "" {
+					continue
+				}
+			}
+			kept = append(kept, v)
+		}
+		if len(kept) == 0 {
+			delete(node, "enum")
+		} else {
+			node["enum"] = kept
+		}
+	}
+
 	if props, ok := node["properties"].(map[string]any); ok {
 		for k, v := range props {
 			if propMap, ok := v.(map[string]any); ok {

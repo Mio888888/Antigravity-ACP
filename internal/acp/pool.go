@@ -434,21 +434,32 @@ func (mp *MultiAccountPool) AcquireForAccountForModel(ctx context.Context, prefe
 // ResolveContextSize maps a client's context window to the `--context-size` value
 // workers serving it are started with (0 when the flag is not passed).
 func (mp *MultiAccountPool) ResolveContextSize(clientContextWindow int64) int64 {
+	if tier, ok := mp.ContextPatchTier(clientContextWindow); ok {
+		return tier
+	}
 	mp.mu.Lock()
 	poolCfg := mp.poolCfg
 	mp.mu.Unlock()
-	// When context-window patching is enabled for the CLI backend, the effective window
-	// follows the client's request (or the configured default when absent), snapped to
-	// the nearest preset tier. Each tier runs from its own patched agy copy, so this
-	// value both selects the worker pool and drives which patched binary is launched.
-	if poolCfg.ContextPatch && ctxpatch.IsCLIBinary(ResolveACPBinaryPath(poolCfg.BackendType, poolCfg.BinaryPath)) {
-		base := clientContextWindow
-		if base <= 0 {
-			base = poolCfg.ContextPatchTokens
-		}
-		return NearestContextPreset(base)
-	}
 	return ResolveWorkerContextSize(poolCfg, clientContextWindow)
+}
+
+// ContextPatchTier reports the patched compaction tier that serves clientContextWindow and
+// whether context-window patching is active for the current backend. When active, the
+// effective window follows the client's request (or the configured default when absent),
+// snapped to the nearest preset tier; each tier runs from its own patched agy copy, so the
+// tier both selects the worker pool and is the ceiling agy enforces (0 = full window).
+func (mp *MultiAccountPool) ContextPatchTier(clientContextWindow int64) (int64, bool) {
+	mp.mu.Lock()
+	poolCfg := mp.poolCfg
+	mp.mu.Unlock()
+	if !poolCfg.ContextPatch || !ctxpatch.IsCLIBinary(ResolveACPBinaryPath(poolCfg.BackendType, poolCfg.BinaryPath)) {
+		return 0, false
+	}
+	base := clientContextWindow
+	if base <= 0 {
+		base = poolCfg.ContextPatchTokens
+	}
+	return NearestContextPreset(base), true
 }
 
 // resolveWorkerBinary returns the executable a worker should launch. When context-window

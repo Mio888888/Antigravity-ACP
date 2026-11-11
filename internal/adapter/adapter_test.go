@@ -3,6 +3,7 @@ package adapter_test
 import (
 	"encoding/json"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -241,6 +242,29 @@ func TestParseOpenAIAndClaudeRequestsAndSystemPromptPolicy(t *testing.T) {
 	expRev, _ := props["expected_revision"].(map[string]any)
 	if expRev["type"] != "string" || expRev["nullable"] != true {
 		t.Fatalf("expected union type [\"string\",\"null\"] to normalize to type=string, nullable=true, got %+v", expRev)
+	}
+
+	// Gemini rejects empty enum values ("enum[2]: cannot be empty"); they must be stripped,
+	// null must become nullable, and an enum left empty must be removed. Nested schemas too.
+	enumSchema := adapter.EnsureObjectSchema(json.RawMessage(`{"type":"object","properties":{
+		"role":{"type":"string","enum":["explorer","reviewer",""]},
+		"mode":{"type":"string","enum":["plan",null]},
+		"blank":{"type":"string","enum":["", " "]},
+		"agents":{"type":"array","items":{"type":"object","properties":{"role":{"type":"string","enum":["","worker"]}}}}
+	}}`))
+	eprops, _ := enumSchema["properties"].(map[string]any)
+	if got := eprops["role"].(map[string]any)["enum"]; !reflect.DeepEqual(got, []any{"explorer", "reviewer"}) {
+		t.Fatalf("expected empty enum value stripped, got %#v", got)
+	}
+	if mode := eprops["mode"].(map[string]any); !reflect.DeepEqual(mode["enum"], []any{"plan"}) || mode["nullable"] != true {
+		t.Fatalf("expected null enum value to become nullable, got %+v", mode)
+	}
+	if _, ok := eprops["blank"].(map[string]any)["enum"]; ok {
+		t.Fatalf("expected an all-empty enum to be removed, got %+v", eprops["blank"])
+	}
+	nested := eprops["agents"].(map[string]any)["items"].(map[string]any)["properties"].(map[string]any)["role"].(map[string]any)
+	if !reflect.DeepEqual(nested["enum"], []any{"worker"}) {
+		t.Fatalf("expected nested empty enum value stripped, got %#v", nested["enum"])
 	}
 
 	// 7. Test SessionUpdateParams ContentBlock unmarshaling for both object and tool_call_update array shapes
