@@ -39,6 +39,9 @@ type ACPPoolConfig struct {
 	MaxWorkers         int               `yaml:"max_workers" json:"max_workers"`
 	MaxIdleTimeSec     int               `yaml:"max_idle_time_sec" json:"max_idle_time_sec"`
 	ToolParkTimeoutSec int               `yaml:"tool_park_timeout_sec" json:"tool_park_timeout_sec"`
+	ContextSize        int64             `yaml:"context_size" json:"context_size"`
+	ContextPatch       bool              `yaml:"context_patch" json:"context_patch"`
+	ContextPatchTokens int64             `yaml:"context_patch_tokens" json:"context_patch_tokens"`
 	ExtraArgs          []string          `yaml:"extra_args" json:"extra_args"`
 	Env                map[string]string `yaml:"env" json:"env"`
 }
@@ -103,6 +106,8 @@ func Load(path string) (*Config, error) {
 			MaxWorkers:         5,
 			MaxIdleTimeSec:     600,
 			ToolParkTimeoutSec: 180,
+			ContextPatch:       true,
+			ContextPatchTokens: 400000,
 			Env:                map[string]string{},
 		},
 		PromptPolicy: PromptPolicyConfig{
@@ -143,6 +148,21 @@ func Load(path string) (*Config, error) {
 	}
 	if envWs := strings.TrimSpace(os.Getenv("AG_WORKSPACE_DIR")); envWs != "" {
 		cfg.ACPPool.WorkspaceDir = envWs
+	}
+	if envCtx := strings.TrimSpace(os.Getenv("AG_ACP_CONTEXT_SIZE")); envCtx != "" {
+		if n, err := strconv.ParseInt(envCtx, 10, 64); err == nil && n >= 0 {
+			cfg.ACPPool.ContextSize = n
+		}
+	}
+	if envPatch := strings.TrimSpace(os.Getenv("AG_ACP_CONTEXT_PATCH")); envPatch != "" {
+		if b, err := strconv.ParseBool(envPatch); err == nil {
+			cfg.ACPPool.ContextPatch = b
+		}
+	}
+	if envPatchTok := strings.TrimSpace(os.Getenv("AG_ACP_CONTEXT_PATCH_TOKENS")); envPatchTok != "" {
+		if n, err := strconv.ParseInt(envPatchTok, 10, 64); err == nil && n >= 0 {
+			cfg.ACPPool.ContextPatchTokens = n
+		}
 	}
 	if strings.TrimSpace(cfg.ACPPool.BackendType) == "" {
 		cfg.ACPPool.BackendType = "cli"
@@ -194,6 +214,30 @@ func (c *Config) GetACPPool() ACPPoolConfig {
 	}
 	cp.Env = envCopy
 	return cp
+}
+
+func (c *Config) SetBackendType(backendType string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if bt := strings.TrimSpace(backendType); bt != "" {
+		c.ACPPool.BackendType = bt
+	}
+}
+
+func (c *Config) GetContextPatch() (enabled bool, tokens int64) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.ACPPool.ContextPatch, c.ACPPool.ContextPatchTokens
+}
+
+func (c *Config) SetContextPatch(enabled bool, tokens int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ACPPool.ContextPatch = enabled
+	if tokens < 0 {
+		tokens = 0
+	}
+	c.ACPPool.ContextPatchTokens = tokens
 }
 
 func (c *Config) UpdateACPEnv(updates map[string]string) {

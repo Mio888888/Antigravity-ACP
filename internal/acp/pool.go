@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"antigravity-gateway/internal/acp/ctxpatch"
 	"antigravity-gateway/internal/config"
 	"antigravity-gateway/internal/storage"
 )
@@ -35,6 +37,7 @@ type WorkerSnapshot struct {
 	AccountID     string               `json:"account_id"`
 	PID           int                  `json:"pid"`
 	State         WorkerState          `json:"state"`
+	ContextSize   int64                `json:"context_size,omitempty"`
 	LastActiveAt  time.Time            `json:"last_active_at"`
 	BoundSessions []WorkerBoundSession `json:"bound_sessions,omitempty"`
 }
@@ -116,6 +119,32 @@ func (sp *accountSubPool) sweepRetiredRelaysLocked() {
 	sp.retiredRelays = kept
 }
 
+// evictMismatchedIdleWorkerLocked frees a max_workers slot held by an idle worker that
+// cannot serve contextSize (different context size or stale generation), preferring
+// unbound and least recently used workers. The caller closes the returned worker.
+func (sp *accountSubPool) evictMismatchedIdleWorkerLocked(contextSize int64) *WorkerClient {
+	var cands []*WorkerClient
+	for _, w := range sp.workers {
+		if w.GetState() == StateIdle && (w.ContextSize != contextSize || w.poolGen != sp.gen) {
+			cands = append(cands, w)
+		}
+	}
+	sort.Slice(cands, func(i, j int) bool {
+		bi, bj := cands[i].BoundSessionCount(), cands[j].BoundSessionCount()
+		if bi != bj {
+			return bi < bj
+		}
+		return cands[i].LastActiveAt().Before(cands[j].LastActiveAt())
+	})
+	for _, w := range cands {
+		if w.TryMarkBusy() {
+			delete(sp.workers, w.ID)
+			return w
+		}
+	}
+	return nil
+}
+
 type MultiAccountPool struct {
 	mu               sync.Mutex
 	discoverMu       sync.Mutex
@@ -131,7 +160,18 @@ type MultiAccountPool struct {
 	modelsCacheTTL   time.Duration
 	stopCh           chan struct{}
 	closeOnce        sync.Once
+	ctxPatchMu       sync.Mutex
+	baseFingerprint  string               // size-mtime of the agy binary last resolved
+	activeVersion    string               // version key currently serving (may lag base after a bad upgrade)
+	activeVerDir     string               // on-disk directory of the active version
+	versionUsed      map[string]time.Time // recency per version for LRU retention
 }
+
+// maxPatchedVersions bounds how many agy versions keep their context-patch tier copies on
+// disk. Each version holds up to one copy per preset tier (~200MB each), so only the two
+// most recently used versions are retained; this also leaves the previous version in place
+// to fall back to when a freshly installed agy cannot be patched.
+const maxPatchedVersions = 2
 
 func NewMultiAccountPool(dataDir string, poolCfg config.ACPPoolConfig, sandboxCfg config.SandboxPolicyConfig, accounts []storage.Account, wiretap WiretapCallback) (*MultiAccountPool, error) {
 	if dataDir == "" {
@@ -145,6 +185,7 @@ func NewMultiAccountPool(dataDir string, poolCfg config.ACPPoolConfig, sandboxCf
 		subPools:       make(map[string]*accountSubPool),
 		modelsCacheTTL: DefaultModelsCacheTTL,
 		stopCh:         make(chan struct{}),
+		versionUsed:    make(map[string]time.Time),
 	}
 
 	if len(accounts) == 0 {
@@ -387,6 +428,266 @@ func (mp *MultiAccountPool) AcquireForAccount(ctx context.Context, preferredAcco
 }
 
 func (mp *MultiAccountPool) AcquireForAccountForModel(ctx context.Context, preferredAccountID string, allowFailover bool, modelID string) (*WorkerClient, storage.Account, error) {
+	return mp.AcquireForAccountWithContextSize(ctx, preferredAccountID, allowFailover, modelID, mp.ResolveContextSize(0))
+}
+
+// ResolveContextSize maps a client's context window to the `--context-size` value
+// workers serving it are started with (0 when the flag is not passed).
+func (mp *MultiAccountPool) ResolveContextSize(clientContextWindow int64) int64 {
+	mp.mu.Lock()
+	poolCfg := mp.poolCfg
+	mp.mu.Unlock()
+	// When context-window patching is enabled for the CLI backend, the effective window
+	// follows the client's request (or the configured default when absent), snapped to
+	// the nearest preset tier. Each tier runs from its own patched agy copy, so this
+	// value both selects the worker pool and drives which patched binary is launched.
+	if poolCfg.ContextPatch && ctxpatch.IsCLIBinary(ResolveACPBinaryPath(poolCfg.BackendType, poolCfg.BinaryPath)) {
+		base := clientContextWindow
+		if base <= 0 {
+			base = poolCfg.ContextPatchTokens
+		}
+		return NearestContextPreset(base)
+	}
+	return ResolveWorkerContextSize(poolCfg, clientContextWindow)
+}
+
+// resolveWorkerBinary returns the executable a worker should launch. When context-window
+// patching is enabled for the CLI backend, each context-size tier runs from its own patched
+// copy of agy so the model's compaction ceiling tracks the client's requested window. Copies
+// are grouped per agy version under <dataDir>/acp-ctxpatch/<version>/<tier>/agy, and the two
+// most recent versions are retained. If a freshly installed agy version cannot be patched,
+// the previous version keeps serving. Non-CLI backends and the no-patch path use the base
+// binary unchanged.
+func (mp *MultiAccountPool) resolveWorkerBinary(poolCfg config.ACPPoolConfig, tier int64) string {
+	base := ResolveACPBinaryPath(poolCfg.BackendType, poolCfg.BinaryPath)
+	if !poolCfg.ContextPatch || !ctxpatch.IsCLIBinary(base) {
+		return base
+	}
+	patched, err := mp.resolveTierBinary(base, tier)
+	if err != nil {
+		log.Printf("acp: context-patch tier binary (%d tokens) unavailable, falling back to %s: %v", tier, base, err)
+		return base
+	}
+	return patched
+}
+
+// resolveTierBinary returns a patched copy of agy for the given tier, selecting which agy
+// version serves the request. On a version change it verifies the new binary is patchable
+// (by materializing the requested tier from it); if it is not, the previously active version
+// keeps serving so a bad upgrade does not break context patching.
+func (mp *MultiAccountPool) resolveTierBinary(base string, tier int64) (string, error) {
+	mp.ctxPatchMu.Lock()
+	defer mp.ctxPatchMu.Unlock()
+
+	fp := fileFingerprint(base)
+
+	// Fast path: the agy binary is unchanged since the last resolution.
+	if fp != "" && fp == mp.baseFingerprint && mp.activeVerDir != "" {
+		mp.versionUsed[mp.activeVersion] = time.Now()
+		return mp.ensureTierInVersionLocked(mp.activeVerDir, base, tier)
+	}
+
+	root := filepath.Join(mp.dataDir, "acp-ctxpatch")
+	ver := agyVersionKey(base)
+	verDir := filepath.Join(root, ver)
+
+	// Version already materialized (this run or a previous one): reactivate it.
+	if dirHasTier(verDir) {
+		mp.setActiveVersionLocked(ver, verDir, fp)
+		mp.pruneVersionsLocked()
+		return mp.ensureTierInVersionLocked(verDir, base, tier)
+	}
+
+	// New version: prove it is patchable by materializing the requested tier from base.
+	if err := os.MkdirAll(verDir, 0o755); err != nil {
+		return "", err
+	}
+	tierPath, err := mp.ensureTierInVersionLocked(verDir, base, tier)
+	if err == nil {
+		mp.setActiveVersionLocked(ver, verDir, fp)
+		mp.pruneVersionsLocked()
+		return tierPath, nil
+	}
+
+	// New version is not patchable: discard the partial copy and keep the old version.
+	os.RemoveAll(verDir)
+	mp.baseFingerprint = fp // remember the bad binary so the probe is not repeated each spawn
+	if mp.activeVerDir != "" && dirHasTier(mp.activeVerDir) {
+		log.Printf("acp: agy version %q does not support context patching (%v); keeping previous version %q", ver, err, mp.activeVersion)
+		mp.versionUsed[mp.activeVersion] = time.Now()
+		return mp.ensureTierInVersionLocked(mp.activeVerDir, base, tier)
+	}
+	return "", err
+}
+
+func (mp *MultiAccountPool) setActiveVersionLocked(ver, verDir, fp string) {
+	mp.activeVersion = ver
+	mp.activeVerDir = verDir
+	mp.baseFingerprint = fp
+	mp.versionUsed[ver] = time.Now()
+}
+
+// ensureTierInVersionLocked returns the path to a tier copy inside verDir, creating it from
+// an existing same-version tier when one is present (so it always matches verDir's agy
+// version, even when base now points at a different one) or from base when the version has
+// no copies yet. Callers hold ctxPatchMu.
+func (mp *MultiAccountPool) ensureTierInVersionLocked(verDir, base string, tier int64) (string, error) {
+	target := filepath.Join(verDir, strconv.FormatInt(tier, 10), "agy")
+	if st, err := os.Stat(target); err == nil && !st.IsDir() {
+		return target, nil
+	}
+	donor := findVersionTierBinary(verDir)
+	if donor == "" {
+		donor = base
+	}
+	mode := os.FileMode(0o755)
+	if info, err := os.Stat(donor); err == nil {
+		mode = info.Mode()
+	}
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return "", err
+	}
+	if err := copyFilePreserveMode(donor, target, mode); err != nil {
+		return "", err
+	}
+	if _, err := ctxpatch.Apply(target, tier); err != nil {
+		os.Remove(target)
+		return "", err
+	}
+	return target, nil
+}
+
+// pruneVersionsLocked keeps at most maxPatchedVersions version directories, evicting the
+// least-recently-used (never the active one). Recency comes from in-memory tracking,
+// falling back to directory mtime for versions left over from a prior run. Removal is
+// best-effort: a running worker keeps its own file handle on unix, and a locked file on
+// Windows is simply skipped. Callers hold ctxPatchMu.
+func (mp *MultiAccountPool) pruneVersionsLocked() {
+	root := filepath.Join(mp.dataDir, "acp-ctxpatch")
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return
+	}
+	type verDir struct {
+		name string
+		used time.Time
+	}
+	var dirs []verDir
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		used, ok := mp.versionUsed[e.Name()]
+		if !ok {
+			if info, err := e.Info(); err == nil {
+				used = info.ModTime()
+			}
+		}
+		dirs = append(dirs, verDir{name: e.Name(), used: used})
+	}
+	if len(dirs) <= maxPatchedVersions {
+		return
+	}
+	sort.Slice(dirs, func(i, j int) bool { return dirs[i].used.Before(dirs[j].used) })
+	toRemove := len(dirs) - maxPatchedVersions
+	for _, d := range dirs {
+		if toRemove <= 0 {
+			break
+		}
+		if d.name == mp.activeVersion {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(root, d.name)); err != nil {
+			log.Printf("acp: could not prune context-patch version %q: %v", d.name, err)
+			continue
+		}
+		delete(mp.versionUsed, d.name)
+		toRemove--
+	}
+}
+
+func fileFingerprint(path string) string {
+	st, err := os.Stat(path)
+	if err != nil {
+		return ""
+	}
+	return fmt.Sprintf("%d-%d", st.Size(), st.ModTime().UnixNano())
+}
+
+func dirHasTier(verDir string) bool { return findVersionTierBinary(verDir) != "" }
+
+// findVersionTierBinary returns the path of any existing tier copy inside verDir, or "".
+func findVersionTierBinary(verDir string) string {
+	entries, err := os.ReadDir(verDir)
+	if err != nil {
+		return ""
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		if _, err := strconv.ParseInt(e.Name(), 10, 64); err != nil {
+			continue
+		}
+		cand := filepath.Join(verDir, e.Name(), "agy")
+		if st, err := os.Stat(cand); err == nil && !st.IsDir() {
+			return cand
+		}
+	}
+	return ""
+}
+
+var agyVersionTokenRe = regexp.MustCompile(`[0-9]+\.[0-9]+\.[0-9]+`)
+
+// agyVersionKey derives a filesystem-safe, patch-stable identity for the agy binary at
+// path. It prefers the semver reported by `agy --version` (which our in-place patching does
+// not change) and falls back to the file size when the version cannot be read.
+func agyVersionKey(path string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, path, "--version")
+	cmd.Env = SanitizedParentEnv()
+	if out, err := cmd.Output(); err == nil {
+		if m := agyVersionTokenRe.FindString(string(out)); m != "" {
+			return "v" + m
+		}
+	}
+	if st, err := os.Stat(path); err == nil {
+		return fmt.Sprintf("sz%d", st.Size())
+	}
+	return "unknown"
+}
+
+func copyFilePreserveMode(src, dst string, mode os.FileMode) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	tmp := dst + ".tmp"
+	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, mode.Perm())
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := out.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Chmod(tmp, mode.Perm()); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, dst)
+}
+
+// AcquireForAccountWithContextSize acquires a worker started with exactly contextSize
+// (as returned by ResolveContextSize), reusing an idle one or spawning a new process.
+func (mp *MultiAccountPool) AcquireForAccountWithContextSize(ctx context.Context, preferredAccountID string, allowFailover bool, modelID string, contextSize int64) (*WorkerClient, storage.Account, error) {
 	mp.mu.Lock()
 	if modelID != "" && preferredAccountID != "" && preferredAccountID != "auto" && !allowFailover {
 		if sp, ok := mp.subPools[preferredAccountID]; ok && sp.account.Enabled && sp.account.IsModelDisabled(modelID) {
@@ -406,7 +707,7 @@ func (mp *MultiAccountPool) AcquireForAccountForModel(ctx context.Context, prefe
 
 	var lastErr error
 	for _, accID := range candidates {
-		w, acc, err := mp.acquireFromSpecificAccount(ctx, accID)
+		w, acc, err := mp.acquireFromSpecificAccount(ctx, accID, contextSize)
 		if err == nil {
 			return w, acc, nil
 		}
@@ -510,7 +811,7 @@ func (mp *MultiAccountPool) selectCandidateAccountsForModelLocked(preferred stri
 	return out
 }
 
-func (mp *MultiAccountPool) acquireFromSpecificAccount(ctx context.Context, accountID string) (*WorkerClient, storage.Account, error) {
+func (mp *MultiAccountPool) acquireFromSpecificAccount(ctx context.Context, accountID string, contextSize int64) (*WorkerClient, storage.Account, error) {
 	mp.mu.Lock()
 	sp, ok := mp.subPools[accountID]
 	if !ok {
@@ -519,7 +820,8 @@ func (mp *MultiAccountPool) acquireFromSpecificAccount(ctx context.Context, acco
 	}
 
 	// Clean dead workers and prefer an unbound idle worker so new requests do not steal
-	// a worker process that already holds a sticky session in memory.
+	// a worker process that already holds a sticky session in memory. The context size
+	// is fixed at process start, so only workers launched with the same size qualify.
 	var idle []*WorkerClient
 	for id, w := range sp.workers {
 		st := w.GetState()
@@ -528,7 +830,7 @@ func (mp *MultiAccountPool) acquireFromSpecificAccount(ctx context.Context, acco
 			go func(w *WorkerClient) { _ = w.Close() }(w)
 			continue
 		}
-		if st == StateIdle && w.poolGen == sp.gen {
+		if st == StateIdle && w.poolGen == sp.gen && w.ContextSize == contextSize {
 			idle = append(idle, w)
 		}
 	}
@@ -559,9 +861,13 @@ func (mp *MultiAccountPool) acquireFromSpecificAccount(ctx context.Context, acco
 		maxW = mp.poolCfg.MaxWorkers
 	}
 	if maxW > 0 && len(sp.workers)+sp.pending >= maxW {
-		acc := sp.account
-		mp.mu.Unlock()
-		return nil, acc, fmt.Errorf("account %q reached max_workers limit (%d)", accountID, maxW)
+		victim := sp.evictMismatchedIdleWorkerLocked(contextSize)
+		if victim == nil {
+			acc := sp.account
+			mp.mu.Unlock()
+			return nil, acc, fmt.Errorf("account %q reached max_workers limit (%d)", accountID, maxW)
+		}
+		go func(w *WorkerClient) { _ = w.Close() }(victim)
 	}
 	sp.pending++
 	reserved := true
@@ -595,7 +901,7 @@ func (mp *MultiAccountPool) acquireFromSpecificAccount(ctx context.Context, acco
 	w, err := NewWorkerClient(ctx, workerID, WorkerLaunchOptions{
 		AccountID:           acc.ID,
 		BackendType:         poolCfg.BackendType,
-		BinaryPath:          ResolveACPBinaryPath(poolCfg.BackendType, poolCfg.BinaryPath),
+		BinaryPath:          mp.resolveWorkerBinary(poolCfg, contextSize),
 		WorkspaceDir:        accountWorkDir,
 		AdditionalDirs:      poolCfg.AdditionalDirs,
 		AgentName:           poolCfg.AgentName,
@@ -605,6 +911,7 @@ func (mp *MultiAccountPool) acquireFromSpecificAccount(ctx context.Context, acco
 		DisableTelemetry:    poolCfg.DisableTelemetry,
 		LogFile:             poolCfg.LogFile,
 		IDEMCPPort:          poolCfg.IDEMCPPort,
+		ContextSize:         contextSize,
 		ExtraArgs:           poolCfg.ExtraArgs,
 		Env:                 env,
 		NetNSName:           netns,
@@ -951,7 +1258,7 @@ func (mp *MultiAccountPool) GetOrDiscoverModels(ctx context.Context, preferredAc
 		err    error
 	)
 	if specificAccount {
-		worker, acc, err = mp.acquireFromSpecificAccount(dCtx, preferred)
+		worker, acc, err = mp.acquireFromSpecificAccount(dCtx, preferred, mp.ResolveContextSize(0))
 	} else {
 		worker, acc, err = mp.AcquireForAccount(dCtx, preferred, true)
 	}
@@ -1207,6 +1514,7 @@ func (mp *MultiAccountPool) Snapshot() []WorkerSnapshot {
 				AccountID:    w.AccountID,
 				PID:          w.PID,
 				State:        st,
+				ContextSize:  w.ContextSize,
 				LastActiveAt: w.LastActiveAt(),
 			})
 		}
@@ -1580,7 +1888,7 @@ func (mp *MultiAccountPool) FetchAccountQuotaViaACP(ctx context.Context, account
 		return groups, msg, err
 	}
 
-	worker, _, err := mp.acquireFromSpecificAccount(ctx, accountID)
+	worker, _, err := mp.acquireFromSpecificAccount(ctx, accountID, mp.ResolveContextSize(0))
 	if err != nil {
 		if IsAuthRequiredError(err) {
 			mp.MarkAccountAuthRequired(accountID)

@@ -621,6 +621,7 @@ func (gs *GatewayServer) handleAdminKeys(w http.ResponseWriter, r *http.Request)
 			SessionMode         string `json:"session_mode"`
 			GlobalPrependPrompt string `json:"global_prepend_prompt"`
 			DisableBuiltinTools *bool  `json:"disable_builtin_tools"`
+			ContextWindow       int64  `json:"context_window"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			writeJSONError(w, http.StatusBadRequest, err.Error())
@@ -647,6 +648,7 @@ func (gs *GatewayServer) handleAdminKeys(w http.ResponseWriter, r *http.Request)
 			SessionMode:         sessionMode,
 			GlobalPrependPrompt: body.GlobalPrependPrompt,
 			DisableBuiltinTools: disableBuiltin,
+			ContextWindow:       body.ContextWindow,
 		})
 		if err != nil {
 			writeJSONError(w, http.StatusBadRequest, err.Error())
@@ -684,6 +686,7 @@ func (gs *GatewayServer) handleAdminKeyDelete(w http.ResponseWriter, r *http.Req
 			SessionMode         string `json:"session_mode"`
 			GlobalPrependPrompt string `json:"global_prepend_prompt"`
 			DisableBuiltinTools *bool  `json:"disable_builtin_tools"`
+			ContextWindow       int64  `json:"context_window"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			writeJSONError(w, http.StatusBadRequest, err.Error())
@@ -701,6 +704,7 @@ func (gs *GatewayServer) handleAdminKeyDelete(w http.ResponseWriter, r *http.Req
 			SessionMode:         body.SessionMode,
 			GlobalPrependPrompt: body.GlobalPrependPrompt,
 			DisableBuiltinTools: disableBuiltin,
+			ContextWindow:       body.ContextWindow,
 		})
 		if err != nil {
 			writeJSONError(w, http.StatusBadRequest, err.Error())

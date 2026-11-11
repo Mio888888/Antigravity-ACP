@@ -890,6 +890,7 @@ ensure_acp_backend() {
       fi
       ;;
   esac
+  patch_cli_backend "$ROOT_DIR/bin/agy"
 }
 
 update_acp_backend() {
@@ -907,6 +908,7 @@ update_acp_backend() {
   if [[ "$UPDATE_BOTH_ACP" == "1" ]]; then
     install_cli_backend "$ROOT_DIR/bin"
     install_zed_backend "$ROOT_DIR/bin"
+    patch_cli_backend "$ROOT_DIR/bin/agy"
     return 0
   fi
 
@@ -937,6 +939,45 @@ update_acp_backend() {
       fi
       ;;
   esac
+  patch_cli_backend "$ROOT_DIR/bin/agy"
+}
+
+# Apply the context-window patch to a freshly installed Antigravity CLI binary using the
+# compiled gateway (single source of truth; no bash reimplementation). Honors the
+# acp_pool.context_patch / context_patch_tokens settings in config.yaml (default: on).
+# Non-fatal: a failure keeps the working, unpatched binary.
+patch_cli_backend() {
+  local agy_path="$1"
+  local gw="${2:-$GATEWAY_BIN}"
+  [[ -n "$agy_path" && -f "$agy_path" ]] || return 0
+  case "$(basename "$agy_path")" in
+    agy|agy.exe|antigravity|antigravity.exe) ;;
+    *) return 0 ;;
+  esac
+  local enabled
+  enabled="$(lower "$(read_config_value context_patch)")"
+  [[ -n "$enabled" ]] || enabled="true"
+  case "$enabled" in
+    0|false|no|off)
+      msg ">>> 配置中 context_patch 已关闭，跳过上下文窗口打补丁" \
+          ">>> context_patch disabled in config; skipping context-window patch"
+      return 0 ;;
+  esac
+  if [[ ! -x "$gw" ]]; then
+    msg ">>> 网关二进制尚未构建，部署期跳过打补丁 (网关启动时会自动打补丁)" \
+        ">>> Gateway binary not built yet; skipping deploy-time patch (it is applied on gateway startup)"
+    return 0
+  fi
+  local tokens patch_args
+  tokens="$(read_config_value context_patch_tokens)"
+  patch_args=(-config "$CFG_PATH" --patch-acp "$agy_path")
+  [[ -n "$tokens" ]] && patch_args+=(--patch-tokens "$tokens")
+  msg ">>> 正在为 Antigravity CLI 打上下文窗口补丁: ${agy_path} ..." \
+      ">>> Patching Antigravity CLI context window: ${agy_path} ..."
+  if ! "$gw" "${patch_args[@]}"; then
+    warn ">>> [警告] 上下文窗口打补丁失败，保留未打补丁的二进制 (网关启动时将重试)" \
+         ">>> [WARN] Context-window patch failed; keeping the unpatched binary (retried on gateway startup)"
+  fi
 }
 
 discover_acp_binary() {
@@ -1337,6 +1378,30 @@ install_service_acp_binary() {
     fi
   fi
   SERVICE_ACP_PATH="$dest"
+
+  # Patch the root-owned CLI copy at install time: the service runs as a low-privilege user
+  # that cannot write /usr/local/bin, so startup auto-patch would be a no-op there.
+  if [[ "$base" != agy_acp_server* ]]; then
+    local svc_enabled
+    svc_enabled="$(lower "$(read_config_value context_patch)")"
+    [[ -n "$svc_enabled" ]] || svc_enabled="true"
+    case "$svc_enabled" in
+      0|false|no|off) ;;
+      *)
+        if [[ -x "$SERVICE_BIN_DIR/antigravity-gateway" ]]; then
+          local svc_tokens svc_args
+          svc_tokens="$(read_config_value context_patch_tokens)"
+          svc_args=(-config "$CFG_PATH" --patch-acp "$dest")
+          [[ -n "$svc_tokens" ]] && svc_args+=(--patch-tokens "$svc_tokens")
+          msg ">>> 正在为系统服务的 Antigravity CLI 打上下文窗口补丁: ${dest} ..." \
+              ">>> Patching systemd-service Antigravity CLI context window: ${dest} ..."
+          sudo "$SERVICE_BIN_DIR/antigravity-gateway" "${svc_args[@]}" \
+            || warn ">>> [警告] 服务二进制打补丁失败，保留未打补丁的二进制" \
+                    ">>> [WARN] Service binary patch failed; keeping the unpatched binary"
+        fi
+        ;;
+    esac
+  fi
 }
 
 wait_for_service_health() {

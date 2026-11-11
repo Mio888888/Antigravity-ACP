@@ -129,6 +129,15 @@ COPY --from=go-builder /out/antigravity-gateway /usr/local/bin/antigravity-gatew
 COPY --from=go-builder /out/antigravity-probe /usr/local/bin/antigravity-probe
 COPY config/config.yaml /etc/antigravity-gateway/config.yaml
 
+# Apply the context-window patch to the root-owned CLI at build time: the container runs
+# as the unprivileged `agy` user and cannot rewrite /usr/local/bin/agy at startup. Honors
+# acp_pool.context_patch in config.yaml (default: on). Non-fatal.
+RUN set -eu; \
+    cp_enabled="$(awk -F: '/^[[:space:]]*context_patch[[:space:]]*:/ {v=$2; sub(/#.*/,"",v); gsub(/[[:space:]]/,"",v); print v; exit}' /etc/antigravity-gateway/config.yaml)"; \
+    if [ -x /usr/local/bin/agy ] && [ "$cp_enabled" != "false" ] && [ "$cp_enabled" != "0" ]; then \
+      antigravity-gateway -config /etc/antigravity-gateway/config.yaml --patch-acp /usr/local/bin/agy || echo "[ctxpatch] build-time patch skipped"; \
+    fi
+
 USER agy
 VOLUME ["/var/lib/antigravity-gateway", "/home/agy/.gemini", "/opt/antigravity-acp"]
 EXPOSE 8080

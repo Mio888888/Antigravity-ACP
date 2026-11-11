@@ -157,6 +157,7 @@ type APIKey struct {
 	SessionMode         string    `json:"session_mode"`          // "yolo" | "stateless_single_turn" | "sticky_conversation"
 	GlobalPrependPrompt string    `json:"global_prepend_prompt"` // Per-key system prompt prefix
 	DisableBuiltinTools bool      `json:"disable_builtin_tools"`
+	ContextWindow       int64     `json:"context_window"` // Per-key context window override (tokens); 0 = client-provided/auto
 	Enabled             bool      `json:"enabled"`
 	CreatedAt           time.Time `json:"created_at"`
 }

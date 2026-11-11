@@ -414,6 +414,32 @@ function Install-ZedBackend {
     }
 }
 
+# Apply the context-window patch to a freshly installed Antigravity CLI (agy.exe) via the
+# compiled gateway. Honors acp_pool.context_patch / context_patch_tokens (default: on).
+# Non-fatal: a failure keeps the working, unpatched binary.
+function Patch-CliBackend([string]$AgyPath = "$RootDir\bin\agy.exe") {
+    if (-not $AgyPath -or -not (Test-Path $AgyPath)) { return }
+    $enabled = (Read-ConfigValue "context_patch").ToLower()
+    if (-not $enabled) { $enabled = "true" }
+    if ($enabled -in @("0", "false", "no", "off")) {
+        Write-Bilingual ">>> 配置中 context_patch 已关闭，跳过上下文窗口打补丁" ">>> context_patch disabled in config; skipping context-window patch"
+        return
+    }
+    if (-not (Test-Path $GatewayExe)) {
+        Write-Bilingual ">>> 网关二进制尚未构建，部署期跳过打补丁 (网关启动时会自动打补丁)" ">>> Gateway binary not built yet; skipping deploy-time patch (applied on gateway startup)"
+        return
+    }
+    $tokens = Read-ConfigValue "context_patch_tokens"
+    $patchArgs = @("-config", $CfgPath, "--patch-acp", $AgyPath)
+    if ($tokens) { $patchArgs += @("--patch-tokens", $tokens) }
+    Write-Bilingual ">>> 正在为 Antigravity CLI 打上下文窗口补丁: $AgyPath ..." ">>> Patching Antigravity CLI context window: $AgyPath ..."
+    try {
+        & $GatewayExe @patchArgs
+    } catch {
+        Write-BilingualWarning ">>> [警告] 上下文窗口打补丁失败，保留未打补丁的二进制 (网关启动时将重试)" ">>> [WARN] Context-window patch failed; keeping the unpatched binary (retried on gateway startup)"
+    }
+}
+
 function Ensure-AcpBackend {
     if ($AcpBin) { return }
     if ($NoDownload) { return }
@@ -435,6 +461,7 @@ function Ensure-AcpBackend {
             }
         }
     }
+    Patch-CliBackend
 }
 
 function Update-AcpBackend {
@@ -450,6 +477,7 @@ function Update-AcpBackend {
     if ($UpdateBothAcp) {
         Install-CliBackend
         Install-ZedBackend
+        Patch-CliBackend
         return
     }
 
@@ -479,6 +507,7 @@ function Update-AcpBackend {
             }
         }
     }
+    Patch-CliBackend
 }
 
 function Resolve-AcpBinary {

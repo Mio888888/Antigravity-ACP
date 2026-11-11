@@ -112,6 +112,22 @@ func (ms *ManagedSession) SetLastTokenUsage(inputTokens, cachedTokens int64) {
 	ms.mu.Unlock()
 }
 
+// ResetTokenUsage clears the recorded token watermark and pending compaction state
+// after the gateway rotates the ACP session onto a compacted history, so the stale
+// pre-rotation reading does not re-trigger rotation on the following turn.
+func (ms *ManagedSession) ResetTokenUsage() {
+	if ms == nil {
+		return
+	}
+	ms.mu.Lock()
+	ms.LastInputTokens = 0
+	ms.LastCachedTokens = 0
+	ms.ClientCompactionRequested = false
+	ms.ClientCompactionWaitTurns = 0
+	ms.UpdatedAt = time.Now()
+	ms.mu.Unlock()
+}
+
 func (ms *ManagedSession) GetClientCompactionState() (requested bool, waitTurns int) {
 	if ms == nil {
 		return false, 0

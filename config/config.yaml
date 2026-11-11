@@ -30,6 +30,27 @@ acp_pool:
   max_workers: 5
   max_idle_time_sec: 600
   tool_park_timeout_sec: 180
+  # Context size passed to `agy acp --context-size` when a worker starts.
+  # The client's own context window (request context_window / model_context_window /
+  # metadata, or the X-Context-Window header) takes precedence; this value is the
+  # fallback when the client does not send one. 0 = only sync from the client.
+  # Skipped automatically if the agy binary does not support the flag, or if
+  # extra_args already contains --context-size. Env override: AG_ACP_CONTEXT_SIZE.
+  context_size: 0
+  # Binary context patch (Antigravity CLI / `agy` only). When true, the gateway
+  # rewrites agy's hardcoded 256,000-token compaction ceiling in place so ACP
+  # sessions use a larger window. This is the only mechanism that affects ACP mode
+  # (the --context-size flag and settings.json only apply to the interactive TUI).
+  # The patch is re-applied automatically after every agy auto-update and on startup;
+  # it is idempotent and leaves all other bytes unchanged (macOS copies are re-signed).
+  # Caveats: modifies Google's binary (TOS/account risk), raises quota consumption,
+  # and is only validated on macOS arm64. Env override: AG_ACP_CONTEXT_PATCH.
+  context_patch: true
+  # Target ceiling for context_patch, in tokens. 0 removes the clamp entirely so the
+  # model's full physical window applies (e.g. 786,432 for gemini-4-carbon); a positive
+  # value caps at that many tokens. The admin UI offers presets 128000 / 200000 /
+  # 256000 / 400000 / 1000000. Env override: AG_ACP_CONTEXT_PATCH_TOKENS.
+  context_patch_tokens: 400000
   extra_args: []
   env: {}
 

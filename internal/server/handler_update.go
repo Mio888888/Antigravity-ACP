@@ -8,6 +8,8 @@ import (
 	"strings"
 	"time"
 
+	"antigravity-gateway/internal/acp"
+	"antigravity-gateway/internal/acp/ctxpatch"
 	"antigravity-gateway/internal/updater"
 )
 
@@ -52,6 +54,10 @@ func (gs *GatewayServer) handleAdminUpdateStatus(w http.ResponseWriter, r *http.
 	defer cancel()
 
 	status := u.GetStatus(ctx, poolCfg.BackendType, poolCfg.BinaryPath, forceRefresh)
+	enabled, tokens := gs.cfg.GetContextPatch()
+	status.ACP.ContextPatch = enabled
+	status.ACP.ContextPatchTokens = tokens
+	status.ACP.SupportsPatch = ctxpatch.IsCLIBinary(acp.ResolveACPBinaryPath(poolCfg.BackendType, poolCfg.BinaryPath))
 	writeJSON(w, http.StatusOK, status)
 }
 

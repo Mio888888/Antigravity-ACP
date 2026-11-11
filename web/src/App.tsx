@@ -31,12 +31,15 @@ import {
   SystemUpdateStatusResponse,
   TerminalLoginStatus,
   UnauthorizedError,
+  CONTEXT_WINDOW_PRESETS,
+  adminApplyACPPatch,
   adminApplySystemUpdate,
   adminChangePassword,
   adminCheckSession,
   adminGetSystemUpdateStatus,
   adminLogin,
   adminLogout,
+  adminSwitchACPBackend,
   adminTerminalLoginStatus,
   apiFetch,
 } from './api'
@@ -186,6 +189,44 @@ function parsePositiveInt(raw: string): number | null {
 
 function errorMessage(err: unknown, fallback: string): string {
   return err instanceof Error && err.message ? err.message : fallback
+}
+
+// Quick-select for a context-window override (tokens). value 0 = client-provided / auto.
+function ContextWindowPresetPicker({
+  value,
+  onChange,
+  disabled,
+}: {
+  value: number
+  onChange: (v: number) => void
+  disabled?: boolean
+}) {
+  const options: { label: string; value: number }[] = [
+    { label: '自动', value: 0 },
+    ...CONTEXT_WINDOW_PRESETS,
+  ]
+  return (
+    <div className="flex flex-wrap items-center gap-1.5">
+      {options.map((opt) => {
+        const active = value === opt.value
+        return (
+          <button
+            key={opt.value}
+            type="button"
+            disabled={disabled}
+            onClick={() => onChange(opt.value)}
+            className={`rounded-md border px-2 py-0.5 text-xs transition-colors duration-150 ${
+              active
+                ? 'border-primary bg-primary/10 font-medium text-foreground'
+                : 'border-border bg-card text-muted-foreground hover:text-foreground'
+            } disabled:cursor-not-allowed disabled:opacity-50`}
+          >
+            {opt.label}
+          </button>
+        )
+      })}
+    </div>
+  )
 }
 
 function readStoredTheme(): boolean {
@@ -406,6 +447,8 @@ export function App() {
   const [applyingUpdateTarget, setApplyingUpdateTarget] = useState<'' | 'gateway' | 'acp' | 'all'>('')
   const [updateModalError, setUpdateModalError] = useState<string>('')
   const [updateModalNotice, setUpdateModalNotice] = useState<string>('')
+  const [patchingACP, setPatchingACP] = useState<boolean>(false)
+  const [switchingBackend, setSwitchingBackend] = useState<'' | 'cli' | 'zed'>('')
   const [restartingGateway, setRestartingGateway] = useState<boolean>(false)
   const restartingGatewayRef = useRef<boolean>(false)
   const restartPollTimerRef = useRef<number | null>(null)
@@ -535,6 +578,7 @@ export function App() {
   const [newKeySessionMode, setNewKeySessionMode] = useState<string>('yolo')
   const [newKeyPrependPrompt, setNewKeyPrependPrompt] = useState<string>('')
   const [newKeyDisableBuiltinTools, setNewKeyDisableBuiltinTools] = useState<boolean>(true)
+  const [newKeyContextWindow, setNewKeyContextWindow] = useState<number>(0)
   const [issuedPlainKey, setIssuedPlainKey] = useState<string>('')
   const [editingKey, setEditingKey] = useState<APIKeyRecord | null>(null)
   const [editKeyRPM, setEditKeyRPM] = useState<string>('')
@@ -1179,6 +1223,53 @@ export function App() {
     }
   }
 
+  const handleApplyACPPatch = async (tokens: number, enabled = true) => {
+    if (patchingACP || applyingUpdateTarget || restartingGateway) return
+    setPatchingACP(true)
+    setUpdateModalError('')
+    setUpdateModalNotice('')
+    try {
+      const res = await adminApplyACPPatch(enabled, tokens)
+      if (!enabled) {
+        setUpdateModalNotice('已关闭上下文补丁（已安装的二进制在下次更新或重新下载后恢复原始上限）')
+      } else {
+        const windowLabel =
+          res.max_tokens && res.max_tokens > 0
+            ? `${formatCompact(res.max_tokens)} token`
+            : '模型完整窗口'
+        setUpdateModalNotice(
+          `上下文补丁已应用（目标 ${windowLabel}），并轮换 ${res.retired_workers || 0} 个空闲进程`
+        )
+      }
+      await Promise.all([fetchUpdateStatus(true), refreshAll()])
+    } catch (err) {
+      const msg = resolveInlineError(err, '打补丁失败')
+      if (msg) setUpdateModalError(msg)
+    } finally {
+      setPatchingACP(false)
+    }
+  }
+
+  const handleSwitchBackend = async (backendType: 'cli' | 'zed') => {
+    if (switchingBackend || applyingUpdateTarget || restartingGateway) return
+    if (updateStatus?.acp.flavor === backendType) return
+    setSwitchingBackend(backendType)
+    setUpdateModalError('')
+    setUpdateModalNotice('')
+    try {
+      const res = await adminSwitchACPBackend(backendType)
+      setUpdateModalNotice(
+        `已切换 ACP 后端至 ${res.flavor === 'zed' ? 'Zed ACP' : 'Antigravity CLI'}，并轮换 ${res.retired_workers || 0} 个空闲进程`
+      )
+      await Promise.all([fetchUpdateStatus(true), refreshAll()])
+    } catch (err) {
+      const msg = resolveInlineError(err, '切换 ACP 后端失败')
+      if (msg) setUpdateModalError(msg)
+    } finally {
+      setSwitchingBackend('')
+    }
+  }
+
   const handleLogout = async () => {
     clearRestartPollTimer()
     restartingGatewayRef.current = false
@@ -1813,6 +1904,7 @@ export function App() {
             session_mode: newKeySessionMode,
             global_prepend_prompt: newKeyPrependPrompt,
             disable_builtin_tools: newKeyDisableBuiltinTools,
+            context_window: newKeyContextWindow,
           }),
         }
       )
@@ -1823,6 +1915,7 @@ export function App() {
       }
       setClientAccountBind(boundAccountId || 'auto')
       setNewKeyName('')
+      setNewKeyContextWindow(0)
       setShowCreateKeyModal(false)
       setNoticeMsg('已签发新的客户端 API Key 并同步至客户端接入设置，请立即复制保存下方明文密钥')
       await refreshAll()
@@ -1842,6 +1935,7 @@ export function App() {
       session_mode: key.session_mode || 'yolo',
       global_prepend_prompt: key.global_prepend_prompt || '',
       disable_builtin_tools: key.disable_builtin_tools ?? true,
+      context_window: key.context_window || 0,
     })
     setEditKeyRPM(String(key.rate_limit_rpm))
     setEditKeyError('')
@@ -1879,6 +1973,7 @@ export function App() {
           session_mode: editingKey.session_mode || 'yolo',
           global_prepend_prompt: editingKey.global_prepend_prompt || '',
           disable_builtin_tools: editingKey.disable_builtin_tools ?? true,
+          context_window: editingKey.context_window || 0,
         }),
       })
       setEditingKey(null)
@@ -3086,6 +3181,97 @@ export function App() {
                           </Button>
                         </div>
                       )}
+
+                    <div className="flex flex-col gap-3 border-t border-border pt-3">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <span className="text-xs font-medium text-foreground">上下文窗口补丁</span>
+                        {updateStatus.acp.context_patch ? (
+                          <Badge variant="success-light">
+                            {`已开启 · ${
+                              updateStatus.acp.context_patch_tokens &&
+                              updateStatus.acp.context_patch_tokens > 0
+                                ? formatCompact(updateStatus.acp.context_patch_tokens)
+                                : '完整窗口'
+                            }`}
+                          </Badge>
+                        ) : (
+                          <Badge variant="warning-light">未开启</Badge>
+                        )}
+                      </div>
+                      <span className="text-xs text-muted-foreground">
+                        重写 agy 二进制里 256K 的压缩上限，突破 ACP 会话上下文窗口；每次引擎更新后自动重新打补丁。会修改官方二进制并增加配额消耗。
+                      </span>
+                      {updateStatus.acp.supports_patch ? (
+                        <>
+                          <div className="flex flex-wrap items-center gap-2">
+                            {CONTEXT_WINDOW_PRESETS.map((preset) => {
+                              const active =
+                                updateStatus.acp.context_patch &&
+                                updateStatus.acp.context_patch_tokens === preset.value
+                              return (
+                                <Button
+                                  key={preset.value}
+                                  size="xs"
+                                  variant={active ? 'default' : 'outline'}
+                                  disabled={
+                                    patchingACP ||
+                                    Boolean(applyingUpdateTarget) ||
+                                    restartingGateway ||
+                                    updateStatus.updating
+                                  }
+                                  onClick={() => void handleApplyACPPatch(preset.value)}
+                                >
+                                  {preset.label}
+                                </Button>
+                              )
+                            })}
+                            <Button
+                              size="xs"
+                              variant={
+                                updateStatus.acp.context_patch &&
+                                (!updateStatus.acp.context_patch_tokens ||
+                                  updateStatus.acp.context_patch_tokens <= 0)
+                                  ? 'default'
+                                  : 'outline'
+                              }
+                              disabled={
+                                patchingACP ||
+                                Boolean(applyingUpdateTarget) ||
+                                restartingGateway ||
+                                updateStatus.updating
+                              }
+                              onClick={() => void handleApplyACPPatch(0)}
+                            >
+                              完整窗口
+                            </Button>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <span className="text-xs text-muted-foreground">
+                              {patchingACP ? '正在打补丁并热轮换空闲进程...' : '点击任一目标即立即打补丁并热轮换'}
+                            </span>
+                            {updateStatus.acp.context_patch && (
+                              <Button
+                                size="xs"
+                                variant="ghost"
+                                disabled={patchingACP || restartingGateway}
+                                onClick={() => void handleApplyACPPatch(0, false)}
+                              >
+                                关闭补丁
+                              </Button>
+                            )}
+                          </div>
+                        </>
+                      ) : (
+                        <Alert variant="default">
+                          <div className="flex-1 min-w-0">
+                            <AlertTitle>当前后端不支持上下文补丁</AlertTitle>
+                            <AlertDescription>
+                              仅 Antigravity CLI (agy) 后端支持；请在「账号管理」切换 ACP 后端为 CLI 后再打补丁。
+                            </AlertDescription>
+                          </div>
+                        </Alert>
+                      )}
+                    </div>
                   </div>
                 </FramePanel>
               </Frame>
@@ -3352,6 +3538,67 @@ export function App() {
                     </Button>
                   </div>
                 </FrameHeader>
+              </Frame>
+
+              {/* ACP Backend Engine Switcher */}
+              <Frame>
+                <FrameHeader>
+                  <div className="flex items-center gap-2.5">
+                    <IconTile variant="elevated">
+                      <Cpu />
+                    </IconTile>
+                    <div>
+                      <FrameTitle>ACP 后端引擎切换</FrameTitle>
+                      <FrameDescription>
+                        全局切换底层 ACP 引擎类型（Antigravity CLI / Zed ACP）。切换到未安装的后端会先从官方清单下载校验，随后热轮换空闲 Worker 进程，无需重启网关
+                      </FrameDescription>
+                    </div>
+                  </div>
+                  {updateStatus?.acp.flavor && (
+                    <Badge variant="info-light">
+                      {updateStatus.acp.flavor === 'zed'
+                        ? 'Zed ACP (agy_acp_server)'
+                        : 'Antigravity CLI (agy)'}
+                    </Badge>
+                  )}
+                </FrameHeader>
+                <FramePanel>
+                  <div className="flex flex-col gap-3">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Button
+                        size="sm"
+                        variant={updateStatus?.acp.flavor === 'cli' ? 'default' : 'outline'}
+                        disabled={
+                          Boolean(switchingBackend) ||
+                          updateStatus?.acp.flavor === 'cli' ||
+                          Boolean(applyingUpdateTarget) ||
+                          restartingGateway
+                        }
+                        onClick={() => void handleSwitchBackend('cli')}
+                      >
+                        <Terminal />
+                        {switchingBackend === 'cli' ? '正在切换...' : 'Antigravity CLI (agy)'}
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant={updateStatus?.acp.flavor === 'zed' ? 'default' : 'outline'}
+                        disabled={
+                          Boolean(switchingBackend) ||
+                          updateStatus?.acp.flavor === 'zed' ||
+                          Boolean(applyingUpdateTarget) ||
+                          restartingGateway
+                        }
+                        onClick={() => void handleSwitchBackend('zed')}
+                      >
+                        <Server />
+                        {switchingBackend === 'zed' ? '正在切换...' : 'Zed ACP (agy_acp_server)'}
+                      </Button>
+                    </div>
+                    <span className="text-xs text-muted-foreground">
+                      仅 Antigravity CLI 后端支持上下文窗口补丁（在「系统更新」面板设置）。首次切换到 Zed ACP 需联网下载对应引擎，可能耗时较长。
+                    </span>
+                  </div>
+                </FramePanel>
               </Frame>
 
               {/* Modal Dialog for Account Creation / Editing */}
@@ -4863,6 +5110,21 @@ curl "${gatewayBaseUrl}/v1/models?refresh=1" \\
 
                     <div className="flex flex-col gap-1.5">
                       <div className="flex items-center justify-between gap-2">
+                        <label className="text-xs font-medium text-foreground">
+                          上下文窗口上限
+                        </label>
+                        <span className="text-xs text-muted-foreground">
+                          客户端未显式指定时生效，用于突破默认压缩窗口
+                        </span>
+                      </div>
+                      <ContextWindowPresetPicker
+                        value={newKeyContextWindow}
+                        onChange={setNewKeyContextWindow}
+                      />
+                    </div>
+
+                    <div className="flex flex-col gap-1.5">
+                      <div className="flex items-center justify-between gap-2">
                         <label htmlFor="key-acc" className="text-xs font-medium text-foreground">
                           绑定隔离账户 ID
                         </label>
@@ -5178,6 +5440,21 @@ curl "${gatewayBaseUrl}/v1/models?refresh=1" \\
                             onChange={setEditKeyRPM}
                           />
                         </div>
+                      </div>
+
+                      <div className="flex flex-col gap-1.5">
+                        <div className="flex items-center justify-between gap-2">
+                          <label className="text-xs font-medium text-foreground">
+                            上下文窗口上限
+                          </label>
+                          <span className="text-xs text-muted-foreground">
+                            客户端未显式指定时生效，用于突破默认压缩窗口
+                          </span>
+                        </div>
+                        <ContextWindowPresetPicker
+                          value={editingKey.context_window || 0}
+                          onChange={(v) => setEditingKey({ ...editingKey, context_window: v })}
+                        />
                       </div>
 
                       <div className="flex flex-col gap-1.5">

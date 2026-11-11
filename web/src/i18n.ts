@@ -869,6 +869,31 @@ const ZH_TO_EN_EXACT: Record<string, string> = {
   当前已是最新版本: 'Already Up to Date',
   底层: 'Underlying',
   '底层 ACP 后端引擎': 'ACP Backend Engine',
+
+  // Context-window patch (update panel) + ACP backend switch (accounts)
+  上下文窗口补丁: 'Context Window Patch',
+  未开启: 'Disabled',
+  '重写 agy 二进制里 256K 的压缩上限，突破 ACP 会话上下文窗口；每次引擎更新后自动重新打补丁。会修改官方二进制并增加配额消耗。':
+    "Rewrites agy's hardcoded 256K compaction ceiling to enlarge the ACP context window; re-applied automatically after every engine update. Modifies the official binary and raises quota consumption.",
+  完整窗口: 'Full Window',
+  '正在打补丁并热轮换空闲进程...': 'Patching & hot-rotating idle workers...',
+  点击任一目标即立即打补丁并热轮换: 'Click any target to patch immediately and hot-rotate',
+  关闭补丁: 'Disable Patch',
+  当前后端不支持上下文补丁: 'Current backend does not support the context patch',
+  '仅 Antigravity CLI (agy) 后端支持；请在「账号管理」切换 ACP 后端为 CLI 后再打补丁。':
+    'Only the Antigravity CLI (agy) backend is supported; switch the ACP backend to CLI under Accounts first.',
+  'ACP 后端引擎切换': 'ACP Backend Engine Switch',
+  '全局切换底层 ACP 引擎类型（Antigravity CLI / Zed ACP）。切换到未安装的后端会先从官方清单下载校验，随后热轮换空闲 Worker 进程，无需重启网关':
+    'Globally switch the ACP engine type (Antigravity CLI / Zed ACP). Switching to an uninstalled backend downloads and verifies it from the official manifest first, then hot-rotates idle workers without restarting the gateway',
+  '仅 Antigravity CLI 后端支持上下文窗口补丁（在「系统更新」面板设置）。首次切换到 Zed ACP 需联网下载对应引擎，可能耗时较长。':
+    'Only the Antigravity CLI backend supports the context-window patch (configured in the Updates panel). Switching to Zed ACP for the first time downloads the engine online and may take a while.',
+  '正在切换...': 'Switching...',
+  上下文窗口上限: 'Context Window Limit',
+  '客户端未显式指定时生效，用于突破默认压缩窗口':
+    'Applies when the client does not specify one; raises the default compaction window',
+  自动: 'Auto',
+  '已关闭上下文补丁（已安装的二进制在下次更新或重新下载后恢复原始上限）':
+    'Context patch disabled (the installed binary reverts to the original ceiling after the next update or re-download)',
   '从官方清单下载最新 CLI / Zed ACP 引擎，校验哈希后平滑轮换空闲 Worker 进程（无需重启网关）':
     'Downloads latest official CLI / Zed ACP package with hash verification and rotates idle workers without gateway restart',
   引擎类型: 'Engine Flavor',

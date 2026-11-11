@@ -9,11 +9,14 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
 	gatewayembed "antigravity-gateway"
 	"antigravity-gateway/internal/acp"
+	"antigravity-gateway/internal/acp/ctxpatch"
 	"antigravity-gateway/internal/config"
 	"antigravity-gateway/internal/server"
 	"antigravity-gateway/internal/storage"
@@ -27,6 +30,8 @@ func main() {
 	backendFlag := flag.String("backend", "", "ACP backend type override: auto | zed | zen | cli")
 	acpBinFlag := flag.String("acp-bin", "", "Explicit path to ACP backend binary (agy_acp_server.par or agy)")
 	syncOnlyFlag := flag.Bool("sync-only", false, "Run continuous transcript.jsonl -> gateway.db token reconciler")
+	patchACPFlag := flag.String("patch-acp", "", "Apply the context-window patch to the given agy binary and exit (used by deploy scripts)")
+	patchTokensFlag := flag.Int64("patch-tokens", -1, "Context ceiling in tokens for --patch-acp (0 = full window, <0 = use config default)")
 	flag.Parse()
 
 	cfg, err := config.Load(*cfgPath)
@@ -38,6 +43,29 @@ func main() {
 	}
 	if *acpBinFlag != "" {
 		cfg.ACPPool.BinaryPath = *acpBinFlag
+	}
+
+	// One-shot patch mode for deploy/update scripts: patch the given agy binary and exit.
+	if strings.TrimSpace(*patchACPFlag) != "" {
+		tokens := cfg.ACPPool.ContextPatchTokens
+		if *patchTokensFlag >= 0 {
+			tokens = *patchTokensFlag
+		}
+		target := *patchACPFlag
+		if !ctxpatch.IsCLIBinary(target) {
+			log.Printf("[ctxpatch] %s is not an Antigravity CLI binary; skipping patch", target)
+			return
+		}
+		res, perr := ctxpatch.Apply(target, tokens)
+		if perr != nil {
+			log.Fatalf("[ctxpatch] patch failed for %s: %v", target, perr)
+		}
+		if res.Changed {
+			log.Printf("[ctxpatch] patched %s (%s): %s; %s", target, res.Arch, res.Gate3A, res.Gate3B)
+		} else {
+			log.Printf("[ctxpatch] %s already patched at target; no change", target)
+		}
+		return
 	}
 
 	if err := os.MkdirAll(cfg.Server.DataDir, 0700); err != nil {
@@ -54,9 +82,38 @@ func main() {
 	}
 	defer store.Close()
 
+	// Apply runtime overrides persisted from the admin UI (ACP backend + context patch),
+	// unless a CLI flag or env var already pinned the value.
+	if *backendFlag == "" && os.Getenv("AG_ACP_BACKEND") == "" {
+		if bt, ok := store.GetSetting(updater.SettingACPBackendType); ok && strings.TrimSpace(bt) != "" {
+			cfg.ACPPool.BackendType = strings.TrimSpace(bt)
+		}
+	}
+	if os.Getenv("AG_ACP_CONTEXT_PATCH") == "" {
+		if v, ok := store.GetSetting(updater.SettingACPContextPatch); ok && strings.TrimSpace(v) != "" {
+			cfg.ACPPool.ContextPatch = strings.TrimSpace(v) == "1" || strings.EqualFold(strings.TrimSpace(v), "true")
+		}
+	}
+	if os.Getenv("AG_ACP_CONTEXT_PATCH_TOKENS") == "" {
+		if v, ok := store.GetSetting(updater.SettingACPContextPatchTokens); ok && strings.TrimSpace(v) != "" {
+			if n, perr := strconv.ParseInt(strings.TrimSpace(v), 10, 64); perr == nil && n >= 0 {
+				cfg.ACPPool.ContextPatchTokens = n
+			}
+		}
+	}
+
 	if *acpBinFlag == "" && os.Getenv("AG_ACP_BINARY_PATH") == "" {
 		if overrideBin := updater.ResolveStartupACPOverride(store, cfg.ACPPool.BackendType, cfg.ACPPool.BinaryPath); overrideBin != "" {
 			cfg.ACPPool.BinaryPath = overrideBin
+		}
+	}
+
+	if cfg.ACPPool.ContextPatch {
+		patchBin := acp.ResolveACPBinaryPath(cfg.ACPPool.BackendType, cfg.ACPPool.BinaryPath)
+		if res, err := ctxpatch.EnsurePatched(patchBin, true, cfg.ACPPool.ContextPatchTokens); err != nil {
+			log.Printf("[ctxpatch] startup patch skipped for %s: %v", patchBin, err)
+		} else if res.Changed {
+			log.Printf("[ctxpatch] patched %s (%s): %s; %s", patchBin, res.Arch, res.Gate3A, res.Gate3B)
 		}
 	}
 

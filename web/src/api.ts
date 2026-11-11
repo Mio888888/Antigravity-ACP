@@ -212,6 +212,39 @@ export interface ACPUpdateStatus {
   can_hot_update: boolean
   blocked_reason?: string
   check_error?: string
+  context_patch?: boolean
+  context_patch_tokens?: number
+  supports_patch?: boolean
+}
+
+// Context-window / context-patch preset values (tokens), shared by the update panel
+// patch controls and the per-key / per-client context-window selectors.
+export const CONTEXT_WINDOW_PRESETS: { label: string; value: number }[] = [
+  { label: '128K', value: 128000 },
+  { label: '200K', value: 200000 },
+  { label: '256K', value: 256000 },
+  { label: '400K', value: 400000 },
+  { label: '1M', value: 1000000 },
+]
+
+export interface ACPPatchResponse {
+  enabled: boolean
+  tokens: number
+  binary_path: string
+  changed?: boolean
+  arch?: string
+  max_tokens?: number
+  gate3a?: string
+  gate3b?: string
+  retired_workers?: number
+}
+
+export interface ACPBackendResponse {
+  backend_type: string
+  flavor: 'cli' | 'zed' | string
+  binary_path: string
+  retired_workers?: number
+  supports_patch?: boolean
 }
 
 export interface SystemUpdateStatusResponse {
@@ -267,6 +300,7 @@ export interface APIKeyRecord {
   session_mode?: 'yolo' | 'stateless_single_turn' | 'sticky_conversation' | string
   global_prepend_prompt?: string
   disable_builtin_tools?: boolean
+  context_window?: number
   created_at: string
 }
 
@@ -422,6 +456,27 @@ export async function adminApplySystemUpdate(
   return apiFetch<SystemUpdateApplyResponse>('/api/admin/update/apply', {
     method: 'POST',
     body: JSON.stringify({ target }),
+    timeoutMs: 300_000,
+  })
+}
+
+export async function adminApplyACPPatch(
+  enabled: boolean,
+  tokens: number
+): Promise<ACPPatchResponse> {
+  return apiFetch<ACPPatchResponse>('/api/admin/acp/patch', {
+    method: 'POST',
+    body: JSON.stringify({ enabled, tokens }),
+    timeoutMs: 120_000,
+  })
+}
+
+export async function adminSwitchACPBackend(
+  backendType: 'cli' | 'zed'
+): Promise<ACPBackendResponse> {
+  return apiFetch<ACPBackendResponse>('/api/admin/acp/backend', {
+    method: 'POST',
+    body: JSON.stringify({ backend_type: backendType }),
     timeoutMs: 300_000,
   })
 }

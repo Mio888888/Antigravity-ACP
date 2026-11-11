@@ -87,6 +87,9 @@ func NewGatewayServer(
 	hub *WiretapHub,
 	staticFS fs.FS,
 ) *GatewayServer {
+	upd := updater.NewUpdater(cfg.Server.DataDir, store)
+	upd.ContextPatch = cfg.ACPPool.ContextPatch
+	upd.ContextPatchTokens = cfg.ACPPool.ContextPatchTokens
 	gs := &GatewayServer{
 		cfg:                cfg,
 		store:              store,
@@ -95,7 +98,7 @@ func NewGatewayServer(
 		hub:                hub,
 		staticFS:           staticFS,
 		loopbackBaseURL:    fmt.Sprintf("http://127.0.0.1:%d", cfg.Server.Port),
-		updater:            updater.NewUpdater(cfg.Server.DataDir, store),
+		updater:            upd,
 		accountCheckAt:     make(map[string]string),
 		accountCheckMsg:    make(map[string]string),
 		accountQuotaGroups: make(map[string][]storage.ModelQuotaGroup),
@@ -242,6 +245,8 @@ func (gs *GatewayServer) Handler() http.Handler {
 	mux.HandleFunc("/api/admin/logs", gs.withAdminAuth(gs.handleAdminLogs))
 	mux.HandleFunc("/api/admin/update/status", gs.withAdminAuth(gs.handleAdminUpdateStatus))
 	mux.HandleFunc("/api/admin/update/apply", gs.withAdminAuth(gs.handleAdminUpdateApply))
+	mux.HandleFunc("/api/admin/acp/patch", gs.withAdminAuth(gs.handleAdminACPPatch))
+	mux.HandleFunc("/api/admin/acp/backend", gs.withAdminAuth(gs.handleAdminACPBackend))
 	if gs.hub != nil {
 		mux.HandleFunc("/api/admin/ws/wiretap", gs.withAdminAuth(gs.hub.ServeHTTP))
 	}

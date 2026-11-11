@@ -113,6 +113,7 @@ CREATE TABLE IF NOT EXISTS api_keys (
     session_mode TEXT DEFAULT 'yolo',
     global_prepend_prompt TEXT DEFAULT '',
     disable_builtin_tools BOOLEAN DEFAULT 1,
+    context_window INTEGER DEFAULT 0,
     enabled BOOLEAN DEFAULT 1,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
@@ -166,6 +167,7 @@ CREATE TABLE IF NOT EXISTS audit_logs (
 	_, _ = s.db.Exec(`ALTER TABLE api_keys ADD COLUMN session_mode TEXT DEFAULT 'yolo'`)
 	_, _ = s.db.Exec(`ALTER TABLE api_keys ADD COLUMN global_prepend_prompt TEXT DEFAULT ''`)
 	_, _ = s.db.Exec(`ALTER TABLE api_keys ADD COLUMN disable_builtin_tools BOOLEAN DEFAULT 1`)
+	_, _ = s.db.Exec(`ALTER TABLE api_keys ADD COLUMN context_window INTEGER DEFAULT 0`)
 	_, _ = s.db.Exec(`ALTER TABLE audit_logs ADD COLUMN prompt_tokens INTEGER DEFAULT 0`)
 	_, _ = s.db.Exec(`ALTER TABLE audit_logs ADD COLUMN cached_tokens INTEGER DEFAULT 0`)
 	_, _ = s.db.Exec(`ALTER TABLE audit_logs ADD COLUMN completion_tokens INTEGER DEFAULT 0`)
@@ -474,6 +476,9 @@ func normalizeAPIKeyFields(rec *APIKey) {
 	default:
 		rec.SessionMode = "yolo"
 	}
+	if rec.ContextWindow < 0 {
+		rec.ContextWindow = 0
+	}
 }
 
 func (s *Store) CreateAPIKey(name string, boundAccountID string, rpm int) (string, *APIKey, error) {
@@ -503,11 +508,11 @@ func (s *Store) CreateAPIKeyWithPolicy(req APIKey) (string, *APIKey, error) {
 INSERT INTO api_keys (
 	key_hash, key_prefix, name, bound_account_id, rate_limit_rpm,
 	prompt_mode, session_mode, global_prepend_prompt, disable_builtin_tools,
-	enabled, created_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
+	context_window, enabled, created_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
 		keyHash, prefix, req.Name, req.BoundAccountID, req.RateLimitRPM,
 		req.PromptMode, req.SessionMode, req.GlobalPrependPrompt, req.DisableBuiltinTools,
-		now,
+		req.ContextWindow, now,
 	)
 	if err != nil {
 		return "", nil, err
@@ -524,6 +529,7 @@ INSERT INTO api_keys (
 		SessionMode:         req.SessionMode,
 		GlobalPrependPrompt: req.GlobalPrependPrompt,
 		DisableBuiltinTools: req.DisableBuiltinTools,
+		ContextWindow:       req.ContextWindow,
 		Enabled:             true,
 		CreatedAt:           now,
 	}
@@ -545,11 +551,12 @@ SET name = ?,
     prompt_mode = ?,
     session_mode = ?,
     global_prepend_prompt = ?,
-    disable_builtin_tools = ?
+    disable_builtin_tools = ?,
+    context_window = ?
 WHERE id = ?`,
 		req.Name, req.BoundAccountID, req.RateLimitRPM,
 		req.PromptMode, req.SessionMode, req.GlobalPrependPrompt, req.DisableBuiltinTools,
-		id,
+		req.ContextWindow, id,
 	)
 	if err != nil {
 		return nil, err
@@ -568,13 +575,14 @@ SELECT id, key_hash, key_prefix, name, bound_account_id, rate_limit_rpm,
        COALESCE(session_mode, 'yolo'),
        COALESCE(global_prepend_prompt, ''),
        COALESCE(disable_builtin_tools, 1),
+       COALESCE(context_window, 0),
        enabled, created_at
 FROM api_keys WHERE id = ?`, id)
 	var rec APIKey
 	if err := row.Scan(
 		&rec.ID, &rec.KeyHash, &rec.KeyPrefix, &rec.Name, &rec.BoundAccountID, &rec.RateLimitRPM,
 		&rec.PromptMode, &rec.SessionMode, &rec.GlobalPrependPrompt, &rec.DisableBuiltinTools,
-		&rec.Enabled, &rec.CreatedAt,
+		&rec.ContextWindow, &rec.Enabled, &rec.CreatedAt,
 	); err != nil {
 		return nil, err
 	}
@@ -601,6 +609,7 @@ SELECT id, key_hash, key_prefix, name, bound_account_id, rate_limit_rpm,
        COALESCE(session_mode, 'yolo'),
        COALESCE(global_prepend_prompt, ''),
        COALESCE(disable_builtin_tools, 1),
+       COALESCE(context_window, 0),
        enabled, created_at
 FROM api_keys WHERE enabled = 1`)
 	if err != nil {
@@ -612,7 +621,7 @@ FROM api_keys WHERE enabled = 1`)
 		if rows.Scan(
 			&rec.ID, &rec.KeyHash, &rec.KeyPrefix, &rec.Name, &rec.BoundAccountID, &rec.RateLimitRPM,
 			&rec.PromptMode, &rec.SessionMode, &rec.GlobalPrependPrompt, &rec.DisableBuiltinTools,
-			&rec.Enabled, &rec.CreatedAt,
+			&rec.ContextWindow, &rec.Enabled, &rec.CreatedAt,
 		) == nil {
 			m[rec.KeyHash] = rec
 		}
@@ -681,6 +690,7 @@ SELECT id, key_hash, key_prefix, name, bound_account_id, rate_limit_rpm,
        COALESCE(session_mode, 'yolo'),
        COALESCE(global_prepend_prompt, ''),
        COALESCE(disable_builtin_tools, 1),
+       COALESCE(context_window, 0),
        enabled, created_at
 FROM api_keys WHERE key_hash = ? AND enabled = 1`, keyHash)
 
@@ -688,7 +698,7 @@ FROM api_keys WHERE key_hash = ? AND enabled = 1`, keyHash)
 	if err := row.Scan(
 		&rec.ID, &rec.KeyHash, &rec.KeyPrefix, &rec.Name, &rec.BoundAccountID, &rec.RateLimitRPM,
 		&rec.PromptMode, &rec.SessionMode, &rec.GlobalPrependPrompt, &rec.DisableBuiltinTools,
-		&rec.Enabled, &rec.CreatedAt,
+		&rec.ContextWindow, &rec.Enabled, &rec.CreatedAt,
 	); err != nil {
 		return nil, false
 	}
@@ -702,6 +712,7 @@ SELECT id, key_hash, key_prefix, name, bound_account_id, rate_limit_rpm,
        COALESCE(session_mode, 'yolo'),
        COALESCE(global_prepend_prompt, ''),
        COALESCE(disable_builtin_tools, 1),
+       COALESCE(context_window, 0),
        enabled, created_at
 FROM api_keys ORDER BY id DESC`)
 	if err != nil {
@@ -715,7 +726,7 @@ FROM api_keys ORDER BY id DESC`)
 		if err := rows.Scan(
 			&rec.ID, &rec.KeyHash, &rec.KeyPrefix, &rec.Name, &rec.BoundAccountID, &rec.RateLimitRPM,
 			&rec.PromptMode, &rec.SessionMode, &rec.GlobalPrependPrompt, &rec.DisableBuiltinTools,
-			&rec.Enabled, &rec.CreatedAt,
+			&rec.ContextWindow, &rec.Enabled, &rec.CreatedAt,
 		); err != nil {
 			return nil, err
 		}

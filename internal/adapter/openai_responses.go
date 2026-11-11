@@ -29,6 +29,7 @@ type openAIResponsesRawRequest struct {
 		Effort string `json:"effort"`
 	} `json:"output_config"`
 	ContextWindow      flexInt64                `json:"context_window"`
+	ContextSize        flexInt64                `json:"context_size"`
 	ModelContextWindow flexInt64                `json:"model_context_window"`
 	MaxInputTokens     flexInt64                `json:"max_input_tokens"`
 	MaxContextTokens   flexInt64                `json:"max_context_tokens"`
@@ -118,7 +119,7 @@ func ParseOpenAIResponsesRequest(body []byte, sessionHeader string) (*CanonicalR
 		Model:           cleanModel,
 		Stream:          raw.Stream,
 		ThinkingLevel:   finalThinking,
-		ContextWindow:   ExtractContextWindowFromMetadata(raw.Metadata, int64(raw.ContextWindow), int64(raw.ModelContextWindow), int64(raw.MaxContextTokens), int64(raw.MaxInputTokens)),
+		ContextWindow:   ExtractContextWindowFromMetadata(raw.Metadata, int64(raw.ContextWindow), int64(raw.ContextSize), int64(raw.ModelContextWindow), int64(raw.MaxContextTokens), int64(raw.MaxInputTokens)),
 		SessionHeader:   effSession,
 		ClientSessionID: clientSessID,
 	}

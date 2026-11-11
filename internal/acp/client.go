@@ -325,6 +325,12 @@ func BuildCommandAndArgs(opts WorkerLaunchOptions) (string, []string) {
 		if opts.AgentName != "" {
 			args = append(args, "--agent", opts.AgentName)
 		}
+		// ContextSize doubles as the context-window tier used for worker pooling and
+		// context-patch binary selection, so it may be set for binaries that do not
+		// accept --context-size. Only pass the flag when the binary actually supports it.
+		if opts.ContextSize > 0 && !HasContextSizeArg(opts.ExtraArgs) && SupportsContextSizeFlag(resolvedBin) {
+			args = append(args, contextSizeFlag, strconv.FormatInt(opts.ContextSize, 10))
+		}
 		for _, dir := range opts.AdditionalDirs {
 			if strings.TrimSpace(dir) != "" {
 				args = append(args, "--add-dir", strings.TrimSpace(dir))
@@ -344,6 +350,7 @@ type WorkerClient struct {
 	ID               string
 	AccountID        string
 	PID              int
+	ContextSize      int64
 	cmd              *exec.Cmd
 	stdin            io.WriteCloser
 	stdout           io.ReadCloser
@@ -434,6 +441,7 @@ func NewWorkerClient(ctx context.Context, id string, opts WorkerLaunchOptions, w
 		ID:               id,
 		AccountID:        accountID,
 		PID:              cmd.Process.Pid,
+		ContextSize:      opts.ContextSize,
 		cmd:              cmd,
 		stdin:            stdin,
 		stdout:           stdout,

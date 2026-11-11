@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -31,6 +32,7 @@ import (
 	"time"
 
 	"antigravity-gateway/internal/acp"
+	"antigravity-gateway/internal/acp/ctxpatch"
 	"antigravity-gateway/internal/storage"
 	"antigravity-gateway/internal/version"
 )
@@ -42,6 +44,11 @@ const (
 
 	SettingACPOverrideBinPath = "acp_override_binary_path"
 	SettingACPInstalledMeta   = "acp_installed_meta_json"
+
+	// Persisted runtime overrides set from the admin UI; applied on startup.
+	SettingACPBackendType        = "acp_backend_type"
+	SettingACPContextPatch       = "acp_context_patch"
+	SettingACPContextPatchTokens = "acp_context_patch_tokens"
 
 	maxMetadataBytes = 8 << 20   // 8 MiB
 	maxArchiveBytes  = 512 << 20 // 512 MiB
@@ -94,6 +101,11 @@ type ACPUpdateStatus struct {
 	CanHotUpdate     bool   `json:"can_hot_update"`
 	BlockedReason    string `json:"blocked_reason,omitempty"`
 	CheckError       string `json:"check_error,omitempty"`
+
+	// Context patch state (populated by the server from config, not the updater itself).
+	ContextPatch       bool  `json:"context_patch"`
+	ContextPatchTokens int64 `json:"context_patch_tokens"`
+	SupportsPatch      bool  `json:"supports_patch"`
 }
 
 type StatusResponse struct {
@@ -138,6 +150,11 @@ type Updater struct {
 	Store             *storage.Store
 	MetaClient        *http.Client
 	DownloadClient    *http.Client
+
+	// ContextPatch, when set, re-applies the agy context-window patch after every CLI
+	// update. ContextPatchTokens is the target ceiling (<=0 removes the clamp entirely).
+	ContextPatch       bool
+	ContextPatchTokens int64
 }
 
 func NewUpdater(dataDir string, store *storage.Store) *Updater {
@@ -1428,6 +1445,17 @@ func (u *Updater) applyACPInternal(ctx context.Context, backendType, configuredB
 	destBin := filepath.Join(installDir, binName)
 	if err := replaceExecutableFile(extractedCLI, destBin); err != nil {
 		return "", "", flavor, false, fmt.Errorf("写入 Antigravity CLI 到 %s 失败: %w", destBin, err)
+	}
+
+	// Re-apply the context-window patch to the freshly installed CLI so every agy
+	// upgrade keeps the raised ceiling. Non-fatal: if patching fails we keep the
+	// unpatched (working) binary and log it.
+	if u.ContextPatch {
+		if res, err := ctxpatch.EnsurePatched(destBin, true, u.ContextPatchTokens); err != nil {
+			log.Printf("[ctxpatch] re-patch after update skipped for %s: %v", destBin, err)
+		} else if res.Changed {
+			log.Printf("[ctxpatch] re-patched %s (%s): %s; %s", destBin, res.Arch, res.Gate3A, res.Gate3B)
+		}
 	}
 
 	fileSHA, _ := computeFileDigestHex(destBin, sha256.New())

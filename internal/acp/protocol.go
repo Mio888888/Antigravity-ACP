@@ -91,6 +91,7 @@ type WorkerLaunchOptions struct {
 	DisableTelemetry    bool
 	LogFile             string
 	IDEMCPPort          int
+	ContextSize         int64 // passed as --context-size when > 0
 	ExtraArgs           []string
 	Env                 map[string]string
 	NetNSName           string

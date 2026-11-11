@@ -61,6 +61,7 @@ func (gs *GatewayServer) handleACPWebSocketTunnel(w http.ResponseWriter, r *http
 	stopCh := make(chan struct{})
 	worker, err := acp.NewWorkerClient(r.Context(), "ws_"+acctID+"_"+reqID, acp.WorkerLaunchOptions{
 		AccountID:           acctID,
+		BackendType:         poolCfg.BackendType,
 		BinaryPath:          poolCfg.BinaryPath,
 		WorkspaceDir:        wsDir,
 		AdditionalDirs:      poolCfg.AdditionalDirs,
@@ -69,6 +70,7 @@ func (gs *GatewayServer) handleACPWebSocketTunnel(w http.ResponseWriter, r *http
 		SkipPermissionsFlag: sandboxCfg.SkipPermissionsFlag,
 		EnableSandbox:       sandboxCfg.EnableSandbox,
 		DisableTelemetry:    poolCfg.DisableTelemetry,
+		ContextSize:         acp.ResolveWorkerContextSize(poolCfg, extractContextWindowHeader(r)),
 		ExtraArgs:           poolCfg.ExtraArgs,
 		Env:                 env,
 		NetNSName:           netns,

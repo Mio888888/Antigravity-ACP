@@ -1085,16 +1085,24 @@ func TestClientFirstACPCompactionLifecycle(t *testing.T) {
 	}
 
 	// 2. When ACP session approaches localharness's ~255K-260K CHECKPOINT threshold (e.g. 232K >= 225K),
-	// gateway must trigger client compaction FIRST by setting ClientCompactionRequested=true and
-	// reporting usage at >=95% of client's context window.
+	// the gateway marks the session for local compaction on the next turn but reports the real
+	// usage instead of inflating it to the client's compaction watermark.
 	sess.SetLastTokenUsage(232000, 180000)
 	repInHigh, _ := server.ComputeNorthboundUsageInputTokens(normalReq, sess, 232000, 180000)
 	reqFlag, waitTurns := sess.GetClientCompactionState()
 	if !reqFlag || waitTurns != 0 {
 		t.Fatalf("expected ClientCompactionRequested=true and waitTurns=0 at 232K tokens, got req=%v wait=%d", reqFlag, waitTurns)
 	}
-	if repInHigh < (272000*95)/100 {
-		t.Fatalf("expected reported input tokens (%d) to reach >=95%% of client context window (258400) to trigger client compaction first", repInHigh)
+	if repInHigh != 232000 {
+		t.Fatalf("expected reported input tokens to equal the real 232000 ACP usage, got %d", repInHigh)
+	}
+	carbonReq := &adapter.CanonicalRequest{
+		Protocol:     "openai_responses",
+		Model:        "gemini-4-carbon",
+		PromptBlocks: []acp.PromptBlock{{Type: "text", Text: "continue"}},
+	}
+	if repCarbon, _ := server.ComputeNorthboundUsageInputTokens(carbonReq, sess, 240000, 0); repCarbon != 240000 {
+		t.Fatalf("expected 1M-window model usage to be reported as-is (240000) instead of ~996K, got %d", repCarbon)
 	}
 
 	// 3. Verify IsClientCompactionRequest and immediate abort of parked tool calls when client compacts mid-tool-loop
@@ -1144,6 +1152,213 @@ func TestClientFirstACPCompactionLifecycle(t *testing.T) {
 	sess.SetLastTokenUsage(32000, 12000)
 	if reqAfterDrop, _ := sess.GetClientCompactionState(); reqAfterDrop {
 		t.Fatalf("expected ClientCompactionRequested to reset to false when token usage drops from 232K to 32K")
+	}
+
+	// 6. After a local rotation the stale watermark must be cleared so the next turn does not rotate again.
+	sess.SetLastTokenUsage(240000, 200000)
+	sess.SetClientCompactionState(true, 0)
+	sess.ResetTokenUsage()
+	if in, cached := sess.GetLastTokenUsage(); in != 0 || cached != 0 {
+		t.Fatalf("expected ResetTokenUsage to clear token usage, got in=%d cached=%d", in, cached)
+	}
+	if req, _ := sess.GetClientCompactionState(); req {
+		t.Fatalf("expected ResetTokenUsage to clear ClientCompactionRequested")
+	}
+}
+
+func TestStripStaleHandoffOpenTasksPreservesLaterSections(t *testing.T) {
+	handoff := "# Handoff Summary\n## Goal\nFix login\n\nOpen tasks:\n- STALE_OPEN_TASK\n\n## Constraints\n- KEEP_CONSTRAINT\n\nNext step:\n- STALE_NEXT_STEP\n\n## State\nKEEP_STATE\n\n## Working set\n- KEEP_FILE internal/server/router.go"
+	msgs := []adapter.CanonicalMessage{
+		{Role: "user", Content: handoff},
+		{Role: "assistant", Content: "登录已修复并通过测试。TASK_DONE_REPORT"},
+		{Role: "user", Content: "NEW_FOLLOWUP_GOAL: 再加一个注销接口"},
+	}
+	prompt := server.BuildPromptBlocksWithHistory(&adapter.CanonicalRequest{Protocol: "openai_responses", Messages: msgs})[0].Text
+	for _, gone := range []string{"STALE_OPEN_TASK", "STALE_NEXT_STEP"} {
+		if strings.Contains(prompt, gone) {
+			t.Fatalf("expected %s to be stripped after the prior task completed, got:\n%s", gone, prompt)
+		}
+	}
+	for _, kept := range []string{"KEEP_CONSTRAINT", "KEEP_STATE", "KEEP_FILE internal/server/router.go", "TASK_DONE_REPORT", "NEW_FOLLOWUP_GOAL"} {
+		if !strings.Contains(prompt, kept) {
+			t.Fatalf("expected %s to survive Open tasks stripping, got:\n%s", kept, prompt)
+		}
+	}
+}
+
+func TestPostCompactionResumePreservesFullHandoff(t *testing.T) {
+	workingSet := strings.Repeat("- internal/server/handler_proxy.go already read\n", 200) // ~10KB, beyond the default 4000-byte cap
+	handoff := "# Handoff Summary\n## Goal\nRefactor compaction\n\nOpen tasks:\n- ACTIVE_OPEN_TASK keep implementing\n\n## Working set\n" + workingSet + "WORKING_SET_TAIL_MARKER"
+	msgs := []adapter.CanonicalMessage{
+		{Role: "user", Content: "ORIGINAL_GOAL: 优化压缩策略"},
+		{Role: "user", Content: handoff},
+		{Role: "assistant", Content: "Your context was compacted. The previous message contains a summary of the conversation so far."},
+		{Role: "user", Content: "ORIGINAL_GOAL: 优化压缩策略"},
+	}
+	req := &adapter.CanonicalRequest{
+		Protocol:     "openai_responses",
+		Messages:     msgs,
+		PromptBlocks: []acp.PromptBlock{{Type: "text", Text: "ORIGINAL_GOAL: 优化压缩策略"}},
+	}
+	if !server.IsPostCompactionResumeRequest(req) {
+		t.Fatalf("expected the synthetic compaction ack not to hide the post-compaction resume turn")
+	}
+	prompt := server.BuildPromptBlocksWithHistory(req)[0].Text
+	for _, kept := range []string{"ACTIVE_OPEN_TASK keep implementing", "WORKING_SET_TAIL_MARKER"} {
+		if !strings.Contains(prompt, kept) {
+			t.Fatalf("expected %s from the active Handoff Summary to be preserved on resume, got:\n%s", kept, prompt)
+		}
+	}
+	if strings.Contains(prompt, "Your context was compacted") {
+		t.Fatalf("expected the synthetic compaction ack to be dropped from rebuilt history")
+	}
+	if !strings.Contains(prompt, "do NOT redundantly re-run find_files / git_status") {
+		t.Fatalf("expected anti-rerun continuity note after </conversation_history>")
+	}
+
+	resumed := &adapter.CanonicalRequest{
+		Protocol: "openai_responses",
+		Messages: append(append([]adapter.CanonicalMessage{}, msgs...), adapter.CanonicalMessage{Role: "assistant", Content: "已继续完成第一步。"}),
+	}
+	if server.IsPostCompactionResumeRequest(resumed) {
+		t.Fatalf("expected a substantive assistant reply after the handoff to end the resume window")
+	}
+}
+
+func TestRebuildKeepsActiveTaskToolOutputs(t *testing.T) {
+	msgs := []adapter.CanonicalMessage{{Role: "user", Content: "ACTIVE_GOAL: 修复 handler_proxy 压缩逻辑"}}
+	for i := 0; i < 6; i++ {
+		body := strings.Repeat("a", 2500) + fmt.Sprintf("MID_FILE_MARKER_%d", i) + strings.Repeat("b", 2500)
+		msgs = append(msgs,
+			adapter.CanonicalMessage{Role: "assistant", Content: fmt.Sprintf("read_file({\"path\":\"f%d.go\"})", i)},
+			adapter.CanonicalMessage{Role: "tool", Content: body},
+		)
+	}
+	msgs = append(msgs,
+		adapter.CanonicalMessage{Role: "assistant", Content: "tool_search({\"query\":\"apply_patch\"})"},
+		adapter.CanonicalMessage{Role: "tool", Content: "Loaded tools: apply_patch"},
+	)
+	req := &adapter.CanonicalRequest{
+		Protocol:    "openai_responses",
+		Messages:    msgs,
+		ToolResults: []adapter.CanonicalToolResult{{CallID: "call_ts", Content: "Loaded tools: apply_patch"}},
+	}
+	prompt := server.BuildPromptBlocksWithHistory(req)[0].Text
+	for i := 0; i < 6; i++ {
+		if !strings.Contains(prompt, fmt.Sprintf("MID_FILE_MARKER_%d", i)) {
+			t.Fatalf("expected tool output %d of the active task to survive a mid-task rebuild without 1400-byte truncation", i)
+		}
+	}
+}
+
+func sailryCompactionSystemPrompt() string {
+	return "## Task\nYou are writing a handoff for yourself. The conversation below reached its context budget, and the next model request will see only this handoff in place of the history. Produce the handoff only: do not continue the task, answer questions, or call tools.\n\n" +
+		"**Conversation History:**\n" +
+		"[user]: [user]: 参考这个方案，在acp启动时，同步客户端 上下文大小配置\n" +
+		"[assistant]: tool_request(plugin_x_read_file): {\"path\":\"/Users/dev/proj/internal/acp/pool.go\",\"limit\":800}\n" +
+		"[user]: tool_response: {\"kind\":\"file\",\"data\":\"package acp POOL_FILE_BODY\"}\n" +
+		"[assistant]: tool_request(plugin_x_read_file): {\"path\":\"/Users/dev/.gemini/antigravity-acp/brain/abc/transcript.jsonl\"}\n" +
+		"[user]: tool_response: Command Working Directory: /Users\n" +
+		"[assistant]: tool_request(plugin_x_edit_file): {\"path\":\"internal/config/config.go\",\"old\":\"a\",\"new\":\"b\"}\n" +
+		"[user]: tool_response: {\"ok\":true}\n" +
+		"[assistant]: 已在 config.go 中新增 context_size 字段，下一步修改 pool.go。LATEST_PROGRESS_MARKER\n"
+}
+
+func TestLocalClientCompactionSummary(t *testing.T) {
+	req := &adapter.CanonicalRequest{
+		Protocol:     "openai_responses",
+		SystemPrompt: sailryCompactionSystemPrompt(),
+		PromptBlocks: []acp.PromptBlock{{Type: "text", Text: "Please summarize the conversation history provided in the system prompt."}},
+	}
+	if !server.IsClientCompactionRequest(req) {
+		t.Fatalf("expected Sailry handoff request to be detected as client compaction")
+	}
+	summary := server.BuildLocalClientCompactionSummary(req)
+	for _, want := range []string{
+		"# Handoff Summary",
+		"参考这个方案，在acp启动时，同步客户端 上下文大小配置",
+		"/Users/dev/proj/internal/acp/pool.go",
+		"internal/config/config.go",
+		"LATEST_PROGRESS_MARKER",
+		"Open tasks:",
+		"## Working set",
+	} {
+		if !strings.Contains(summary, want) {
+			t.Fatalf("expected local handoff to contain %q, got:\n%s", want, summary)
+		}
+	}
+	if strings.Contains(summary, "[user]:") {
+		t.Fatalf("expected nested [user]: prefixes to be stripped, got:\n%s", summary)
+	}
+	for _, host := range []string{"transcript.jsonl", "/.gemini/", "Command Working Directory"} {
+		if strings.Contains(summary, host) {
+			t.Fatalf("expected host environment detail %q to be excluded from the local handoff, got:\n%s", host, summary)
+		}
+	}
+	if strings.Contains(summary, "Please summarize the conversation history") {
+		t.Fatalf("expected the compaction instruction itself not to be listed as a user goal")
+	}
+	modIdx := strings.Index(summary, "Files modified:")
+	readIdx := strings.Index(summary, "Files already read:")
+	if modIdx < 0 || readIdx < 0 || !strings.Contains(summary[modIdx:readIdx], "internal/config/config.go") {
+		t.Fatalf("expected edited file to be listed under Files modified, got:\n%s", summary)
+	}
+}
+
+func TestLocalClientCompactionHTTPResponse(t *testing.T) {
+	t.Setenv("AG_CLIENT_COMPACTION_MODE", "")
+	dataDir := t.TempDir()
+	store, err := storage.NewStore(filepath.Join(dataDir, "gateway.db"))
+	if err != nil {
+		t.Fatalf("NewStore failed: %v", err)
+	}
+	defer store.Close()
+	cfg := &config.Config{
+		Server:       config.ServerConfig{Host: "127.0.0.1", DataDir: dataDir, AdminToken: "admin-token-0123456789", AdminPassword: "admin-password-01"},
+		PromptPolicy: config.PromptPolicyConfig{Mode: "pure_passthrough"},
+	}
+	// No ACP pool or session manager: the local handoff must be answered without touching a worker.
+	gw := server.NewGatewayServer(cfg, store, nil, nil, nil, nil)
+	httpSrv := httptest.NewServer(gw.Handler())
+	defer httpSrv.Close()
+
+	post := func(path string, payload map[string]any) (int, string, time.Duration) {
+		raw, _ := json.Marshal(payload)
+		req, _ := http.NewRequest(http.MethodPost, httpSrv.URL+path, bytes.NewReader(raw))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer admin-token-0123456789")
+		start := time.Now()
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("POST %s failed: %v", path, err)
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(body), time.Since(start)
+	}
+
+	status, body, elapsed := post("/v1/responses", map[string]any{
+		"model":        "gemini-4-carbon",
+		"instructions": sailryCompactionSystemPrompt(),
+		"input":        []map[string]any{{"role": "user", "content": "Please summarize the conversation history provided in the system prompt."}},
+	})
+	if status != http.StatusOK || !strings.Contains(body, "# Handoff Summary") || !strings.Contains(body, "LATEST_PROGRESS_MARKER") {
+		t.Fatalf("expected local handoff via /v1/responses, got status=%d body=%s", status, body)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("expected local compaction to return without a model round-trip, took %v", elapsed)
+	}
+
+	status, body, _ = post("/v1/chat/completions", map[string]any{
+		"model":  "gemini-4-carbon",
+		"stream": true,
+		"messages": []map[string]any{
+			{"role": "system", "content": sailryCompactionSystemPrompt()},
+			{"role": "user", "content": "Please summarize the conversation history provided in the system prompt."},
+		},
+	})
+	if status != http.StatusOK || !strings.Contains(body, "Handoff Summary") || !strings.Contains(body, "[DONE]") {
+		t.Fatalf("expected streamed local handoff via /v1/chat/completions, got status=%d body=%s", status, body)
 	}
 }
 

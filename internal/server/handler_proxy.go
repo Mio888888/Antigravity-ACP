@@ -253,12 +253,31 @@ func stripStaleHandoffOpenTasks(s string) string {
 	if !strings.Contains(s, "# Handoff Summary") {
 		return s
 	}
-	for _, marker := range []string{"\nOpen tasks:", "\nNext step:"} {
-		if idx := strings.Index(s, marker); idx >= 0 {
-			return strings.TrimSpace(s[:idx])
+	for _, marker := range []string{"\nOpen tasks:", "\nNext step:", "\n## Open tasks", "\n## Next step"} {
+		idx := strings.Index(s, marker)
+		if idx < 0 {
+			continue
+		}
+		rest := s[idx+len(marker):]
+		// Only trim up to the next section heading ("\n## "), preserving subsequent
+		// Constraints, State, Decisions, and Working set sections.
+		if nextSec := strings.Index(rest, "\n## "); nextSec >= 0 {
+			s = s[:idx] + rest[nextSec:]
+		} else {
+			s = strings.TrimSpace(s[:idx])
 		}
 	}
-	return s
+	return strings.TrimSpace(s)
+}
+
+func isSyntheticCompactionAckAssistant(content string) bool {
+	lower := strings.ToLower(strings.TrimSpace(content))
+	if lower == "" {
+		return false
+	}
+	return strings.Contains(lower, "your context was compacted") ||
+		strings.Contains(lower, "the previous message contains a summary") ||
+		strings.Contains(lower, "context has been compacted")
 }
 
 func isToolCallOnlyAssistant(content string) bool {
@@ -295,13 +314,11 @@ func isToolCallOnlyAssistant(content string) bool {
 }
 
 const (
-	// acpCompactionTriggerTokens is the input-token watermark (~225K) at which the gateway
-	// proactively signals the northbound client to run its own context compaction FIRST,
-	// before agy_acp_server.par (`localharness`) hits its internal ~255K-260K CHECKPOINT threshold.
+	// acpCompactionTriggerTokens is the ACP-session input-token watermark (~225K) at which
+	// the gateway rotates the ACP session onto a locally compacted history on the next
+	// turn, before agy_acp_server.par (`localharness`) hits its internal ~255K-260K
+	// CHECKPOINT threshold.
 	acpCompactionTriggerTokens int64 = 225000
-	// acpCompactionHardFallbackTokens is the token ceiling (~245K) at which, if the client
-	// did not compact after being signaled, the gateway triggers ACP compaction fallback.
-	acpCompactionHardFallbackTokens int64 = 245000
 	// maxCompactionSystemPromptBytes caps oversized raw conversation history stuffed into
 	// SystemPrompt during a client compaction request (~120KB ≈ ~35K tokens) so the
 	// compaction turn itself finishes in a single fast step without triggering a double
@@ -348,11 +365,15 @@ func IsPostCompactionResumeRequest(canReq *adapter.CanonicalRequest) bool {
 	if canReq == nil || len(canReq.ToolResults) > 0 {
 		return false
 	}
-	// Only the first turn after the summary counts: once an assistant reply follows
-	// the handoff summary, the conversation has already resumed.
+	// Only the first turn after the summary counts: once a substantive assistant reply
+	// follows the handoff summary, the conversation has already resumed. Synthetic
+	// transition messages ("Your context was compacted...") are skipped.
 	for i := len(canReq.Messages) - 1; i >= 0; i-- {
 		m := canReq.Messages[i]
-		if m.Role == "assistant" {
+		if strings.EqualFold(strings.TrimSpace(m.Role), "assistant") {
+			if isSyntheticCompactionAckAssistant(m.Content) {
+				continue
+			}
 			break
 		}
 		if strings.Contains(m.Content, "# Resuming from a compaction") ||
@@ -389,16 +410,37 @@ func compactOversizedClientCompactionSystemPrompt(sys string) string {
 	return cleaned[:headBudget] + "\n\n...[middle of raw conversation history omitted to stay within compaction budget]...\n\n" + cleaned[tailStart:]
 }
 
+// acpCompactionWatermark returns the ACP-session token count at which the gateway
+// compacts locally: acpCompactionTriggerTokens, or 85% of a smaller client window.
+func acpCompactionWatermark(canReq *adapter.CanonicalRequest) int64 {
+	watermark := acpCompactionTriggerTokens
+	if canReq != nil && canReq.ContextWindow > 0 {
+		if winTrigger := (canReq.ContextWindow * 85) / 100; winTrigger > 0 && winTrigger < watermark {
+			watermark = winTrigger
+		}
+	}
+	return watermark
+}
+
+// needsLocalACPCompaction reports whether the ACP session crossed the compaction
+// watermark and the client sent enough history to rebuild it locally.
+func needsLocalACPCompaction(canReq *adapter.CanonicalRequest, sess *acp.ManagedSession) bool {
+	if canReq == nil || sess == nil || len(canReq.Messages) <= 1 {
+		return false
+	}
+	requested, _ := sess.GetClientCompactionState()
+	lastIn, _ := sess.GetLastTokenUsage()
+	return requested || lastIn >= acpCompactionWatermark(canReq)
+}
+
 // computeNorthboundUsageInputTokens returns the input token count to report in the
-// northbound SSE/JSON `usage` object.
-// To implement "trigger client compaction FIRST, fallback to ACP compaction if unsuccessful":
-//  1. When `stepInfo.inputTokens` is not yet flushed to `transcript.jsonl` during a fast tool call,
-//     we estimate current session tokens from `sess.GetLastTokenUsage() + estimateTurnDeltaTokens(canReq)`
-//     so the client never sees an artificially tiny delta token count (e.g. 3K instead of 230K).
-//  2. When the ACP session's token usage reaches `acpCompactionTriggerTokens` (~225K) or 85% of
-//     the client's context window—and we have not yet requested client compaction on this ACP session—
-//     we mark `ClientCompactionRequested = true` and report a token usage at the client's compaction
-//     watermark so the client immediately triggers its own compaction before ACP hits ~260K CHECKPOINT.
+// northbound SSE/JSON `usage` object. The real ACP usage is reported as-is; crossing
+// the compaction watermark only marks the session so the next turn rotates it onto a
+// locally compacted history (BuildPromptBlocksWithHistory) instead of forcing the
+// client into a slow model-generated compaction.
+// When `stepInfo.inputTokens` is not yet flushed to `transcript.jsonl` during a fast tool call,
+// current session tokens are estimated from `sess.GetLastTokenUsage() + estimateTurnDeltaTokens(canReq)`
+// so the client never sees an artificially tiny delta token count (e.g. 3K instead of 230K).
 func computeNorthboundUsageInputTokens(
 	canReq *adapter.CanonicalRequest,
 	sess *acp.ManagedSession,
@@ -423,31 +465,398 @@ func computeNorthboundUsageInputTokens(
 		}
 	}
 
-	triggerWatermark := acpCompactionTriggerTokens
-	if canReq.ContextWindow > 0 {
-		winTrigger := (canReq.ContextWindow * 85) / 100
-		if winTrigger > 0 && winTrigger < triggerWatermark {
-			triggerWatermark = winTrigger
-		}
-	}
-
 	alreadyRequested, _ := sess.GetClientCompactionState()
-	if reportedInputTokens >= triggerWatermark && !alreadyRequested {
+	if reportedInputTokens >= acpCompactionWatermark(canReq) && !alreadyRequested {
 		sess.SetClientCompactionState(true, 0)
-		// Ensure the reported token count crosses the client's compaction threshold
-		// (even if the client assumed a 272K or 1M window for the model).
-		clientTarget := modelContextCapacityForAudit(canReq.Model, canReq.ContextWindow)
-		if clientTarget > 0 {
-			minSignal := (clientTarget * 95) / 100
-			if minSignal > reportedInputTokens {
-				reportedInputTokens = minSignal
-			}
-		}
 	}
 	if reportedCachedTokens > reportedInputTokens {
 		reportedCachedTokens = reportedInputTokens
 	}
 	return reportedInputTokens, reportedCachedTokens
+}
+
+const (
+	// clientCompactionModeEnv selects how client compaction requests are answered:
+	// "local" (default) builds the handoff in the gateway without any model call;
+	// "model" forwards the request to an ACP session with host-isolation rules.
+	clientCompactionModeEnv = "AG_CLIENT_COMPACTION_MODE"
+	maxLocalHandoffBytes    = 32 * 1024
+)
+
+// clientCompactionHostIsolationRules keeps agy host details out of model-written handoffs.
+const clientCompactionHostIsolationRules = "HANDOFF ISOLATION RULES:\n" +
+	"1. Summarize ONLY the client conversation history provided above. The ACP host environment (e.g. `Command Working Directory: /Users`, host skills such as `using-superpowers`, `.gemini` directories, artifact directories, and `transcript.jsonl` paths) is transport plumbing, not part of the user's task.\n" +
+	"2. NEVER list host environment details, host skills, or transcript paths as files, pending tasks, open tasks, or next steps.\n" +
+	"3. Do NOT call tools. Output the handoff text only."
+
+func localClientCompactionEnabled() bool {
+	return !strings.EqualFold(strings.TrimSpace(os.Getenv(clientCompactionModeEnv)), "model")
+}
+
+type compactionHistoryEntry struct {
+	role     string // "user" | "assistant" | "tool_call" | "tool_result"
+	content  string
+	toolName string
+}
+
+func isCompactionInstruction(lower string) bool {
+	return strings.Contains(lower, "summarize the conversation history provided in the system prompt") ||
+		strings.Contains(lower, "summarize the conversation so far") ||
+		strings.Contains(lower, "create a handoff summary") ||
+		strings.Contains(lower, "compact the conversation")
+}
+
+// parseCompactionHistory flattens the history a client sends for compaction. Sailry-style
+// clients dump it into the system prompt as `[user]: ...` / `[assistant]: tool_request(name): {...}` /
+// `[user]: tool_response: ...` lines; other clients send it as regular messages.
+func parseCompactionHistory(canReq *adapter.CanonicalRequest) []compactionHistoryEntry {
+	if canReq == nil {
+		return nil
+	}
+	var entries []compactionHistoryEntry
+	add := func(role, content string) {
+		content = strings.TrimSpace(content)
+		for {
+			lower := strings.ToLower(content)
+			if strings.HasPrefix(lower, "[user]:") || strings.HasPrefix(lower, "[assistant]:") {
+				content = strings.TrimSpace(content[strings.IndexByte(content, ':')+1:])
+				continue
+			}
+			break
+		}
+		if content == "" {
+			return
+		}
+		lower := strings.ToLower(content)
+		switch {
+		case role == "tool" || strings.HasPrefix(lower, "tool_response:") || strings.HasPrefix(lower, "[tool_result:"):
+			content = strings.TrimSpace(strings.TrimPrefix(content, "tool_response:"))
+			entries = append(entries, compactionHistoryEntry{role: "tool_result", content: content})
+		case role == "assistant" && strings.HasPrefix(lower, "tool_request("):
+			for _, part := range strings.Split(content, "\ntool_request(") {
+				part = strings.TrimPrefix(strings.TrimSpace(part), "tool_request(")
+				name, args := part, ""
+				if closeIdx := strings.Index(part, "):"); closeIdx >= 0 {
+					name, args = part[:closeIdx], strings.TrimSpace(part[closeIdx+2:])
+				}
+				entries = append(entries, compactionHistoryEntry{role: "tool_call", toolName: strings.TrimSpace(name), content: args})
+			}
+		case role == "assistant" && isToolCallOnlyAssistant(content):
+			name := content
+			if openIdx := strings.IndexByte(content, '('); openIdx > 0 {
+				name = content[:openIdx]
+			}
+			entries = append(entries, compactionHistoryEntry{role: "tool_call", toolName: strings.TrimSpace(name), content: content})
+		case role == "assistant":
+			if !isSyntheticCompactionAckAssistant(content) {
+				entries = append(entries, compactionHistoryEntry{role: "assistant", content: content})
+			}
+		default:
+			if !isCompactionInstruction(lower) {
+				entries = append(entries, compactionHistoryEntry{role: "user", content: stripTurnContextBlocks(content)})
+			}
+		}
+	}
+
+	sys := stripTurnContextBlocks(canReq.SystemPrompt)
+	if idx := strings.Index(sys, "**Conversation History:**"); idx >= 0 {
+		sys = sys[idx+len("**Conversation History:**"):]
+	}
+	curRole := ""
+	var cur strings.Builder
+	flush := func() {
+		if curRole != "" {
+			add(curRole, cur.String())
+		}
+		cur.Reset()
+	}
+	for _, ln := range strings.Split(sys, "\n") {
+		lower := strings.ToLower(strings.TrimSpace(ln))
+		switch {
+		case strings.HasPrefix(lower, "[user]:"):
+			flush()
+			curRole = "user"
+		case strings.HasPrefix(lower, "[assistant]:"):
+			flush()
+			curRole = "assistant"
+		case strings.HasPrefix(lower, "[tool]:"):
+			flush()
+			curRole = "tool"
+		}
+		if curRole != "" {
+			cur.WriteString(ln)
+			cur.WriteString("\n")
+		}
+	}
+	flush()
+
+	for _, m := range canReq.Messages {
+		role := strings.ToLower(strings.TrimSpace(m.Role))
+		if role != "assistant" && role != "tool" {
+			role = "user"
+		}
+		add(role, m.Content)
+	}
+	return entries
+}
+
+func isHostEnvironmentPath(p string) bool {
+	switch strings.TrimRight(p, "/") {
+	case "", ".", "/Users", "/home", "/tmp", "/private/tmp", "/var/folders":
+		return true
+	}
+	return mentionsHostEnvironment(p)
+}
+
+func mentionsHostEnvironment(s string) bool {
+	return strings.Contains(s, "/.gemini/") ||
+		strings.Contains(s, "transcript.jsonl") ||
+		strings.Contains(s, "using-superpowers") ||
+		strings.Contains(s, "Command Working Directory:")
+}
+
+func isMutatingToolName(name string) bool {
+	lower := strings.ToLower(name)
+	for _, kw := range []string{"edit", "write", "replace", "patch", "create", "delete", "remove", "move", "rename"} {
+		if strings.Contains(lower, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+func extractToolArgPaths(args string) []string {
+	var obj map[string]any
+	if json.Unmarshal([]byte(args), &obj) != nil {
+		return nil
+	}
+	var out []string
+	for _, key := range []string{"path", "file_path", "filePath", "target_file", "TargetFile", "Path", "paths", "files"} {
+		switch v := obj[key].(type) {
+		case string:
+			out = append(out, strings.TrimSpace(v))
+		case []any:
+			for _, item := range v {
+				if s, ok := item.(string); ok {
+					out = append(out, strings.TrimSpace(s))
+				}
+			}
+		}
+	}
+	return out
+}
+
+// BuildLocalClientCompactionSummary answers a client compaction request locally in
+// well under a millisecond: it extracts the user's messages, the files read/modified
+// through tool calls, the latest assistant progress, and recent tool results from the
+// history, and renders them as a `# Handoff Summary` without spawning an ACP session.
+func BuildLocalClientCompactionSummary(canReq *adapter.CanonicalRequest) string {
+	entries := parseCompactionHistory(canReq)
+
+	var userMessages []string
+	var priorHandoff string
+	seenUser := make(map[string]bool)
+	var readFiles, modifiedFiles []string
+	seenRead := make(map[string]bool)
+	seenModified := make(map[string]bool)
+	lastAssistant := ""
+	type toolActivity struct {
+		name, args, result string
+		host               bool
+	}
+	var activity []toolActivity
+
+	for _, e := range entries {
+		switch e.role {
+		case "user":
+			if strings.Contains(e.content, "# Handoff Summary") {
+				priorHandoff = e.content
+				continue
+			}
+			msg := truncateUTF8Middle(e.content, 1200, "\n...[truncated]...\n")
+			if !seenUser[msg] {
+				seenUser[msg] = true
+				userMessages = append(userMessages, msg)
+			}
+		case "assistant":
+			lastAssistant = e.content
+		case "tool_call":
+			if mentionsHostEnvironment(e.content) {
+				activity = append(activity, toolActivity{name: e.toolName, host: true})
+				continue
+			}
+			for _, p := range extractToolArgPaths(e.content) {
+				if isHostEnvironmentPath(p) {
+					continue
+				}
+				if isMutatingToolName(e.toolName) {
+					if !seenModified[p] {
+						seenModified[p] = true
+						modifiedFiles = append(modifiedFiles, p)
+					}
+				} else if !seenRead[p] {
+					seenRead[p] = true
+					readFiles = append(readFiles, p)
+				}
+			}
+			activity = append(activity, toolActivity{name: e.toolName, args: e.content})
+		case "tool_result":
+			if n := len(activity); n > 0 && activity[n-1].result == "" {
+				activity[n-1].result = e.content
+			} else {
+				activity = append(activity, toolActivity{name: "tool_result", result: e.content})
+			}
+			if n := len(activity); mentionsHostEnvironment(e.content) {
+				activity[n-1].host = true
+			}
+		}
+	}
+	kept := activity[:0]
+	for _, a := range activity {
+		if !a.host {
+			kept = append(kept, a)
+		}
+	}
+	activity = kept
+
+	if len(userMessages) > 12 {
+		userMessages = append(userMessages[:1], userMessages[len(userMessages)-11:]...)
+	}
+	if len(readFiles) > 60 {
+		readFiles = readFiles[len(readFiles)-60:]
+	}
+	if len(activity) > 8 {
+		activity = activity[len(activity)-8:]
+	}
+
+	var sb strings.Builder
+	sb.WriteString("# Handoff Summary\n\n")
+	sb.WriteString("Compacted locally by the gateway from the conversation history.\n\n")
+
+	sb.WriteString("## User intent\n")
+	switch len(userMessages) {
+	case 0:
+		sb.WriteString("- Continue the current task.\n")
+	case 1:
+		sb.WriteString(fmt.Sprintf("- Request: %s\n", userMessages[0]))
+	default:
+		sb.WriteString(fmt.Sprintf("- Original request: %s\n", userMessages[0]))
+		sb.WriteString(fmt.Sprintf("- Latest request: %s\n", userMessages[len(userMessages)-1]))
+	}
+	sb.WriteString("\n")
+
+	if len(userMessages) > 1 {
+		sb.WriteString("## User messages\n")
+		for i, m := range userMessages {
+			sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, m))
+		}
+		sb.WriteString("\n")
+	}
+
+	latestGoal := "the current task"
+	if len(userMessages) > 0 {
+		latestGoal = truncateUTF8Middle(userMessages[len(userMessages)-1], 400, " ... ")
+	}
+	sb.WriteString("Open tasks:\n")
+	sb.WriteString(fmt.Sprintf("- Continue the latest user request from the current state: %s\n\n", latestGoal))
+
+	sb.WriteString("## State\n")
+	if lastAssistant != "" {
+		sb.WriteString("Latest assistant progress:\n")
+		sb.WriteString(truncateUTF8Middle(lastAssistant, 4096, "\n...[truncated]...\n"))
+		sb.WriteString("\n\n")
+	} else {
+		sb.WriteString("No assistant conclusion yet; the task was mid tool loop when compacted.\n\n")
+	}
+
+	if len(activity) > 0 {
+		sb.WriteString("## Recent tool activity\n")
+		for _, a := range activity {
+			line := "- " + a.name
+			if args := strings.TrimSpace(a.args); args != "" {
+				line += " " + truncateUTF8Middle(args, 300, " ... ")
+			}
+			sb.WriteString(line + "\n")
+			if res := strings.TrimSpace(a.result); res != "" {
+				sb.WriteString("  result: " + strings.ReplaceAll(truncateUTF8Middle(res, 700, " ... "), "\n", "\n  ") + "\n")
+			}
+		}
+		sb.WriteString("\n")
+	}
+
+	sb.WriteString("## Working set\n")
+	if len(modifiedFiles) > 0 {
+		sb.WriteString("Files modified:\n")
+		for _, f := range modifiedFiles {
+			sb.WriteString("- " + f + "\n")
+		}
+	}
+	if len(readFiles) > 0 {
+		sb.WriteString("Files already read:\n")
+		for _, f := range readFiles {
+			sb.WriteString("- " + f + "\n")
+		}
+	}
+	if len(modifiedFiles) == 0 && len(readFiles) == 0 {
+		sb.WriteString("- (no files recorded)\n")
+	}
+	sb.WriteString("\n")
+
+	sb.WriteString("## Constraints\n")
+	sb.WriteString("- Files in the working set were already read in this session; do not re-read them unless exact current lines are needed for an edit.\n")
+	sb.WriteString("- Do not re-run discovery (find_files / git_status / search) already reflected above.\n")
+
+	if priorHandoff != "" {
+		sb.WriteString("\n## Prior handoff\n")
+		sb.WriteString(truncateUTF8Middle(strings.TrimSpace(strings.Replace(priorHandoff, "# Handoff Summary", "", 1)), 8*1024, "\n...[truncated]...\n"))
+		sb.WriteString("\n")
+	}
+
+	return truncateUTF8Middle(strings.TrimSpace(sb.String()), maxLocalHandoffBytes, "\n...[handoff truncated]...\n")
+}
+
+// respondLocalClientCompaction writes the locally built handoff in the client's protocol.
+func (gs *GatewayServer) respondLocalClientCompaction(w http.ResponseWriter, reqID string, startTime time.Time, canReq *adapter.CanonicalRequest, accountID string, summary string) {
+	promptTokens := estimatePromptTokens(canReq)
+	compTokens := estimateTokens(summary)
+	if compTokens < 1 {
+		compTokens = 1
+	}
+	ttfbMs := time.Since(startTime).Milliseconds()
+	if ttfbMs < 1 {
+		ttfbMs = 1
+	}
+	gs.recordAuditWithContext(reqID, canReq, accountID, "", 0, promptTokens, promptTokens, 0, compTokens, ttfbMs, startTime, http.StatusOK, "", "", summary, "")
+
+	if canReq.Stream {
+		switch canReq.Protocol {
+		case "openai":
+			sse := adapter.NewOpenAISSEWriter(w, reqID, canReq.Model)
+			sse.WriteStart()
+			sse.WriteTextDelta(summary)
+			sse.WriteStopWithUsage(promptTokens, 0, compTokens)
+		case "openai_responses":
+			sse := adapter.NewOpenAIResponsesSSEWriter(w, reqID, canReq.Model)
+			sse.WriteStart()
+			sse.WriteTextDelta(summary)
+			sse.WriteStopWithCache("", summary, promptTokens, 0, compTokens)
+		default:
+			sse := adapter.NewClaudeSSEWriter(w, reqID, canReq.Model)
+			sse.SetInputTokens(promptTokens)
+			sse.WriteStart()
+			sse.WriteTextDelta(summary)
+			sse.WriteStopWithUsage(promptTokens, 0, compTokens)
+		}
+		return
+	}
+	switch canReq.Protocol {
+	case "openai":
+		writeJSON(w, http.StatusOK, adapter.BuildOpenAIJSONResponseMulti(reqID, canReq.Model, "", summary, nil, promptTokens, 0, compTokens))
+	case "openai_responses":
+		writeJSON(w, http.StatusOK, adapter.BuildOpenAIResponsesJSONResponseMulti(reqID, canReq.Model, "", summary, nil, promptTokens, 0, compTokens))
+	default:
+		writeJSON(w, http.StatusOK, adapter.BuildClaudeJSONResponseMulti(reqID, canReq.Model, "", summary, nil, promptTokens, 0, compTokens))
+	}
 }
 
 // BuildPromptBlocksWithHistory constructs a bounded `<conversation_history>` prompt
@@ -521,22 +930,29 @@ func BuildPromptBlocksWithHistory(canReq *adapter.CanonicalRequest) []acp.Prompt
 		}
 	}
 
-	// Strip obsolete `Open tasks:` from any Handoff Summary that precedes the latest user instruction.
-	for i := range cleaned {
-		if cleaned[i].role == "USER" && i < lastRealUserIdx {
-			cleaned[i].content = stripStaleHandoffOpenTasks(cleaned[i].content)
-		}
-	}
-
 	// Find the last substantive prose ASSISTANT reply before lastRealUserIdx.
-	// Any intermediate TOOL calls or tool-call-only ASSISTANT messages prior to that reply
-	// belong to already-completed turns and must not pollute the new session.
+	// Any intermediate TOOL calls, tool-call-only ASSISTANT messages, or synthetic
+	// compaction ack messages prior to that reply do not count as task completion.
 	lastProseAsstBeforeUserIdx := -1
 	if lastRealUserIdx > 0 {
 		for i := lastRealUserIdx - 1; i >= 0; i-- {
-			if cleaned[i].role == "ASSISTANT" && !isToolCallOnlyAssistant(cleaned[i].content) {
+			if cleaned[i].role == "ASSISTANT" &&
+				!isToolCallOnlyAssistant(cleaned[i].content) &&
+				!isSyntheticCompactionAckAssistant(cleaned[i].content) {
 				lastProseAsstBeforeUserIdx = i
 				break
+			}
+		}
+	}
+
+	// Only strip obsolete `Open tasks:` / `Next step:` from a Handoff Summary when a
+	// substantive assistant conclusion followed that summary (meaning the prior task
+	// finished and the user issued a brand-new follow-up instruction). During an active
+	// post-compaction resume turn, preserve the entire `# Handoff Summary` intact.
+	if lastProseAsstBeforeUserIdx > 0 {
+		for i := 0; i < lastProseAsstBeforeUserIdx; i++ {
+			if cleaned[i].role == "USER" {
+				cleaned[i].content = stripStaleHandoffOpenTasks(cleaned[i].content)
 			}
 		}
 	}
@@ -556,30 +972,67 @@ func BuildPromptBlocksWithHistory(canReq *adapter.CanonicalRequest) []acp.Prompt
 	if len(historySlice) > 0 {
 		startRecentFloor := 0
 		if historySlice[0].role == "USER" && (lastProseAsstBeforeUserIdx < 0 || !strings.Contains(historySlice[0].content, "# Handoff Summary")) {
-			goalText := truncateUTF8Middle(historySlice[0].content, maxInitialGoalBytes, "\n...[initial message truncated]...\n")
+			goalBudget := maxInitialGoalBytes
+			if strings.Contains(historySlice[0].content, "# Handoff Summary") && goalBudget < 32*1024 {
+				goalBudget = 32 * 1024
+			}
+			goalText := truncateUTF8Middle(historySlice[0].content, goalBudget, "\n...[initial message truncated]...\n")
 			sb.WriteString(fmt.Sprintf("[USER]:\n%s\n\n", goalText))
 			startRecentFloor = 1
+		}
+
+		// Tool outputs of the active task (after the last real user turn, or the whole
+		// history when no prior task completed) were just read by the model; keep the
+		// most recent ones large enough that a mid-task rebuild (tool_search unlock or
+		// local compaction) does not force the model to re-read them.
+		const maxActiveTaskTools = 12
+		activeTaskTools := 0
+		for i := len(historySlice) - 1; i >= startRecentFloor && activeTaskTools < maxActiveTaskTools; i-- {
+			if historySlice[i].role == "TOOL" && (i > lastRealUserIdx || lastProseAsstBeforeUserIdx < 0) {
+				activeTaskTools++
+			}
+		}
+		activeToolBytes := 1400
+		if activeTaskTools > 0 {
+			activeToolBytes = (maxMiddleBudget * 3 / 4) / activeTaskTools
+			if activeToolBytes > 8000 {
+				activeToolBytes = 8000
+			} else if activeToolBytes < 1400 {
+				activeToolBytes = 1400
+			}
 		}
 
 		var recentFormatted []string
 		usedBytes := 0
 		skippedCount := 0
+		recentToolCount := 0
 		for i := len(historySlice) - 1; i >= startRecentFloor; i-- {
 			m := historySlice[i]
+			if m.role == "ASSISTANT" && isSyntheticCompactionAckAssistant(m.content) {
+				continue
+			}
 			if lastProseAsstBeforeUserIdx >= 0 && i < lastProseAsstBeforeUserIdx {
 				if m.role == "TOOL" || (m.role == "ASSISTANT" && isToolCallOnlyAssistant(m.content)) {
 					continue
 				}
 			}
+			inActiveTask := i > lastRealUserIdx || lastProseAsstBeforeUserIdx < 0
+			if m.role == "TOOL" && inActiveTask {
+				recentToolCount++
+			}
 			distFromEnd := len(historySlice) - 1 - i
 			maxEntryContent := 4000
 			switch {
+			case strings.Contains(m.content, "# Handoff Summary"):
+				maxEntryContent = 32 * 1024
 			case i == lastProseAsstBeforeUserIdx:
 				maxEntryContent = 24 * 1024
 			case i == lastRealUserIdx:
 				maxEntryContent = 16 * 1024
 			case distFromEnd < 4:
 				maxEntryContent = 8000
+			case m.role == "TOOL" && inActiveTask && recentToolCount <= maxActiveTaskTools:
+				maxEntryContent = activeToolBytes
 			case m.role == "TOOL":
 				maxEntryContent = 1400
 			}
@@ -601,8 +1054,10 @@ func BuildPromptBlocksWithHistory(canReq *adapter.CanonicalRequest) []acp.Prompt
 		}
 	}
 
+	const historyContinuityNote = "[Context Continuity Note: All files, tool outputs, and # Handoff Summary entries in <conversation_history> above have already been read in this session. Continue directly from this state—do NOT redundantly re-run find_files / git_status or re-read already summarized files.]\n\n"
 	if hasTailTurn {
 		sb.WriteString("</conversation_history>\n\n")
+		sb.WriteString(historyContinuityNote)
 		tailContent := truncateUTF8Middle(lastMsg.content, maxFinalTurnBytes, "\n...[middle of large input truncated]...\n")
 		if lastMsg.role == "TOOL" {
 			if lastRealUserIdx >= 0 && lastRealUserIdx < lastIdx {
@@ -618,7 +1073,9 @@ func BuildPromptBlocksWithHistory(canReq *adapter.CanonicalRequest) []acp.Prompt
 			sb.WriteString(tailContent)
 		}
 	} else {
-		sb.WriteString("</conversation_history>\n\nPlease continue.")
+		sb.WriteString("</conversation_history>\n\n")
+		sb.WriteString(historyContinuityNote)
+		sb.WriteString("Please continue.")
 	}
 
 	blocks := []acp.PromptBlock{{Type: "text", Text: sb.String()}}
@@ -1049,7 +1506,9 @@ func extractContextWindowHeader(r *http.Request) int64 {
 	}
 	for _, h := range []string{
 		"X-ACP-Context-Window",
+		"X-ACP-Context-Size",
 		"X-Context-Window",
+		"X-Context-Size",
 		"X-Model-Context-Window",
 		"X-Max-Input-Tokens",
 	} {
@@ -1060,6 +1519,19 @@ func extractContextWindowHeader(r *http.Request) int64 {
 		var parsed int64
 		if _, err := fmt.Sscanf(val, "%d", &parsed); err == nil && parsed > 0 {
 			return parsed
+		}
+	}
+	if r.URL != nil {
+		q := r.URL.Query()
+		for _, k := range []string{"context_size", "context_window"} {
+			val := strings.TrimSpace(q.Get(k))
+			if val == "" {
+				continue
+			}
+			var parsed int64
+			if _, err := fmt.Sscanf(val, "%d", &parsed); err == nil && parsed > 0 {
+				return parsed
+			}
 		}
 	}
 	return 0
@@ -1224,9 +1696,20 @@ func (gs *GatewayServer) executeNorthboundTurn(w http.ResponseWriter, r *http.Re
 			canReq.ContextWindow = hdrWin
 		}
 	}
+	// Per-key context-window override: when the client did not specify one, fall back to
+	// the window configured on the API key (admin UI presets).
+	if canReq.ContextWindow <= 0 {
+		if keyRec, ok := ctx.Value(ctxKeyAPIKey).(*storage.APIKey); ok && keyRec != nil && keyRec.ContextWindow > 0 {
+			canReq.ContextWindow = keyRec.ContextWindow
+		}
+	}
 	isClientCompaction := IsClientCompactionRequest(canReq)
 	isPostCompactionResume := !isClientCompaction && IsPostCompactionResumeRequest(canReq)
+	var localHandoff string
 	if isClientCompaction {
+		if localClientCompactionEnabled() {
+			localHandoff = BuildLocalClientCompactionSummary(canReq)
+		}
 		canReq.SystemPrompt = compactOversizedClientCompactionSystemPrompt(canReq.SystemPrompt)
 		canReq.Tools = nil
 	}
@@ -1242,7 +1725,11 @@ func (gs *GatewayServer) executeNorthboundTurn(w http.ResponseWriter, r *http.Re
 	effectiveSys := canReq.SystemPrompt
 	var acpSessionSys string
 	if isClientCompaction {
-		acpSessionSys = effectiveSys
+		// Always neutralize the agy host identity for model-written handoffs, even in
+		// native_hybrid mode, so host details never end up as pending tasks.
+		compactionPolicy := policy
+		compactionPolicy.Mode = "pure_passthrough"
+		acpSessionSys = adapter.BuildACPSystemPrompt(effectiveSys, compactionPolicy, clientCompactionHostIsolationRules)
 	} else {
 		effectiveSys = adapter.BuildEffectiveSystemPrompt(canReq.SystemPrompt, policy, skills)
 		if effectiveSys != "" {
@@ -1290,13 +1777,17 @@ func (gs *GatewayServer) executeNorthboundTurn(w http.ResponseWriter, r *http.Re
 		}
 
 		var toolsAdded bool
+		// Once the ACP session crossed the compaction watermark, rotate it onto a locally
+		// compacted history right away instead of waiting for the client to compact.
+		needLocalCompaction := false
 		if parkedSess != nil {
 			toolsAdded, sysDelta = gs.sm.UpdateSessionToolsAndSystem(parkedSess, canReq.Tools, acpSessionSys)
+			needLocalCompaction = needsLocalACPCompaction(canReq, parkedSess)
 			parkedWorker := parkedSess.GetWorker()
 			parkedACPSessID := parkedSess.GetACPSessionID()
-			if toolsAdded && parkedWorker != nil && parkedACPSessID != "" {
+			if (toolsAdded || needLocalCompaction) && parkedWorker != nil && parkedACPSessID != "" {
 				// Cancel the active prompt BEFORE unblocking tools/call so agy_acp_server.par
-				// aborts the stale-tool-list session immediately upon receiving the HTTP response.
+				// aborts the stale session immediately upon receiving the HTTP response.
 				_ = parkedWorker.CancelSession(parkedACPSessID)
 			}
 		}
@@ -1320,24 +1811,14 @@ func (gs *GatewayServer) executeNorthboundTurn(w http.ResponseWriter, r *http.Re
 		}
 
 		if resumedSess != nil && resumedSess.GetWorker() != nil {
-			// Check if client compaction was previously signaled on this session,
-			// and whether we need to fall back to ACP compaction because the client
-			// continued the tool loop without compacting.
-			compReq, waitTurns := resumedSess.GetClientCompactionState()
-			lastIn, _ := resumedSess.GetLastTokenUsage()
-			needACPCompactionFallback := false
-			if compReq {
-				waitTurns++
-				resumedSess.SetClientCompactionState(true, waitTurns)
-				if (waitTurns >= 2 || lastIn >= acpCompactionHardFallbackTokens) && len(canReq.Messages) > 1 {
-					needACPCompactionFallback = true
-					if rWorker := resumedSess.GetWorker(); rWorker != nil && resumedSess.GetACPSessionID() != "" {
-						_ = rWorker.CancelSession(resumedSess.GetACPSessionID())
-					}
+			if resumedSess != parkedSess && !needLocalCompaction && needsLocalACPCompaction(canReq, resumedSess) {
+				needLocalCompaction = true
+				if rWorker := resumedSess.GetWorker(); rWorker != nil && resumedSess.GetACPSessionID() != "" {
+					_ = rWorker.CancelSession(resumedSess.GetACPSessionID())
 				}
 			}
 
-			if !toolsAdded && !needACPCompactionFallback {
+			if !toolsAdded && !needLocalCompaction {
 				if canReq.SessionTitle != "" {
 					resumedSess.SetSessionTitle(canReq.SessionTitle)
 				}
@@ -1356,10 +1837,9 @@ func (gs *GatewayServer) executeNorthboundTurn(w http.ResponseWriter, r *http.Re
 				return
 			}
 
-			// New tools were dynamically unlocked OR client compaction did not happen and we are
-			// falling back to ACP compaction!
-			// Wait briefly for the cancelled prompt to exit and drain any leftover events,
-			// then start a fresh compacted ACP session.
+			// New tools were dynamically unlocked or the session crossed the compaction
+			// watermark. Wait briefly for the cancelled prompt to exit and drain any leftover
+			// events, then start a fresh ACP session from BuildPromptBlocksWithHistory.
 			if pCh := resumedSess.GetPromptDoneCh(); pCh != nil {
 				select {
 				case <-pCh:
@@ -1376,6 +1856,9 @@ func (gs *GatewayServer) executeNorthboundTurn(w http.ResponseWriter, r *http.Re
 			}
 		drainedParkedEvents:
 			resumedSess.SetACPSession("", -1)
+			if needLocalCompaction {
+				resumedSess.ResetTokenUsage()
+			}
 			sess = resumedSess
 			worker = rWorker
 			worker.SetState(acp.StateGenerating)
@@ -1407,9 +1890,15 @@ func (gs *GatewayServer) executeNorthboundTurn(w http.ResponseWriter, r *http.Re
 			gs.sm.AbortParkedCallsForSession(priorSess, priorSess.AccountID, "Error: tool call aborted because client initiated context compaction")
 			if isPostCompactionResume {
 				priorSess.SetACPSession("", -1)
+				priorSess.ResetTokenUsage()
 			}
 		}
 	}
+	if localHandoff != "" {
+		gs.respondLocalClientCompaction(w, reqID, startTime, canReq, preferredAccID, localHandoff)
+		return
+	}
+	workerContextSize := gs.pool.ResolveContextSize(canReq.ContextWindow)
 	if sess == nil {
 		var found bool
 		switch sessionMode {
@@ -1430,12 +1919,12 @@ func (gs *GatewayServer) executeNorthboundTurn(w http.ResponseWriter, r *http.Re
 			sess = nil
 		}
 		forkedHistory := found && sess != nil && sessionMode != "sticky_conversation" && gs.sm.IsStaleHistoryHash(sess, scopedHashBefore)
-		if found && sess != nil && sess.GetWorker().TryMarkBusy() {
+		if found && sess != nil && sess.GetWorker() != nil && sess.GetWorker().ContextSize == workerContextSize && sess.GetWorker().TryMarkBusy() {
 			worker = sess.GetWorker()
 			acc.ID = sess.AccountID
 			sameWorker = true
 		} else {
-			worker, acc, err = gs.pool.AcquireForAccountForModel(ctx, preferredAccID, allowFailover, canReq.Model)
+			worker, acc, err = gs.pool.AcquireForAccountWithContextSize(ctx, preferredAccID, allowFailover, canReq.Model, workerContextSize)
 			if err != nil {
 				status := http.StatusServiceUnavailable
 				if strings.Contains(err.Error(), "is disabled") {
@@ -1450,32 +1939,31 @@ func (gs *GatewayServer) executeNorthboundTurn(w http.ResponseWriter, r *http.Re
 		if found && sess != nil {
 			var toolsAdded bool
 			toolsAdded, sysDelta = gs.sm.UpdateSessionToolsAndSystem(sess, canReq.Tools, acpSessionSys)
-			// Fallback to ACP compaction if client compaction was requested on the previous turn
-			// and the client sent another regular turn without compacting.
-			compReq, waitTurns := sess.GetClientCompactionState()
+			compReq, _ := sess.GetClientCompactionState()
 			lastIn, _ := sess.GetLastTokenUsage()
 			clientTruncatedHistory := compReq && len(canReq.Messages) > 0 && lastIn > 0 && promptTokens < (lastIn*55)/100
-			needACPCompactionFallback := false
+			needLocalCompaction := false
 			if isPostCompactionResume || clientTruncatedHistory || forkedHistory {
 				// The live ACP session holds turns the client no longer has; rebuild it
 				// from the client's history.
 				sess.SetACPSession("", -1)
 				sysDelta = ""
-			} else if compReq {
-				waitTurns++
-				sess.SetClientCompactionState(true, waitTurns)
-				if len(canReq.Messages) > 1 {
-					// Client did not compact on the turn following our client-compaction signal:
-					// rotate/compact the ACP session via BuildPromptBlocksWithHistory.
-					needACPCompactionFallback = true
+				if isPostCompactionResume || clientTruncatedHistory {
+					sess.ResetTokenUsage()
 				}
+			} else if needsLocalACPCompaction(canReq, sess) {
+				// The ACP session crossed the compaction watermark: rotate it onto a locally
+				// compacted history (BuildPromptBlocksWithHistory) on this turn.
+				needLocalCompaction = true
 			}
-			if toolsAdded || !sameWorker || needACPCompactionFallback {
+			if toolsAdded || !sameWorker || needLocalCompaction {
 				// If new tools were added, the session moved to a different worker process,
-				// or client compaction did not occur and we are falling back to ACP compaction,
-				// start a fresh ACP session.
+				// or the session needs local compaction, start a fresh ACP session.
 				sess.SetACPSession("", -1)
 				sysDelta = ""
+			}
+			if needLocalCompaction {
+				sess.ResetTokenUsage()
 			}
 			sess = gs.sm.RebindSession(sess, acc.ID, effectiveSessionKey, sess.HistoryHash, worker, sess.GetACPSessionID(), canReq.Tools)
 			gs.sm.UpdateSessionHash(sess, scopedHashFull)
@@ -1539,7 +2027,7 @@ func (gs *GatewayServer) executeNorthboundTurn(w http.ResponseWriter, r *http.Re
 			_ = gs.store.UpdateAccountStatus(acc.ID, "auth_required", "")
 			gs.pool.Release(worker)
 			// Failover to next healthy account
-			worker2, acc2, err2 := gs.pool.AcquireForAccountForModel(ctx, "", true, canReq.Model)
+			worker2, acc2, err2 := gs.pool.AcquireForAccountWithContextSize(ctx, "", true, canReq.Model, workerContextSize)
 			if err2 == nil {
 				worker = worker2
 				acc = acc2
