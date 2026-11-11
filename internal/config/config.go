@@ -21,6 +21,10 @@ type ServerConfig struct {
 	SSEKeepAliveSec    int      `yaml:"sse_keepalive_sec" json:"sse_keepalive_sec"`
 	ReadTimeoutSec     int      `yaml:"read_timeout_sec" json:"read_timeout_sec"`
 	WriteTimeoutSec    int      `yaml:"write_timeout_sec" json:"write_timeout_sec"`
+	// StreamStallTimeoutSec aborts a streaming turn when the upstream ACP backend emits
+	// no output for this many seconds, converting a silent multi-minute hang into a clean
+	// 504 before the client's own timeout fires. 0 disables the watchdog.
+	StreamStallTimeoutSec int `yaml:"stream_stall_timeout_sec" json:"stream_stall_timeout_sec"`
 }
 
 type ACPPoolConfig struct {
@@ -84,16 +88,17 @@ func Load(path string) (*Config, error) {
 
 	cfg := &Config{
 		Server: ServerConfig{
-			Host:               "0.0.0.0",
-			Port:               8080,
-			PublicBaseURL:      "http://localhost:8080",
-			DataDir:            "./data",
-			AdminToken:         "auto",
-			AdminPassword:      "auto",
-			CORSAllowedOrigins: []string{"*"},
-			SSEKeepAliveSec:    15,
-			ReadTimeoutSec:     600,
-			WriteTimeoutSec:    600,
+			Host:                  "0.0.0.0",
+			Port:                  8080,
+			PublicBaseURL:         "http://localhost:8080",
+			DataDir:               "./data",
+			AdminToken:            "auto",
+			AdminPassword:         "auto",
+			CORSAllowedOrigins:    []string{"*"},
+			SSEKeepAliveSec:       15,
+			ReadTimeoutSec:        600,
+			WriteTimeoutSec:       600,
+			StreamStallTimeoutSec: 180,
 		},
 		ACPPool: ACPPoolConfig{
 			BackendType:        "cli",
@@ -310,4 +315,3 @@ func (c *Config) SetAdminPassword(pwd string) {
 	defer c.mu.Unlock()
 	c.Server.AdminPassword = pwd
 }
-

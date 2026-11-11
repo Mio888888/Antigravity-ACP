@@ -9,6 +9,11 @@ server:
   sse_keepalive_sec: 15
   read_timeout_sec: 600
   write_timeout_sec: 600
+  # Abort a streaming turn when the upstream ACP backend produces no output for this many
+  # seconds, so a silent multi-minute hang becomes a clean 504 instead of the client
+  # giving up on a dead stream. Must exceed the model's normal time-to-first-token (tens
+  # of seconds for large contexts / high thinking). 0 disables the watchdog.
+  stream_stall_timeout_sec: 180
 
 acp_pool:
   # backend_type: "cli" (default) | "zed" (or "zen") | "auto"

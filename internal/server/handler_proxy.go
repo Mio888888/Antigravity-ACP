@@ -2701,6 +2701,12 @@ func (gs *GatewayServer) streamOrCollectWorkerOutput(
 	ticker := time.NewTicker(time.Duration(keepAliveSec) * time.Second)
 	defer ticker.Stop()
 
+	// Stall watchdog: if the upstream ACP backend goes completely silent for longer than
+	// stallTimeout, abort the turn with a clean 504 instead of leaving the client hanging
+	// on a dead stream (keepalives keep the socket warm but carry no real progress).
+	stallTimeout := time.Duration(gs.cfg.Server.StreamStallTimeoutSec) * time.Second
+	lastActivity := time.Now()
+
 	var oaSSE *adapter.OpenAISSEWriter
 	var oaRespSSE *adapter.OpenAIResponsesSSEWriter
 	var clSSE *adapter.ClaudeSSEWriter
@@ -2919,9 +2925,11 @@ func (gs *GatewayServer) streamOrCollectWorkerOutput(
 	for {
 		select {
 		case ev := <-worker.Events():
+			lastActivity = time.Now()
 			processEvent(ev)
 
 		case parked := <-sess.ToolCallNotifyCh:
+			lastActivity = time.Now()
 			markFirstByte()
 			gs.sm.MarkToolCallDispatched(parked.CallID)
 			// Drain any parallel tool calls already queued in ToolCallNotifyCh.
@@ -3219,6 +3227,48 @@ func (gs *GatewayServer) streamOrCollectWorkerOutput(
 			return
 
 		case <-ticker.C:
+			if stallTimeout > 0 && time.Since(lastActivity) > stallTimeout {
+				stallMsg := fmt.Sprintf("upstream ACP backend produced no output for %s; aborting stalled turn", stallTimeout)
+				compTokens := estimateTokens(fullText.String())
+				if compTokens < 1 {
+					compTokens = 1
+				}
+				effectiveFirstByteMs := firstOutputByteMs
+				if effectiveFirstByteMs == 0 {
+					effectiveFirstByteMs = firstByteMs
+				}
+				inTok, cachedTok := sess.GetLastTokenUsage()
+				if inTok <= 0 {
+					inTok = promptTokens
+				}
+				gs.recordAuditWithContext(reqID, canReq, sess.AccountID, acpSessID, worker.PID, inTok, inTok, cachedTok, compTokens, effectiveFirstByteMs, startTime, http.StatusGatewayTimeout, stallMsg, fullThinking.String(), fullText.String(), "")
+				switch {
+				case oaSSE != nil:
+					oaSSE.WriteError(stallMsg)
+				case oaRespSSE != nil:
+					oaRespSSE.WriteError(stallMsg)
+				case clSSE != nil:
+					clSSE.WriteError(stallMsg)
+				default:
+					writeProtocolError(w, canReq.Protocol, http.StatusGatewayTimeout, stallMsg)
+				}
+				_ = worker.CancelSession(acpSessID)
+				go func() {
+					select {
+					case <-promptDoneCh:
+					case <-time.After(3 * time.Second):
+					}
+					for {
+						select {
+						case <-worker.Events():
+						default:
+							gs.pool.Release(worker)
+							return
+						}
+					}
+				}()
+				return
+			}
 			if oaSSE != nil {
 				oaSSE.WriteKeepAlive()
 			} else if oaRespSSE != nil {
