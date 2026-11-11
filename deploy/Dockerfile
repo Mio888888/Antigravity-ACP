@@ -1,7 +1,7 @@
 # Base images are pinned to exact version tags; Dependabot (docker ecosystem, /deploy) proposes bumps.
 
 # Stage 1: Build ReUI Bilingual Frontend SPA
-FROM node:22.23.4-bookworm-slim AS web-builder
+FROM node:26.13.0-bookworm-slim AS web-builder
 WORKDIR /src/web
 COPY web/package.json web/package-lock.json ./
 RUN npm ci
