@@ -17,7 +17,7 @@
 
 2. **Selectable Dual ACP Backend Engine with Auto-Download (Default: `cli`)**
    - **`cli` Mode (Default)**: Runs the official Antigravity CLI (`agy acp` / `antigravity acp`) with full CLI flag support (`--process-per-session`, `--sandbox`, etc.). One-click deployment automatically downloads and **SHA-512 verifies** the native `agy` binary for your OS/Arch (`darwin/linux/windows`, `amd64/arm64`) from the official manifest if not already installed. Verification **fails closed**: a missing hash, missing hashing tool or unreachable manifest is an error, and a hash mismatch is always fatal.
-   - **`zed` / `zen` Mode**: Runs Zed's standalone Antigravity ACP server package (`agy_acp_server.par` / `agy_acp_server` / `agy_acp_server.exe`). Automatic download requires a **pinned SHA-256** via `ZED_ACP_SHA256` (or `--zed-sha256`); without it the scripts refuse to install.
+   - **`zed` / `zen` Mode**: Runs Zed's standalone Antigravity ACP server package (`agy_acp_server.par` / `agy_acp_server` / `agy_acp_server.exe`). Automatic download resolves the latest version and **SHA-256** checksum from the official ACP Registry by default, or accepts an explicitly pinned `ZED_ACP_SHA256` (`--zed-sha256`).
    - **`auto` Discovery Mode**: Automatically locates the installed `agy` CLI or Zed ACP extension package across macOS, Windows, Linux, and Docker containers, with built-in binary header (ELF / Mach-O / PE) validation to prevent cross-OS mount conflicts.
 
 3. **4-Layer Sticky Session & Worker Process Affinity**
@@ -30,8 +30,9 @@
    - Per-account isolated `GEMINI_CLI_HOME` directories (`data/accounts/<id>/.gemini`) and dedicated worker sub-pools.
    - Supports **Direct**, **SOCKS5 / HTTP Proxy**, **Source IP Binding (`bind_ip`)**, and **Linux Network Namespace (`netns`)** egress modes, plus headless OAuth Terminal Login and per-model quota window tracking.
 
-5. **Bilingual (Chinese / English) ReUI Observability Console**
+5. **Bilingual (Chinese / English) ReUI Observability Console & In-Console Self-Update**
    - Instant **`中文 / EN`** toggle in the top bar.
+   - **In-Console Online Updater (`Updates`)**: Built-in dual-target updater in the admin header—downloads prebuilt gateway archives directly from **GitHub Releases** (`SHA256SUMS` verification + ELF/Mach-O/PE binary header validation + graceful in-place restart & automatic page reload), and hot-updates the **Antigravity CLI / Zed ACP backend engine** without restarting the gateway or interrupting active requests (automatically detects Docker or read-only systemd sandboxes and provides the host update command).
    - **Overview Dashboard**: Per-request routing trace, 4-stage latency breakdown (Gateway / Network / Provider TTFB / Streaming), pure output TPS calculation, 2D proportional Context Window Treemap & Waffle Grid, bottom request/session selector, and a live **Worker Processes & Bound Sessions** panel.
 
 ---
@@ -62,7 +63,7 @@ The gateway uses a pure-Go SQLite engine (`CGO_ENABLED=0`) and embeds the compil
 Make the deployment script executable:
 
 ```bash
-chmod +x deploy/deploy.sh
+chmod +x deploy/deploy.sh deploy/update.sh
 ```
 
 #### A. One-Click Build & Local Background Start (Quickest)
@@ -106,13 +107,26 @@ sudo cat /var/lib/antigravity-gateway/data/admin_credentials.txt   # Show the ge
 
 On macOS, `--mode service` registers a per-user launchd agent at `~/Library/LaunchAgents/com.antigravity.gateway.plist` (mode `0600`).
 
-#### C. Switch or Standalone Download/Update ACP Backend Engine
-```bash
-# Download or update the default CLI backend (./bin/agy) only
-./deploy/deploy.sh --action install-acp --backend cli --lang en
+#### C. One-Click Code Pull & CLI / Zed ACP Package Update (`deploy/update.sh`)
+Run `./deploy/update.sh` (or `./deploy/deploy.sh --action update`) to perform an end-to-end update across `local`, `service` (systemd / launchd), or `docker` deployments:
+1. Automatically stashes local modifications and runs `git pull --ff-only` (or links and syncs the directory to the official GitHub repository if deployed from a release archive without `.git`), then re-execs the updated script;
+2. Auto-detects the active deployment mode (`docker` / `service` / `local`) and backend engine;
+3. **Updates the ACP backend package(s)**: downloads and verifies the latest **Antigravity CLI (`agy`)** and/or **Zed standalone ACP package (`agy_acp_server.par`)** (in Docker mode, passes `AG_ACP_CACHE_BUST` to force a fresh ACP layer build);
+4. Rebuilds the frontend + Go binaries, restarts the gateway, and verifies `/healthz`.
 
-# Use Zed/Zen's standalone ACP backend package: a pinned SHA-256 from a trusted source is required
-ZED_ACP_SHA256="<sha256 of agy-acp-server-1.4.5-<os>-<arch>.zip>" ./deploy/deploy.sh --mode local --backend zed --lang en
+```bash
+# One-click pull latest code + update active/installed ACP backend package + rebuild & restart
+./deploy/update.sh --lang en
+
+# One-click update code and explicitly update (or switch to) CLI, Zed ACP, or both
+./deploy/update.sh --backend cli --lang en
+./deploy/update.sh --backend zed --lang en
+./deploy/update.sh --backend both --lang en
+
+# Update ACP backend package(s) only without pulling code or restarting
+./deploy/update.sh --action update-acp --backend cli --lang en
+./deploy/update.sh --action update-acp --backend zed --lang en
+./deploy/update.sh --action update-acp --backend both --lang en
 
 # Offline deployment (use an existing binary path and skip auto-download)
 ./deploy/deploy.sh --mode local --backend cli --acp-bin "/path/to/agy" --no-download --lang en
@@ -120,7 +134,7 @@ ZED_ACP_SHA256="<sha256 of agy-acp-server-1.4.5-<os>-<arch>.zip>" ./deploy/deplo
 
 Download integrity rules (identical in `deploy.sh`, `deploy.ps1` and the `Dockerfile`):
 - **CLI**: uses the SHA-512 from the official manifest. An unreachable manifest, a missing hash or a missing hashing tool is an error; only an explicit `--insecure-skip-verify` lets the "missing hash/tool" cases continue.
-- **Zed package**: the expected SHA-256 must be supplied via `ZED_ACP_SHA256` or `--zed-sha256` (for example from `distribution.binary.<target>.sha256` of the `antigravity-acp` entry in the ACP Registry, or another trusted source), otherwise the script errors out. `ZED_ACP_VERSION` overrides the version (default `1.4.5`).
+- **Zed package**: automatically resolves the latest version and expected SHA-256 from the `antigravity-acp` entry in the official ACP Registry (`https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json`), or accepts an explicit override via `ZED_ACP_SHA256` / `--zed-sha256` and `ZED_ACP_VERSION` / `--zed-version`.
 - **A hash mismatch is always fatal**; there is no fallback to another download method.
 - The official installer `https://antigravity.google/cli/install.sh` is only used when the manifest is unavailable **and** `--allow-install-script` is passed. It is downloaded to a temp file and shown in full first (with a confirmation prompt on a terminal); it is never piped into `bash`.
 
@@ -139,15 +153,17 @@ In local mode, `stop` / `restart` only terminate the PID recorded in the pid fil
 
 | Flag | Values | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `--action` | `install` \| `install-acp` \| `start` \| `stop` \| `restart` \| `status` \| `build` \| `build-all` | `install` | Action to run (`install-acp` downloads ACP backend only; `build-all` cross-compiles all platforms) |
-| `--mode` | `local` \| `service` \| `docker` | `local` | Deployment target: local background daemon, OS service, or Docker Compose; lifecycle actions are routed accordingly |
-| `--backend` | `cli` \| `zed` \| `zen` \| `auto` | Keep `config.yaml` value | ACP backend engine (repository default `cli`) |
+| `--action` | `install` \| `update` \| `install-acp` \| `update-acp` \| `start` \| `stop` \| `restart` \| `status` \| `build` \| `build-all` | `install` (`update` in `update.sh`) | Action to run (`update` pulls latest code + updates ACP package + restarts; `update-acp` updates ACP backend only) |
+| `--mode` | `local` \| `service` \| `docker` | `local` (auto-detected on `update`) | Deployment target: local background daemon, OS service, or Docker Compose; lifecycle actions are routed accordingly |
+| `--backend` | `cli` \| `zed` \| `zen` \| `auto` \| `both` | Keep `config.yaml` value | ACP backend engine (repository default `cli`; `both` updates both CLI and Zed ACP packages) |
 | `--acp-bin` | File path | Empty (auto) | Explicit path to `agy` or `agy_acp_server.par` |
-| `--no-download` | Flag | Off (auto-download on) | Disable automatic ACP backend download when missing |
+| `--no-download` | Flag | Off (auto-download on) | Disable automatic ACP backend download/update |
+| `--no-git` / `--skip-git` | Flag | Off | Skip `git pull` during `--action update` |
 | `--port` | Port number | `AG_PORT`, else `config.yaml` (docker: `8080`) | Listen port in local/service mode; host-side published port in docker mode (the container always listens on `8080`) |
 | `--admin-password-stdin` | Flag | Off | Read the initial admin password (min. 8 chars) from stdin or an interactive prompt |
 | `--admin-password` | String | Empty (auto-generated) | Same, but on the command line (discouraged); only applies until the password is changed in the console |
-| `--zed-sha256` | 64 hex chars | `ZED_ACP_SHA256` | Expected SHA-256 of the Zed ACP archive |
+| `--zed-version` | Version string | Latest from ACP Registry | Override Zed ACP package version (or set `ZED_ACP_VERSION`) |
+| `--zed-sha256` | 64 hex chars | Auto-resolved from ACP Registry | Expected SHA-256 of the Zed ACP archive (or set `ZED_ACP_SHA256`) |
 | `--insecure-skip-verify` | Flag | Off | Continue when no expected hash or hashing tool is available (a mismatch still fails) |
 | `--allow-install-script` | Flag | Off | Allow downloading and running the official installer when the manifest is unavailable (shown first) |
 | `--lang` | `zh` \| `en` | `zh` | Script terminal output language |
@@ -242,11 +258,13 @@ Run in PowerShell on Windows 10/11 or Windows Server (`x64` or `ARM64`):
 # Option A: Build & start locally in background (defaults to `cli` mode, auto-downloading `agy.exe` with SHA-512 verification if missing)
 .\deploy\deploy.ps1 -Mode local -Port 8080 -AdminPasswordStdin -Lang en
 
-# Option B: Explicitly use Zed/Zen ACP package (a pinned SHA-256 is required)
-.\deploy\deploy.ps1 -Mode local -Backend zed -ZedSha256 "<sha256 of agy-acp-server-1.4.5-windows-<arch>.zip>" -Lang en
+# Option B: One-click pull latest code & update CLI / Zed ACP packages (.\deploy\update.ps1)
+.\deploy\update.ps1 -Lang en
+.\deploy\update.ps1 -Backend zed -Lang en
+.\deploy\update.ps1 -Backend both -Lang en
 
 # Option C: Download/update ACP backend binary into .\bin only
-.\deploy\deploy.ps1 -Action install-acp -Backend cli -Lang en
+.\deploy\deploy.ps1 -Action update-acp -Backend cli -Lang en
 
 # Option D: Register a Windows Scheduled Task that starts at boot (run from an elevated PowerShell)
 .\deploy\deploy.ps1 -Mode service -Port 8080 -AdminPasswordStdin -Lang en

@@ -10,18 +10,19 @@
 # and only applies until it is changed in the Web Console.
 # ==============================================================================
 param(
-    [ValidateSet("install", "install-acp", "start", "stop", "restart", "status", "build")]
+    [ValidateSet("install", "update", "install-acp", "update-acp", "start", "stop", "restart", "status", "build")]
     [string]$Action = "install",
 
     [ValidateSet("local", "service", "docker")]
     [string]$Mode = "local",
 
     # Default: keep acp_pool.backend_type from config.yaml
-    [ValidateSet("cli", "zed", "zen", "auto")]
+    [ValidateSet("cli", "zed", "zen", "auto", "both", "all")]
     [string]$Backend = "cli",
 
     [string]$AcpBin = "",
     [switch]$NoDownload,
+    [switch]$NoGit,
 
     # Default: AG_PORT, else server.port from config.yaml (docker: 8080)
     [int]$Port = 0,
@@ -82,7 +83,66 @@ function Read-ConfigValue([string]$Key) {
 
 $BackendSet = $PSBoundParameters.ContainsKey("Backend")
 $PortSet = $PSBoundParameters.ContainsKey("Port")
+$ModeSet = $PSBoundParameters.ContainsKey("Mode")
+$ZedVersionSet = $PSBoundParameters.ContainsKey("ZedVersion") -or [bool]$env:ZED_ACP_VERSION
 
+function Get-ActiveMode {
+    if (Get-Command docker -ErrorAction SilentlyContinue) {
+        docker inspect antigravity-gateway *> $null
+        if ($LASTEXITCODE -eq 0) { return "docker" }
+    }
+    if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+        return "service"
+    }
+    return "local"
+}
+
+if ($Action -eq "update") {
+    if (-not $NoGit -and $env:AG_UPDATE_REEXEC -ne "1") {
+        if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+            Fail "未检测到 git，无法拉取最新代码 (如需跳过请传入 -NoGit)" "git not found; cannot pull latest code (pass -NoGit to skip)"
+        }
+        git -C $RootDir rev-parse --is-inside-work-tree *> $null
+        if ($LASTEXITCODE -ne 0) {
+            Fail "当前目录 ($RootDir) 不是 Git 仓库，无法执行 git pull (如需跳过请传入 -NoGit)" "Current directory ($RootDir) is not a git repository (pass -NoGit to skip)"
+        }
+        $stashed = $false
+        git -C $RootDir diff --quiet
+        $hasUnstaged = ($LASTEXITCODE -ne 0)
+        git -C $RootDir diff --cached --quiet
+        $hasStaged = ($LASTEXITCODE -ne 0)
+        if ($hasUnstaged -or $hasStaged) {
+            Write-Bilingual ">>> 检测到工作区存在本地修改，正在自动暂存 (git stash)..." ">>> Local modifications detected; stashing before git pull..."
+            git -C $RootDir stash push -m "antigravity-gateway-auto-update" | Out-Null
+            $stashed = $true
+        }
+        $oldHead = (git -C $RootDir rev-parse --short HEAD).Trim()
+        Write-Bilingual ">>> [更新] 正在从远程仓库拉取最新代码 (当前提交: $oldHead)..." ">>> [Update] Pulling latest source code from remote (current commit: $oldHead)..."
+        git -C $RootDir pull --ff-only
+        if ($LASTEXITCODE -ne 0) {
+            if ($stashed) { git -C $RootDir stash pop *> $null }
+            Fail "git pull --ff-only 失败，请检查网络连接或本地分支状态" "git pull --ff-only failed; please check network connection or local branch state"
+        }
+        $newHead = (git -C $RootDir rev-parse --short HEAD).Trim()
+        if ($stashed) {
+            git -C $RootDir stash pop *> $null
+            if ($LASTEXITCODE -ne 0) {
+                Fail "恢复本地修改 (git stash pop) 时发生冲突，请手动解决冲突后重试" "Conflict while restoring local changes (git stash pop); please resolve manually"
+            }
+        }
+        if ($oldHead -eq $newHead) {
+            Write-Bilingual ">>> 代码已是最新版本 ($newHead)" ">>> Source code is already at the latest commit ($newHead)"
+        } else {
+            Write-Bilingual ">>> 代码已更新: $oldHead -> $newHead" ">>> Source code updated: $oldHead -> $newHead"
+        }
+    }
+    if (-not $ModeSet) {
+        $Mode = Get-ActiveMode
+        Write-Bilingual ">>> 自动识别当前运行模式: $Mode" ">>> Auto-detected active deployment mode: $Mode"
+    }
+}
+
+$UpdateBothAcp = $false
 if ($BackendSet) {
     $BackendNorm = $Backend.ToLower()
 } else {
@@ -90,6 +150,10 @@ if ($BackendSet) {
     if (-not $BackendNorm) { $BackendNorm = "cli" }
 }
 if ($BackendNorm -eq "zen") { $BackendNorm = "zed" }
+if ($BackendNorm -in @("both", "all")) {
+    $UpdateBothAcp = $true
+    $BackendNorm = "auto"
+}
 if (@("cli", "zed", "auto") -notcontains $BackendNorm) {
     Fail "无效的 backend_type: $BackendNorm" "Invalid backend_type: $BackendNorm"
 }
@@ -156,6 +220,32 @@ function Assert-FileHash([string]$Path, [string]$Algorithm, [string]$Expected, [
     Write-Bilingual "    -> $Algorithm 校验通过" "    -> $Algorithm verified"
 }
 
+function Normalize-Version([string]$Raw) {
+    if (-not $Raw) { return "" }
+    $m = [regex]::Match($Raw, '(?i)(?:^|[^0-9A-Za-z._-])v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)')
+    if ($m.Success) { return $m.Groups[1].Value }
+    return ($Raw.Trim() -replace '^[vV]', '')
+}
+
+function Get-LocalZedVersion([string]$BinPath) {
+    if (-not $BinPath -or -not (Test-Path $BinPath)) { return "" }
+    $verFile = Join-Path (Split-Path -Parent $BinPath) ".zed-acp-version"
+    if (Test-Path $verFile) {
+        $firstLine = ("" + (Get-Content -Path $verFile -TotalCount 1 -ErrorAction SilentlyContinue)).Trim()
+        if ($firstLine) {
+            $tok = ($firstLine -split '\s+')[0]
+            return (Normalize-Version $tok)
+        }
+    }
+    $parts = ($BinPath -replace '\\', '/') -split '/'
+    for ($i = 0; $i -lt ($parts.Length - 1); $i++) {
+        if ($parts[$i] -eq "antigravity-acp") {
+            return (Normalize-Version $parts[$i + 1])
+        }
+    }
+    return ""
+}
+
 function Find-ExistingZedBinary {
     foreach ($c in @("$RootDir\bin\agy_acp_server.exe", "$RootDir\bin\agy_acp_server.par")) {
         if (Test-Path $c) {
@@ -205,8 +295,8 @@ function Install-CliBackend {
     $arch = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
     $platform = if ($arch -eq "ARM64") { "windows_arm64" } else { "windows_amd64" }
 
-    Write-Bilingual ">>> 正在自动下载并安装 Antigravity CLI 后端 ($platform) -> $targetBin ..." `
-                    ">>> Auto-downloading & installing Antigravity CLI backend ($platform) -> $targetBin ..."
+    Write-Bilingual ">>> 正在检查 Antigravity CLI 后端版本 ($platform) ..." `
+                    ">>> Checking Antigravity CLI backend version ($platform) ..."
 
     $manifestUrl = "https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/$platform.json"
     try {
@@ -216,6 +306,26 @@ function Install-CliBackend {
     }
     if (-not $manifest.url) { Fail "CLI 发布清单中没有下载地址" "CLI manifest has no package URL" }
     if (-not ("" + $manifest.url).StartsWith("https://")) { Fail "CLI 下载地址不是 HTTPS: $($manifest.url)" "CLI package URL is not HTTPS: $($manifest.url)" }
+
+    $remoteVer = Normalize-Version ("" + $manifest.version)
+    $checkBin = if (Test-Path $targetBin) { $targetBin } else { Find-ExistingCliBinary }
+    $localVer = ""
+    if ($checkBin -and (Test-Path $checkBin)) {
+        try {
+            $rawOut = (& $checkBin --version 2>$null | Select-Object -First 1)
+            $localVer = Normalize-Version ("" + $rawOut)
+        } catch { }
+    }
+    if ($localVer -and $remoteVer -and ($localVer -eq $remoteVer)) {
+        Write-Bilingual ">>> Antigravity CLI 已是相同版本 (v$remoteVer)，跳过下载更新: $checkBin" `
+                        ">>> Antigravity CLI is already at version v$remoteVer; skipping download: $checkBin"
+        return
+    }
+    if ($localVer) {
+        Write-Host "    -> Updating Antigravity CLI (v$localVer -> v$remoteVer): $($manifest.url)"
+    } else {
+        Write-Host "    -> Downloading Antigravity CLI v${remoteVer}: $($manifest.url)"
+    }
 
     $tmpFile = Join-Path $env:TEMP "agy_download_$([guid]::NewGuid().ToString('N')).exe"
     try {
@@ -234,18 +344,61 @@ function Install-ZedBackend {
     New-Item -ItemType Directory -Force -Path "$RootDir\bin" | Out-Null
     $arch = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
     $releaseArch = if ($arch -eq "ARM64") { "arm64" } else { "x86_64" }
-    $archiveName = "agy-acp-server-$ZedVersion-windows-$releaseArch.zip"
-    $archiveUrl = "https://dl.google.com/agy-extensions/releases/windows/$archiveName"
+    $regArch = if ($arch -eq "ARM64") { "aarch64" } else { "x86_64" }
+    $regTarget = "windows-$regArch"
+    $archiveUrl = ""
 
-    if (-not $ZedSha256 -and -not $InsecureSkipVerify) {
-        Fail ("下载 Zed ACP 包需要固定的 SHA-256。请传入 -ZedSha256 <$archiveName 的 sha256> 或设置环境变量 ZED_ACP_SHA256。" +
-              "哈希应来自可信来源，例如 https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json 中 antigravity-acp 条目的 distribution.binary.<目标平台>.sha256；也可用 -AcpBin 指定已安装的 agy_acp_server.exe。") `
-             ("Installing the Zed ACP package requires a pinned SHA-256. Pass -ZedSha256 <sha256 of $archiveName> or set ZED_ACP_SHA256. " +
-              "Take it from a trusted source, e.g. distribution.binary.<target>.sha256 of the antigravity-acp entry in https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json, or pass -AcpBin with an installed agy_acp_server.exe.")
+    if (-not $ZedSha256) {
+        $regUrl = "https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json"
+        Write-Bilingual ">>> 正在从官方 ACP Registry 查询最新 Zed ACP 包信息 (target=$regTarget) ..." `
+                        ">>> Querying official ACP Registry for latest Zed ACP package (target=$regTarget) ..."
+        try {
+            $reg = Invoke-RestMethod -Uri $regUrl
+            $agent = $reg.agents | Where-Object { $_.id -eq "antigravity-acp" } | Select-Object -First 1
+            if ($agent -and (-not $ZedVersionSet -or $ZedVersion -eq "latest" -or $ZedVersion -eq $agent.version)) {
+                $targetObj = $agent.distribution.binary.$regTarget
+                if ($targetObj -and $targetObj.archive -and $targetObj.sha256) {
+                    $ZedVersion = $agent.version
+                    $archiveUrl = $targetObj.archive
+                    $ZedSha256 = $targetObj.sha256
+                    Write-Host "    -> Matched Zed ACP v$ZedVersion ($regTarget): $archiveUrl"
+                }
+            }
+        } catch { }
     }
 
-    Write-Bilingual ">>> 正在下载 Zed ACP 独立后端包 $archiveUrl -> $RootDir\bin ..." `
-                    ">>> Downloading Zed ACP standalone package $archiveUrl -> $RootDir\bin ..."
+    $remoteZedVer = Normalize-Version $ZedVersion
+    $existingZed = if (Test-Path "$RootDir\bin\agy_acp_server.exe") {
+        "$RootDir\bin\agy_acp_server.exe"
+    } elseif (Test-Path "$RootDir\bin\agy_acp_server.par") {
+        "$RootDir\bin\agy_acp_server.par"
+    } else {
+        Find-ExistingZedBinary
+    }
+    $localZedVer = if ($existingZed) { Get-LocalZedVersion $existingZed } else { "" }
+    if ($localZedVer -and $remoteZedVer -and ($localZedVer -eq $remoteZedVer)) {
+        Write-Bilingual ">>> Zed ACP 独立后端包已是相同版本 (v$remoteZedVer)，跳过下载更新: $existingZed" `
+                        ">>> Zed ACP standalone package is already at version v$remoteZedVer; skipping download: $existingZed"
+        return
+    }
+
+    $archiveName = "agy-acp-server-$ZedVersion-windows-$releaseArch.zip"
+    if (-not $archiveUrl) {
+        $archiveUrl = "https://dl.google.com/agy-extensions/releases/windows/$archiveName"
+    }
+    if (-not ("" + $archiveUrl).StartsWith("https://")) {
+        Fail "Zed ACP 下载地址不是 HTTPS: $archiveUrl" "Zed ACP package URL is not HTTPS: $archiveUrl"
+    }
+
+    if (-not $ZedSha256 -and -not $InsecureSkipVerify) {
+        Fail ("无法从官方 ACP Registry 获取 $archiveName 的 SHA-256，且未手动指定。请传入 -ZedSha256 <sha256> 或设置环境变量 ZED_ACP_SHA256。" +
+              "哈希应来自可信来源，例如 https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json 中 antigravity-acp 条目的 distribution.binary.$regTarget.sha256；也可用 -AcpBin 指定已安装的 agy_acp_server.exe。") `
+             ("Could not resolve SHA-256 for $archiveName from the ACP Registry and none was supplied. Pass -ZedSha256 <sha256> or set ZED_ACP_SHA256. " +
+              "Take it from a trusted source, e.g. distribution.binary.$regTarget.sha256 of the antigravity-acp entry in https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json, or pass -AcpBin with an installed agy_acp_server.exe.")
+    }
+
+    Write-Bilingual ">>> 正在下载并更新 Zed ACP 独立后端包 (v$ZedVersion) $archiveUrl -> $RootDir\bin ..." `
+                    ">>> Downloading & updating Zed ACP standalone package (v$ZedVersion) $archiveUrl -> $RootDir\bin ..."
 
     $tmpZip = Join-Path $env:TEMP "agy_zed_$([guid]::NewGuid().ToString('N')).zip"
     try {
@@ -253,7 +406,9 @@ function Install-ZedBackend {
         Invoke-WebRequest -UseBasicParsing -Uri $archiveUrl -OutFile $tmpZip
         Assert-FileHash -Path $tmpZip -Algorithm SHA256 -Expected $ZedSha256 -Label $archiveName
         Expand-Archive -Path $tmpZip -DestinationPath "$RootDir\bin" -Force
-        Write-Bilingual ">>> Zed ACP 独立后端包安装完成: $RootDir\bin" ">>> Zed ACP standalone package installed in: $RootDir\bin"
+        $verMarker = if ($remoteZedVer) { $remoteZedVer } else { $ZedVersion }
+        [System.IO.File]::WriteAllText("$RootDir\bin\.zed-acp-version", "$verMarker $(("" + $ZedSha256).ToLower())`n", (New-Object System.Text.UTF8Encoding $false))
+        Write-Bilingual ">>> Zed ACP v$ZedVersion 独立后端包安装/更新完成: $RootDir\bin" ">>> Zed ACP v$ZedVersion standalone package installed/updated in: $RootDir\bin"
     } finally {
         if (Test-Path $tmpZip) { Remove-Item -Force $tmpZip -ErrorAction SilentlyContinue }
     }
@@ -282,6 +437,50 @@ function Ensure-AcpBackend {
     }
 }
 
+function Update-AcpBackend {
+    if ($AcpBin) {
+        Write-Bilingual ">>> 已显式指定 -AcpBin ($AcpBin)，跳过自动更新 ACP 后端" ">>> -AcpBin ($AcpBin) explicitly set; skipping automatic ACP backend update"
+        return
+    }
+    if ($NoDownload) {
+        Write-Bilingual ">>> 已指定 -NoDownload，跳过自动更新 ACP 后端" ">>> -NoDownload set; skipping automatic ACP backend update"
+        return
+    }
+
+    if ($UpdateBothAcp) {
+        Install-CliBackend
+        Install-ZedBackend
+        return
+    }
+
+    switch ($BackendNorm) {
+        "zed" {
+            Install-ZedBackend
+            if (-not $BackendSet -and (Test-Path "$RootDir\bin\agy.exe")) {
+                Install-CliBackend
+            }
+        }
+        "cli" {
+            Install-CliBackend
+            if (-not $BackendSet -and (Test-Path "$RootDir\bin\agy_acp_server.exe")) {
+                Install-ZedBackend
+            }
+        }
+        default {
+            $hasCli = [bool](Find-ExistingCliBinary)
+            $hasZed = [bool](Find-ExistingZedBinary)
+            if ($hasZed -and -not $hasCli) {
+                Install-ZedBackend
+            } elseif ($hasZed -and $hasCli) {
+                Install-CliBackend
+                Install-ZedBackend
+            } else {
+                Install-CliBackend
+            }
+        }
+    }
+}
+
 function Resolve-AcpBinary {
     if ($AcpBin) {
         return (Resolve-Path $AcpBin).Path
@@ -303,7 +502,14 @@ function Resolve-AcpBinary {
 
 function Build-Gateway {
     Write-Bilingual ">>> [1/3] 构建中英双语前端控制台 (web/dist)..." ">>> [1/3] Building bilingual ReUI frontend (web/dist)..."
-    if (-not (Test-Path "$RootDir\web\node_modules")) {
+    $needNpmCi = -not (Test-Path "$RootDir\web\node_modules")
+    if (-not $needNpmCi -and (Test-Path "$RootDir\web\node_modules\.package-lock.json")) {
+        $lockTime = (Get-Item "$RootDir\web\node_modules\.package-lock.json").LastWriteTimeUtc
+        if ((Get-Item "$RootDir\web\package-lock.json").LastWriteTimeUtc -gt $lockTime -or (Get-Item "$RootDir\web\package.json").LastWriteTimeUtc -gt $lockTime) {
+            $needNpmCi = $true
+        }
+    }
+    if ($needNpmCi) {
         npm --prefix "$RootDir\web" ci
         if ($LASTEXITCODE -ne 0) { throw "npm ci failed" }
     }
@@ -568,7 +774,7 @@ function Restart-ServiceTask {
 function Set-DockerEnv {
     $env:AG_ACP_BACKEND = $BackendNorm
     $env:AG_PORT = "$Port"
-    $env:ZED_ACP_VERSION = $ZedVersion
+    if ($ZedVersionSet) { $env:ZED_ACP_VERSION = $ZedVersion }
     if ($ZedSha256) { $env:ZED_ACP_SHA256 = $ZedSha256 }
     if ($InsecureSkipVerify) { $env:AG_INSECURE_SKIP_VERIFY = "1" }
     if (-not $env:AG_BIND) {
@@ -622,17 +828,36 @@ function Invoke-Lifecycle([string]$Verb) {
 }
 
 switch ($Action) {
-    "install-acp" {
-        if ($BackendNorm -eq "zed") {
-            Install-ZedBackend
-        } else {
-            Install-CliBackend
-        }
+    { $_ -in @("install-acp", "update-acp") } {
+        Update-AcpBackend
     }
     "build" {
         Build-Gateway
         Ensure-AcpBackend
         Update-GatewayConfig
+    }
+    "update" {
+        if ($Mode -eq "docker") {
+            if ($AcpBin) {
+                New-Item -ItemType Directory -Force -Path "$RootDir\bin" | Out-Null
+                Copy-Item -Force $AcpBin "$RootDir\bin\"
+                $env:AG_ACP_BINARY_PATH = "/opt/antigravity-acp/$(Split-Path -Leaf $AcpBin)"
+            }
+            $env:AG_ACP_CACHE_BUST = "$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())"
+            Set-DockerEnv
+            Invoke-Compose @("up", "-d", "--build", "--force-recreate")
+            Show-CredentialsHint
+        } elseif ($Mode -eq "service") {
+            Build-Gateway
+            Update-AcpBackend
+            Update-GatewayConfig
+            Install-ServiceTask
+        } else {
+            Build-Gateway
+            Update-AcpBackend
+            Update-GatewayConfig
+            Start-LocalGateway
+        }
     }
     "install" {
         if ($Mode -eq "docker") {
@@ -640,9 +865,6 @@ switch ($Action) {
                 New-Item -ItemType Directory -Force -Path "$RootDir\bin" | Out-Null
                 Copy-Item -Force $AcpBin "$RootDir\bin\"
                 $env:AG_ACP_BINARY_PATH = "/opt/antigravity-acp/$(Split-Path -Leaf $AcpBin)"
-            }
-            if ($BackendNorm -eq "zed" -and -not $ZedSha256 -and -not $InsecureSkipVerify) {
-                Fail "Docker 构建 Zed 后端需要 -ZedSha256 (或 ZED_ACP_SHA256)" "Building the Zed backend image requires -ZedSha256 (or ZED_ACP_SHA256)"
             }
             Set-DockerEnv
             Invoke-Compose @("up", "-d", "--build")

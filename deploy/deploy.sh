@@ -12,10 +12,18 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
+ORIG_ARGS=("$@")
+SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 ACTION="install"
+if [[ "$SCRIPT_NAME" == update* ]]; then
+  ACTION="update"
+fi
 MODE="local"          # local | service | docker
-BACKEND=""            # cli | zed | zen | auto (empty = keep config.yaml value)
+MODE_SET="0"
+BACKEND=""            # cli | zed | zen | auto | both | all (empty = keep config.yaml value)
 BACKEND_SET="0"
+BACKEND_NORM=""
+UPDATE_BOTH_ACP="0"
 ACP_BIN=""
 PORT=""
 PORT_SET="0"
@@ -25,6 +33,11 @@ LANG_CHOICE="zh"      # zh | en
 AUTO_DOWNLOAD="1"
 INSECURE_SKIP_VERIFY="0"
 ALLOW_INSTALL_SCRIPT="0"
+SKIP_GIT="0"
+ZED_ACP_VERSION_SET="0"
+if [[ -n "${ZED_ACP_VERSION:-}" ]]; then
+  ZED_ACP_VERSION_SET="1"
+fi
 ZED_ACP_VERSION="${ZED_ACP_VERSION:-1.4.5}"
 ZED_ACP_SHA256="${ZED_ACP_SHA256:-}"
 
@@ -35,6 +48,7 @@ COMPOSE_FILE="$ROOT_DIR/deploy/docker-compose.yml"
 DOCKER_ENV_FILE="$ROOT_DIR/deploy/gateway.env"
 CLI_MANIFEST_BASE="https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests"
 CLI_INSTALL_SCRIPT_URL="https://antigravity.google/cli/install.sh"
+ZED_ACP_REGISTRY_URL="https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json"
 
 SERVICE_NAME="antigravity-gateway"
 SERVICE_USER="antigravity"
@@ -73,22 +87,76 @@ lower() {
   printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
 }
 
+normalize_version() {
+  printf '%s\n' "$1" | awk '
+    match($0, /[vV]?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?/) {
+      v = substr($0, RSTART, RLENGTH)
+      sub(/^[vV]/, "", v)
+      print v
+      exit
+    }
+    {
+      s = $0
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", s)
+      sub(/^[vV]/, "", s)
+      if (length(s) > 0) print s
+      exit
+    }
+  '
+}
+
+json_string_field() {
+  local key="$1" file="$2"
+  awk -v k="$key" '
+    match($0, "\"" k "\"[[:space:]]*:[[:space:]]*\"[^\"]*\"") {
+      s = substr($0, RSTART, RLENGTH)
+      sub("^.*:[[:space:]]*\"", "", s)
+      sub("\"$", "", s)
+      print s
+      exit
+    }
+  ' "$file"
+}
+
+detect_local_zed_version() {
+  local bin_path="$1"
+  [[ -n "$bin_path" && -f "$bin_path" ]] || return 0
+  local dir_path ver_file raw=""
+  dir_path="$(dirname "$bin_path")"
+  ver_file="$dir_path/.zed-acp-version"
+  if [[ -r "$ver_file" ]]; then
+    raw="$(awk 'NR==1{print $1; exit}' "$ver_file" 2>/dev/null || true)"
+    if [[ -n "$raw" ]]; then
+      normalize_version "$raw"
+      return 0
+    fi
+  fi
+  raw="$(printf '%s\n' "$bin_path" | awk -F'/' '{for (i=1; i<NF; i++) if ($i == "antigravity-acp") { print $(i+1); exit }}')"
+  if [[ -n "$raw" ]]; then
+    normalize_version "$raw"
+  fi
+}
+
 usage() {
   if [[ "$LANG_CHOICE" == "en" ]]; then
     cat <<EOF
 Usage: ./deploy/deploy.sh [options]
+       ./deploy/update.sh [options]
 
 Options:
-  --action <install|install-acp|start|stop|restart|status|build|build-all>  Action to execute (default: install)
-  --mode <local|service|docker>                 Deployment target; lifecycle actions follow it too (default: local)
-  --backend <cli|zed|zen|auto>                  ACP backend engine (default: keep acp_pool.backend_type from config.yaml)
+  --action <install|update|install-acp|update-acp|start|stop|restart|status|build|build-all>
+                                                Action to execute (default: install; update.sh defaults to update)
+  --mode <local|service|docker>                 Deployment target; lifecycle actions follow it too (default: local, or auto-detected on update)
+  --backend <cli|zed|zen|auto|both>             ACP backend engine (default: keep acp_pool.backend_type from config.yaml; 'both' updates CLI + Zed)
   --acp-bin <path>                              Explicit path to agy CLI or agy_acp_server.par
-  --no-download                                 Disable automatic ACP backend download
+  --no-download                                 Disable automatic ACP backend download/update
+  --no-git, --skip-git                          Skip 'git pull' during --action update
   --port <port>                                 Listen port (local/service) or published host port (docker).
                                                 Default: AG_PORT, else server.port from config.yaml (docker: 8080)
   --admin-password-stdin                        Read the initial admin password from stdin / an interactive prompt
   --admin-password <pwd>                        Same, but on the command line (visible in shell history and ps; discouraged)
-  --zed-sha256 <hex>                            Expected SHA-256 of the Zed ACP zip (or set ZED_ACP_SHA256)
+  --zed-version <ver>                           Zed ACP package version override (default: latest from ACP Registry, or ZED_ACP_VERSION)
+  --zed-sha256 <hex>                            Expected SHA-256 of the Zed ACP zip (default: auto-resolved from ACP Registry, or ZED_ACP_SHA256)
   --insecure-skip-verify                        Allow installs when no expected hash or hashing tool is available
                                                 (a hash MISMATCH is always fatal)
   --allow-install-script                        If the CLI manifest is unavailable, download and run the official
@@ -102,29 +170,34 @@ mode 0600, gitignored). It only applies until the password is changed in the Web
 
 Examples:
   ./deploy/deploy.sh                                              # Build, auto-install CLI (agy) & start locally
+  ./deploy/update.sh                                              # Pull latest code, update CLI/Zed ACP package & restart active mode
+  ./deploy/deploy.sh --action update --backend zed                # One-click update code + Zed ACP package
   ./deploy/deploy.sh --mode local --backend cli --port 8080
-  ZED_ACP_SHA256=<sha256> ./deploy/deploy.sh --backend zed        # Zed ACP package with pinned SHA-256
   ./deploy/deploy.sh --mode service --admin-password-stdin        # systemd (dedicated user) / launchd service
   ./deploy/deploy.sh --mode service --action restart              # systemctl restart antigravity-gateway
   AG_BIND=0.0.0.0 ./deploy/deploy.sh --mode docker --port 8080    # Docker; publish on all interfaces explicitly
-  ./deploy/deploy.sh --action install-acp --backend cli           # Download/update ACP backend binary only
+  ./deploy/deploy.sh --action update-acp --backend cli            # Download/update ACP backend binary only
   ./deploy/deploy.sh --action build-all                           # Cross-compile for macOS/Linux/Windows (amd64 & arm64)
 EOF
   else
     cat <<EOF
 用法: ./deploy/deploy.sh [选项]
+      ./deploy/update.sh [选项]
 
 选项:
-  --action <install|install-acp|start|stop|restart|status|build|build-all>  执行动作 (默认: install)
-  --mode <local|service|docker>                 部署模式；start/stop/restart/status 同样按模式路由 (默认: local)
-  --backend <cli|zed|zen|auto>                  ACP 后端类型 (默认: 沿用 config.yaml 中的 acp_pool.backend_type)
+  --action <install|update|install-acp|update-acp|start|stop|restart|status|build|build-all>
+                                                执行动作 (默认: install；update.sh 默认为 update)
+  --mode <local|service|docker>                 部署模式；start/stop/restart/status 同样按模式路由 (默认: local，update 时自动识别当前运行模式)
+  --backend <cli|zed|zen|auto|both>             ACP 后端类型 (默认: 沿用 config.yaml 中的 acp_pool.backend_type；both 同时更新 CLI 与 Zed 包)
   --acp-bin <path>                              显式指定 agy 或 agy_acp_server.par 可执行文件路径
-  --no-download                                 禁用缺失 ACP 后端时的自动下载安装
+  --no-download                                 禁用自动下载/更新 ACP 后端
+  --no-git, --skip-git                          在 --action update 时跳过 git pull 代码拉取
   --port <port>                                 监听端口 (local/service) 或宿主机映射端口 (docker)
                                                 默认: 环境变量 AG_PORT，否则读取 config.yaml 的 server.port (docker 为 8080)
   --admin-password-stdin                        从标准输入 / 交互提示读取初始管理员密码 (推荐)
   --admin-password <pwd>                        直接在命令行传入密码 (会留在 shell 历史与 ps 中，不推荐)
-  --zed-sha256 <hex>                            Zed ACP 压缩包的预期 SHA-256 (或设置环境变量 ZED_ACP_SHA256)
+  --zed-version <ver>                           指定 Zed ACP 压缩包版本 (默认从官方 ACP Registry 自动解析最新版本，或读取 ZED_ACP_VERSION)
+  --zed-sha256 <hex>                            Zed ACP 压缩包的预期 SHA-256 (默认从官方 ACP Registry 自动获取，或设置 ZED_ACP_SHA256)
   --insecure-skip-verify                        缺少预期哈希或哈希工具时仍允许安装 (哈希不匹配始终报错)
   --allow-install-script                        CLI 清单不可用时，下载并展示官方安装脚本后再执行 (不会 curl | bash)
   --lang <zh|en>                                脚本输出语言: zh 或 en (默认: zh)
@@ -136,12 +209,13 @@ EOF
 
 示例:
   ./deploy/deploy.sh                                              # 一键编译、自动下载安装 agy CLI 并在本地后台启动
+  ./deploy/update.sh                                              # 一键拉取最新代码、同步更新 CLI/Zed ACP 包并重启当前服务
+  ./deploy/deploy.sh --action update --backend zed                # 一键拉取最新代码并同步更新 Zed ACP 独立后端包
   ./deploy/deploy.sh --mode local --backend cli --port 8080
-  ZED_ACP_SHA256=<sha256> ./deploy/deploy.sh --backend zed        # 使用 Zed ACP 独立包（必须提供固定 SHA-256）
   ./deploy/deploy.sh --mode service --admin-password-stdin        # 注册为 systemd（专用低权限用户）/ launchd 服务
   ./deploy/deploy.sh --mode service --action restart              # 等价于 systemctl restart antigravity-gateway
   AG_BIND=0.0.0.0 ./deploy/deploy.sh --mode docker --port 8080    # Docker 部署；显式对所有网卡开放端口
-  ./deploy/deploy.sh --action install-acp --backend cli           # 仅自动下载/更新 ACP 后端二进制到 ./bin
+  ./deploy/deploy.sh --action update-acp --backend cli            # 仅下载/更新最新 ACP 后端二进制到 ./bin
   ./deploy/deploy.sh --action build-all                           # 交叉编译全平台发行包 (macOS/Linux/Windows, amd64 & arm64)
 EOF
   fi
@@ -158,13 +232,15 @@ require_value() {
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --action) require_value "$1" "${2-}"; ACTION="$2"; shift 2 ;;
-    --mode) require_value "$1" "${2-}"; MODE="$2"; shift 2 ;;
+    --mode) require_value "$1" "${2-}"; MODE="$2"; MODE_SET="1"; shift 2 ;;
     --backend) require_value "$1" "${2-}"; BACKEND="$2"; BACKEND_SET="1"; shift 2 ;;
     --acp-bin) require_value "$1" "${2-}"; ACP_BIN="$2"; shift 2 ;;
     --no-download) AUTO_DOWNLOAD="0"; shift 1 ;;
+    --no-git|--skip-git) SKIP_GIT="1"; shift 1 ;;
     --port) require_value "$1" "${2-}"; PORT="$2"; PORT_SET="1"; shift 2 ;;
     --admin-password) require_value "$1" "${2-}"; ADMIN_PASSWORD="$2"; ADMIN_PASSWORD_SOURCE="flag"; shift 2 ;;
     --admin-password-stdin) ADMIN_PASSWORD_SOURCE="stdin"; shift 1 ;;
+    --zed-version) require_value "$1" "${2-}"; ZED_ACP_VERSION="$2"; ZED_ACP_VERSION_SET="1"; shift 2 ;;
     --zed-sha256) require_value "$1" "${2-}"; ZED_ACP_SHA256="$2"; shift 2 ;;
     --insecure-skip-verify) INSECURE_SKIP_VERIFY="1"; shift 1 ;;
     --allow-install-script) ALLOW_INSTALL_SCRIPT="1"; shift 1 ;;
@@ -174,13 +250,100 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+OS_NAME="$(uname -s)"
+ARCH_NAME="$(uname -m)"
+
+detect_active_mode() {
+  if command -v docker >/dev/null 2>&1 && docker inspect antigravity-gateway >/dev/null 2>&1; then
+    echo "docker"
+    return 0
+  fi
+  if [[ "$OS_NAME" == "Linux" ]] && [[ -f "/etc/systemd/system/${SERVICE_NAME}.service" ]]; then
+    echo "service"
+    return 0
+  fi
+  if [[ "$OS_NAME" == "Darwin" ]] && [[ -f "$LAUNCHD_PLIST" ]]; then
+    echo "service"
+    return 0
+  fi
+  echo "local"
+}
+
+if [[ "$ACTION" == "update" ]]; then
+  # Pull latest code before resolving config/build steps so any updated deploy.sh can re-exec cleanly.
+  if [[ "$SKIP_GIT" != "1" && "${AG_UPDATE_REEXEC:-0}" != "1" ]]; then
+    command -v git >/dev/null 2>&1 || die "未检测到 git，无法拉取最新代码 (如需跳过代码拉取请传入 --no-git)" \
+                                          "git not found; cannot pull latest code (pass --no-git to skip git pull)"
+    if ! git -C "$ROOT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      git_repo_url="${AG_GIT_REPO:-https://github.com/Mio888888/Antigravity-ACP.git}"
+      git_branch="${AG_GIT_BRANCH:-main}"
+      msg ">>> 当前目录 ($ROOT_DIR) 尚未初始化 Git 仓库，正在关联远程仓库 (${git_repo_url})..." \
+          ">>> Current directory ($ROOT_DIR) is not a git repository yet; linking to remote (${git_repo_url})..."
+      cfg_backup=""
+      if [[ -f "$CFG_PATH" ]]; then
+        cfg_backup="$SCRIPT_TMP/config.yaml.preserve"
+        cp -p "$CFG_PATH" "$cfg_backup"
+      fi
+      git -C "$ROOT_DIR" init -b "$git_branch" >/dev/null 2>&1 || git -C "$ROOT_DIR" init >/dev/null 2>&1
+      if git -C "$ROOT_DIR" remote get-url origin >/dev/null 2>&1; then
+        git -C "$ROOT_DIR" remote set-url origin "$git_repo_url"
+      else
+        git -C "$ROOT_DIR" remote add origin "$git_repo_url"
+      fi
+      git -C "$ROOT_DIR" fetch origin "$git_branch"
+      git -C "$ROOT_DIR" checkout -f -B "$git_branch" "origin/$git_branch"
+      if [[ -n "$cfg_backup" && -f "$cfg_backup" ]]; then
+        cp -p "$cfg_backup" "$CFG_PATH"
+      fi
+      new_head="$(git -C "$ROOT_DIR" rev-parse --short HEAD)"
+      msg ">>> 已同步至最新远程仓库提交 (${new_head})，重新加载最新部署脚本..." \
+          ">>> Synced to latest remote commit (${new_head}); reloading updated deploy script..."
+      export AG_UPDATE_REEXEC=1
+      exec "$ROOT_DIR/deploy/deploy.sh" --action "$ACTION" "${ORIG_ARGS[@]}"
+    fi
+    stashed_BeforePull="0"
+    if ! git -C "$ROOT_DIR" diff --quiet || ! git -C "$ROOT_DIR" diff --cached --quiet; then
+      msg ">>> 检测到工作区存在本地修改，正在自动暂存 (git stash)..." \
+          ">>> Local modifications detected; stashing before git pull..."
+      git -C "$ROOT_DIR" stash push -m "antigravity-gateway-auto-update" >/dev/null
+      stashed_BeforePull="1"
+    fi
+    old_head="$(git -C "$ROOT_DIR" rev-parse --short HEAD)"
+    msg ">>> [更新] 正在从远程仓库拉取最新代码 (当前提交: ${old_head})..." \
+        ">>> [Update] Pulling latest source code from remote (current commit: ${old_head})..."
+    if ! git -C "$ROOT_DIR" pull --ff-only; then
+      if [[ "$stashed_BeforePull" == "1" ]]; then
+        git -C "$ROOT_DIR" stash pop >/dev/null 2>&1 || true
+      fi
+      die "git pull --ff-only 失败，请检查网络连接或本地分支状态" \
+          "git pull --ff-only failed; please check network connection or local branch state"
+    fi
+    new_head="$(git -C "$ROOT_DIR" rev-parse --short HEAD)"
+    if [[ "$stashed_BeforePull" == "1" ]]; then
+      if ! git -C "$ROOT_DIR" stash pop >/dev/null 2>&1; then
+        die "恢复本地修改 (git stash pop) 时发生冲突，请手动解决冲突后重试" \
+            "Conflict while restoring local changes (git stash pop); please resolve manually"
+      fi
+    fi
+    if [[ "$old_head" == "$new_head" ]]; then
+      msg ">>> 代码已是最新版本 (${new_head})" ">>> Source code is already at the latest commit (${new_head})"
+    else
+      msg ">>> 代码已更新: ${old_head} -> ${new_head}，重新加载最新部署脚本..." \
+          ">>> Source code updated: ${old_head} -> ${new_head}; reloading updated deploy script..."
+      export AG_UPDATE_REEXEC=1
+      exec "$ROOT_DIR/deploy/deploy.sh" --action "$ACTION" "${ORIG_ARGS[@]}"
+    fi
+  fi
+  if [[ "$MODE_SET" != "1" ]]; then
+    MODE="$(detect_active_mode)"
+    msg ">>> 自动识别当前运行模式: ${MODE}" ">>> Auto-detected active deployment mode: ${MODE}"
+  fi
+fi
+
 case "$MODE" in
   local|service|docker) ;;
   *) die "无效的 --mode: $MODE" "Invalid --mode: $MODE" ;;
 esac
-
-OS_NAME="$(uname -s)"
-ARCH_NAME="$(uname -m)"
 
 # ------------------------------------------------------------------------------
 # config.yaml helpers (non-secret keys only)
@@ -268,10 +431,19 @@ health_host() {
 if [[ "$BACKEND_SET" == "1" ]]; then
   BACKEND_NORM="$(lower "$BACKEND")"
 else
-  BACKEND_NORM="$(lower "$(read_config_value backend_type)")"
-  [[ -n "$BACKEND_NORM" ]] || BACKEND_NORM="cli"
+  if [[ "$MODE" == "docker" ]] && command -v docker >/dev/null 2>&1 && docker inspect antigravity-gateway >/dev/null 2>&1; then
+    BACKEND_NORM="$(lower "$(docker inspect antigravity-gateway --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null | awk -F= '$1=="AG_ACP_BACKEND"{print $2; exit}' || true)")"
+  elif [[ "$MODE" == "service" && "$OS_NAME" == "Linux" && -r "$SERVICE_CONFIG_DIR/config.yaml" ]]; then
+    BACKEND_NORM="$(lower "$(read_config_value backend_type "$SERVICE_CONFIG_DIR/config.yaml")")"
+  fi
+  [[ -n "${BACKEND_NORM:-}" ]] || BACKEND_NORM="$(lower "$(read_config_value backend_type)")"
+  [[ -n "${BACKEND_NORM:-}" ]] || BACKEND_NORM="cli"
 fi
 [[ "$BACKEND_NORM" == "zen" ]] && BACKEND_NORM="zed"
+if [[ "$BACKEND_NORM" == "both" || "$BACKEND_NORM" == "all" ]]; then
+  UPDATE_BOTH_ACP="1"
+  BACKEND_NORM="auto"
+fi
 case "$BACKEND_NORM" in
   cli|zed|auto) ;;
   *) die "无效的 --backend: $BACKEND_NORM" "Invalid --backend: $BACKEND_NORM" ;;
@@ -281,8 +453,11 @@ if [[ "$PORT_SET" != "1" ]]; then
   if [[ -n "${AG_PORT:-}" ]]; then
     PORT="$AG_PORT"
   elif [[ "$MODE" == "docker" ]]; then
-    PORT="8080"
-  elif [[ "$MODE" == "service" && "$OS_NAME" == "Linux" && "$ACTION" != "install" && -r "$SERVICE_CONFIG_DIR/config.yaml" ]]; then
+    if command -v docker >/dev/null 2>&1 && docker inspect antigravity-gateway >/dev/null 2>&1; then
+      PORT="$(docker inspect antigravity-gateway --format '{{with index .HostConfig.PortBindings "8080/tcp"}}{{with index . 0}}{{.HostPort}}{{end}}{{end}}' 2>/dev/null || true)"
+    fi
+    [[ -n "$PORT" ]] || PORT="8080"
+  elif [[ "$MODE" == "service" && "$OS_NAME" == "Linux" && -r "$SERVICE_CONFIG_DIR/config.yaml" ]]; then
     PORT="$(read_config_value port "$SERVICE_CONFIG_DIR/config.yaml")"
     [[ -n "$PORT" ]] || PORT="8080"
   else
@@ -506,19 +681,23 @@ install_cli_backend() {
     fi
   fi
 
-  msg ">>> 正在自动下载并安装 Antigravity CLI 后端 (platform=${platform}) -> ${target_bin} ..." \
-      ">>> Auto-downloading & installing Antigravity CLI backend (platform=${platform}) -> ${target_bin} ..."
+  msg ">>> 正在检查 Antigravity CLI 后端版本 (platform=${platform}) ..." \
+      ">>> Checking Antigravity CLI backend version (platform=${platform}) ..."
 
-  local manifest_json=""
-  if ! manifest_json="$(curl -fsSL --retry 3 -A "Antigravity-Gateway-Deploy/1.6" "${CLI_MANIFEST_BASE}/${platform}.json")" || [[ -z "$manifest_json" ]]; then
+  local work="$SCRIPT_TMP/cli"
+  rm -rf "$work"
+  mkdir -p "$work"
+  local manifest_file="$work/manifest.json"
+  if ! curl -fsSL --retry 3 -A "Antigravity-Gateway-Deploy/1.6" -o "$manifest_file" "${CLI_MANIFEST_BASE}/${platform}.json" || [[ ! -s "$manifest_file" ]]; then
     cli_manifest_unavailable "$dest_dir" "无法获取 CLI 发布清单 / CLI release manifest unavailable"
     return 0
   fi
 
-  local version pkg_url expected_sha512
-  version="$(printf '%s\n' "$manifest_json" | awk -F'"' '/"version"[[:space:]]*:/ {print $4; exit}')"
-  pkg_url="$(printf '%s\n' "$manifest_json" | awk -F'"' '/"url"[[:space:]]*:/ {print $4; exit}')"
-  expected_sha512="$(printf '%s\n' "$manifest_json" | awk -F'"' '/"sha512"[[:space:]]*:/ {print $4; exit}')"
+  local version pkg_url expected_sha512 remote_ver
+  version="$(json_string_field "version" "$manifest_file")"
+  pkg_url="$(json_string_field "url" "$manifest_file")"
+  expected_sha512="$(json_string_field "sha512" "$manifest_file")"
+  remote_ver="$(normalize_version "$version")"
   if [[ -z "$pkg_url" ]]; then
     cli_manifest_unavailable "$dest_dir" "CLI 发布清单中没有下载地址 / CLI manifest has no package URL"
     return 0
@@ -527,10 +706,30 @@ install_cli_backend() {
     die "CLI 下载地址不是 HTTPS: $pkg_url" "CLI package URL is not HTTPS: $pkg_url"
   fi
 
-  echo "    -> Matched Antigravity CLI v${version:-unknown}: ${pkg_url}"
-  local work="$SCRIPT_TMP/cli"
-  rm -rf "$work"
-  mkdir -p "$work"
+  local check_bin="" current_ver="" current_ver_norm=""
+  if [[ -x "$target_bin" ]]; then
+    check_bin="$target_bin"
+  else
+    check_bin="$(find_existing_cli_binary || true)"
+  fi
+  if [[ -n "$check_bin" && -x "$check_bin" ]]; then
+    current_ver="$("$check_bin" --version 2>/dev/null | awk 'NR==1{gsub(/\r/,""); print; exit}' || true)"
+    current_ver_norm="$(normalize_version "$current_ver")"
+  fi
+  if [[ -n "$current_ver_norm" && -n "$remote_ver" && "$current_ver_norm" == "$remote_ver" ]]; then
+    rm -rf "$work"
+    msg ">>> Antigravity CLI 已是相同版本 (v${remote_ver})，跳过下载更新: ${check_bin}" \
+        ">>> Antigravity CLI is already at version v${remote_ver}; skipping download: ${check_bin}"
+    return 0
+  fi
+
+  if [[ -n "$current_ver_norm" ]]; then
+    echo "    -> Updating Antigravity CLI (v${current_ver_norm} -> v${remote_ver:-${version:-unknown}}): ${pkg_url}"
+  elif [[ -n "$current_ver" ]]; then
+    echo "    -> Updating Antigravity CLI (${current_ver} -> v${version:-unknown}): ${pkg_url}"
+  else
+    echo "    -> Downloading Antigravity CLI v${remote_ver:-${version:-unknown}}: ${pkg_url}"
+  fi
   local pkg_path="$work/agy_pkg"
   curl -fL --retry 3 -o "$pkg_path" "$pkg_url"
   verify_digest 512 "$pkg_path" "$expected_sha512" "Antigravity CLI ${version:-}"
@@ -545,7 +744,8 @@ install_cli_backend() {
     xattr -d com.apple.quarantine "$target_bin" 2>/dev/null || true
   fi
   rm -rf "$work"
-  msg ">>> Antigravity CLI 安装完成: ${target_bin}" ">>> Antigravity CLI installed at: ${target_bin}"
+  msg ">>> Antigravity CLI v${version:-unknown} 安装/更新完成: ${target_bin}" \
+      ">>> Antigravity CLI v${version:-unknown} installed/updated at: ${target_bin}"
 }
 
 install_zed_backend() {
@@ -559,31 +759,94 @@ install_zed_backend() {
     *) die "当前系统 ($OS_NAME) 不支持自动下载 Zed ACP 包" "OS ($OS_NAME) not supported for auto Zed ACP download" ;;
   esac
 
-  local release_arch=""
+  local release_arch="" reg_arch=""
   case "$ARCH_NAME" in
-    x86_64|amd64)  release_arch="x86_64" ;;
-    arm64|aarch64) release_arch="arm64" ;;
+    x86_64|amd64)  release_arch="x86_64"; reg_arch="x86_64" ;;
+    arm64|aarch64) release_arch="arm64";  reg_arch="aarch64" ;;
     *) die "当前架构 ($ARCH_NAME) 不支持自动下载 Zed ACP 包" "Architecture ($ARCH_NAME) not supported for auto Zed ACP download" ;;
   esac
 
+  local reg_target="${os_key}-${reg_arch}"
+  local archive_url=""
+  local reg_file="$SCRIPT_TMP/acp-registry.json"
+  if [[ -z "$ZED_ACP_SHA256" ]]; then
+    msg ">>> 正在从官方 ACP Registry 查询最新 Zed ACP 包信息 (target=${reg_target}) ..." \
+        ">>> Querying official ACP Registry for latest Zed ACP package (target=${reg_target}) ..."
+    if curl -fsSL --retry 3 -A "Antigravity-Gateway-Deploy/1.6" -o "$reg_file" "$ZED_ACP_REGISTRY_URL" 2>/dev/null && [[ -s "$reg_file" ]]; then
+      local reg_ver reg_archive reg_sha
+      reg_ver="$(awk '/"id"[ \t]*:[ \t]*"antigravity-acp"/ { in_a=1; next } in_a && /"id"[ \t]*:/ { in_a=0 } in_a && !v && /"version"[ \t]*:/ { l=$0; sub(/^.*"version"[ \t]*:[ \t]*"/, "", l); sub(/".*$/, "", l); v=l } END { print v }' "$reg_file")"
+      if [[ "$ZED_ACP_VERSION_SET" != "1" || "$ZED_ACP_VERSION" == "latest" || "$ZED_ACP_VERSION" == "$reg_ver" ]]; then
+        reg_archive="$(awk -v target="$reg_target" '/"id"[ \t]*:[ \t]*"antigravity-acp"/ { in_a=1; next } in_a && /"id"[ \t]*:/ { in_a=0 } in_a && $0 ~ ("\"" target "\"[ \t]*:") { in_t=1; next } in_t && /}/ { in_t=0 } in_t && /"archive"[ \t]*:/ { l=$0; sub(/^.*"archive"[ \t]*:[ \t]*"/, "", l); sub(/".*$/, "", l); print l; exit }' "$reg_file")"
+        reg_sha="$(awk -v target="$reg_target" '/"id"[ \t]*:[ \t]*"antigravity-acp"/ { in_a=1; next } in_a && /"id"[ \t]*:/ { in_a=0 } in_a && $0 ~ ("\"" target "\"[ \t]*:") { in_t=1; next } in_t && /}/ { in_t=0 } in_t && /"sha256"[ \t]*:/ { l=$0; sub(/^.*"sha256"[ \t]*:[ \t]*"/, "", l); sub(/".*$/, "", l); print l; exit }' "$reg_file")"
+        if [[ -n "$reg_archive" && -n "$reg_sha" ]]; then
+          ZED_ACP_VERSION="$reg_ver"
+          archive_url="$reg_archive"
+          ZED_ACP_SHA256="$reg_sha"
+          echo "    -> Matched Zed ACP v${ZED_ACP_VERSION} (${reg_target}): ${archive_url}"
+        fi
+      fi
+    fi
+  fi
+
+  local remote_zed_ver existing_zed="" local_zed_ver=""
+  remote_zed_ver="$(normalize_version "$ZED_ACP_VERSION")"
+  if [[ -f "$dest_dir/agy_acp_server.par" ]]; then
+    existing_zed="$dest_dir/agy_acp_server.par"
+  elif [[ -f "$dest_dir/agy_acp_server" ]]; then
+    existing_zed="$dest_dir/agy_acp_server"
+  else
+    existing_zed="$(find_existing_zed_binary || true)"
+  fi
+  if [[ -n "$existing_zed" ]]; then
+    local_zed_ver="$(detect_local_zed_version "$existing_zed")"
+  fi
+  if [[ -n "$local_zed_ver" && -n "$remote_zed_ver" && "$local_zed_ver" == "$remote_zed_ver" ]]; then
+    msg ">>> Zed ACP 独立后端包已是相同版本 (v${remote_zed_ver})，跳过下载更新: ${existing_zed}" \
+        ">>> Zed ACP standalone package is already at version v${remote_zed_ver}; skipping download: ${existing_zed}"
+    return 0
+  fi
+
   local archive_name="agy-acp-server-${ZED_ACP_VERSION}-${os_key}-${release_arch}.zip"
-  local archive_url="https://dl.google.com/agy-extensions/releases/${release_os}/${archive_name}"
+  if [[ -z "$archive_url" ]]; then
+    archive_url="https://dl.google.com/agy-extensions/releases/${release_os}/${archive_name}"
+  fi
+  if [[ "$archive_url" != https://* ]]; then
+    die "Zed ACP 下载地址不是 HTTPS: $archive_url" "Zed ACP package URL is not HTTPS: $archive_url"
+  fi
 
   if [[ -z "$ZED_ACP_SHA256" && "$INSECURE_SKIP_VERIFY" != "1" ]]; then
-    die "下载 Zed ACP 包需要固定的 SHA-256。请设置 ZED_ACP_SHA256=<${archive_name} 的 sha256> 或传入 --zed-sha256 <hex>。\n    哈希应来自可信来源，例如 https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json 中 antigravity-acp 条目的 distribution.binary.<目标平台>.sha256，或您已自行核验的副本。\n    也可以用 --acp-bin 指定已安装的 agy_acp_server.par。" \
-        "Installing the Zed ACP package requires a pinned SHA-256. Set ZED_ACP_SHA256=<sha256 of ${archive_name}> or pass --zed-sha256 <hex>.\n    Take the hash from a trusted source, e.g. distribution.binary.<target>.sha256 of the antigravity-acp entry in https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json, or a copy you verified yourself.\n    Alternatively pass --acp-bin with an already installed agy_acp_server.par."
+    die "无法从官方 ACP Registry 获取 ${archive_name} 的 SHA-256，且未手动指定。请设置 ZED_ACP_SHA256=<sha256> 或传入 --zed-sha256 <hex>。\n    哈希应来自可信来源，例如 ${ZED_ACP_REGISTRY_URL} 中 antigravity-acp 条目的 distribution.binary.${reg_target}.sha256。\n    也可以用 --acp-bin 指定已安装的 agy_acp_server.par。" \
+        "Could not resolve SHA-256 for ${archive_name} from the ACP Registry and none was supplied. Set ZED_ACP_SHA256=<sha256> or pass --zed-sha256 <hex>.\n    Take the hash from a trusted source, e.g. distribution.binary.${reg_target}.sha256 of the antigravity-acp entry in ${ZED_ACP_REGISTRY_URL}.\n    Alternatively pass --acp-bin with an already installed agy_acp_server.par."
   fi
-  command -v unzip >/dev/null 2>&1 || die "需要 unzip 来解压 Zed ACP 包" "unzip is required to extract the Zed ACP package"
+  if ! command -v unzip >/dev/null 2>&1 && ! command -v python3 >/dev/null 2>&1 && ! command -v bsdtar >/dev/null 2>&1; then
+    if [[ "$OS_NAME" == "Linux" ]] && command -v apt-get >/dev/null 2>&1; then
+      msg ">>> 正在自动安装 unzip 以解压 Zed ACP 包..." ">>> Auto-installing unzip to extract Zed ACP package..."
+      if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+        apt-get update -qq && apt-get install -y -qq unzip >/dev/null
+      elif command -v sudo >/dev/null 2>&1; then
+        sudo apt-get update -qq && sudo apt-get install -y -qq unzip >/dev/null
+      fi
+    fi
+  fi
+  if ! command -v unzip >/dev/null 2>&1 && ! command -v python3 >/dev/null 2>&1 && ! command -v bsdtar >/dev/null 2>&1; then
+    die "需要 unzip、python3 或 bsdtar 来解压 Zed ACP 包" "unzip, python3, or bsdtar is required to extract the Zed ACP package"
+  fi
 
-  msg ">>> 正在下载 Zed ACP 独立后端包 ${archive_url} -> ${dest_dir} ..." \
-      ">>> Downloading Zed ACP standalone package ${archive_url} -> ${dest_dir} ..."
+  msg ">>> 正在下载并更新 Zed ACP 独立后端包 (v${ZED_ACP_VERSION}) ${archive_url} -> ${dest_dir} ..." \
+      ">>> Downloading & updating Zed ACP standalone package (v${ZED_ACP_VERSION}) ${archive_url} -> ${dest_dir} ..."
   local work="$SCRIPT_TMP/zed"
   rm -rf "$work"
   mkdir -p "$work/extract"
   local zip_path="$work/agy_acp.zip"
   curl -fL --retry 3 -o "$zip_path" "$archive_url"
   verify_digest 256 "$zip_path" "$ZED_ACP_SHA256" "$archive_name"
-  unzip -q -o "$zip_path" -d "$work/extract"
+  if command -v unzip >/dev/null 2>&1; then
+    unzip -q -o "$zip_path" -d "$work/extract"
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -m zipfile -e "$zip_path" "$work/extract"
+  else
+    bsdtar -xf "$zip_path" -C "$work/extract"
+  fi
 
   local installed="0"
   for fn in agy_acp_server.par agy_acp_server localharness_external; do
@@ -597,7 +860,9 @@ install_zed_backend() {
   done
   rm -rf "$work"
   [[ "$installed" == "1" ]] || die "压缩包中未找到 agy_acp_server" "agy_acp_server not found in the archive"
-  msg ">>> Zed ACP 独立后端包安装完成: ${dest_dir}" ">>> Zed ACP standalone package installed in: ${dest_dir}"
+  printf '%s %s\n' "${remote_zed_ver:-$ZED_ACP_VERSION}" "$(lower "$ZED_ACP_SHA256")" >"$dest_dir/.zed-acp-version"
+  msg ">>> Zed ACP v${ZED_ACP_VERSION} 独立后端包安装/更新完成: ${dest_dir}" \
+      ">>> Zed ACP v${ZED_ACP_VERSION} standalone package installed/updated in: ${dest_dir}"
 }
 
 ensure_acp_backend() {
@@ -621,6 +886,53 @@ ensure_acp_backend() {
       ;;
     *)
       if ! find_existing_cli_binary >/dev/null 2>&1 && ! find_existing_zed_binary >/dev/null 2>&1; then
+        install_cli_backend "$ROOT_DIR/bin"
+      fi
+      ;;
+  esac
+}
+
+update_acp_backend() {
+  if [[ -n "$ACP_BIN" ]]; then
+    msg ">>> 已显式指定 --acp-bin ($ACP_BIN)，跳过自动下载更新 ACP 后端" \
+        ">>> --acp-bin ($ACP_BIN) explicitly set; skipping automatic ACP backend update"
+    return 0
+  fi
+  if [[ "$AUTO_DOWNLOAD" != "1" ]]; then
+    msg ">>> 已指定 --no-download，跳过自动更新 ACP 后端" \
+        ">>> --no-download set; skipping automatic ACP backend update"
+    return 0
+  fi
+
+  if [[ "$UPDATE_BOTH_ACP" == "1" ]]; then
+    install_cli_backend "$ROOT_DIR/bin"
+    install_zed_backend "$ROOT_DIR/bin"
+    return 0
+  fi
+
+  case "$BACKEND_NORM" in
+    zed)
+      install_zed_backend "$ROOT_DIR/bin"
+      if [[ "$BACKEND_SET" != "1" && ( -f "$ROOT_DIR/bin/agy" || -f "$ROOT_DIR/bin/antigravity" ) ]]; then
+        install_cli_backend "$ROOT_DIR/bin"
+      fi
+      ;;
+    cli)
+      install_cli_backend "$ROOT_DIR/bin"
+      if [[ "$BACKEND_SET" != "1" && ( -f "$ROOT_DIR/bin/agy_acp_server.par" || -f "$ROOT_DIR/bin/agy_acp_server" ) ]]; then
+        install_zed_backend "$ROOT_DIR/bin"
+      fi
+      ;;
+    *)
+      local has_cli="0" has_zed="0"
+      find_existing_cli_binary >/dev/null 2>&1 && has_cli="1"
+      find_existing_zed_binary >/dev/null 2>&1 && has_zed="1"
+      if [[ "$has_zed" == "1" && "$has_cli" == "0" ]]; then
+        install_zed_backend "$ROOT_DIR/bin"
+      elif [[ "$has_zed" == "1" && "$has_cli" == "1" ]]; then
+        install_cli_backend "$ROOT_DIR/bin"
+        install_zed_backend "$ROOT_DIR/bin"
+      else
         install_cli_backend "$ROOT_DIR/bin"
       fi
       ;;
@@ -663,7 +975,7 @@ discover_acp_binary() {
 
 build_frontend() {
   msg ">>> [1/3] 构建中英双语前端控制台 (web/dist)..." ">>> [1/3] Building bilingual ReUI frontend (web/dist)..."
-  if [[ ! -d "$ROOT_DIR/web/node_modules" ]]; then
+  if [[ ! -d "$ROOT_DIR/web/node_modules" || "$ROOT_DIR/web/package-lock.json" -nt "$ROOT_DIR/web/node_modules/.package-lock.json" || "$ROOT_DIR/web/package.json" -nt "$ROOT_DIR/web/node_modules/.package-lock.json" ]]; then
     npm --prefix "$ROOT_DIR/web" ci
   fi
   npm --prefix "$ROOT_DIR/web" run build
@@ -713,7 +1025,7 @@ build_all_platforms() {
     CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build -trimpath -ldflags="-s -w" \
       -o "$out_dir/antigravity-probe${ext}" ./cmd/probe
     copy_pristine_config "$out_dir/config/config.yaml"
-    cp "$ROOT_DIR/deploy/deploy.sh" "$ROOT_DIR/deploy/deploy.ps1" "$ROOT_DIR/deploy/Dockerfile" "$ROOT_DIR/deploy/docker-compose.yml" "$ROOT_DIR/deploy/antigravity-gateway.service" "$ROOT_DIR/deploy/gateway.env.example" "$out_dir/deploy/" 2>/dev/null || true
+    cp "$ROOT_DIR/deploy/deploy.sh" "$ROOT_DIR/deploy/update.sh" "$ROOT_DIR/deploy/deploy.ps1" "$ROOT_DIR/deploy/update.ps1" "$ROOT_DIR/deploy/Dockerfile" "$ROOT_DIR/deploy/docker-compose.yml" "$ROOT_DIR/deploy/antigravity-gateway.service" "$ROOT_DIR/deploy/gateway.env.example" "$out_dir/deploy/" 2>/dev/null || true
     cp "$ROOT_DIR/README.md" "$ROOT_DIR/README_EN.md" "$out_dir/" 2>/dev/null || true
   done
   msg ">>> 全平台编译完成，产物位于 ./dist 目录。" ">>> Cross-platform build complete. Artifacts in ./dist."
@@ -1050,7 +1362,11 @@ install_service_linux() {
   sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$SERVICE_STATE_DIR"
 
   local cfg_tmp="$SCRIPT_TMP/service-config.yaml"
-  cp "$CFG_PATH" "$cfg_tmp"
+  if [[ "$ACTION" == "update" && -r "$SERVICE_CONFIG_DIR/config.yaml" ]]; then
+    cp "$SERVICE_CONFIG_DIR/config.yaml" "$cfg_tmp"
+  else
+    cp "$CFG_PATH" "$cfg_tmp"
+  fi
   set_yaml_value "$cfg_tmp" acp_pool backend_type "$(yaml_quote "$BACKEND_NORM")"
   set_yaml_value "$cfg_tmp" acp_pool binary_path "$(yaml_quote "$SERVICE_ACP_PATH")"
   set_yaml_value "$cfg_tmp" acp_pool workspace_dir "$(yaml_quote "$SERVICE_WORKSPACE_DIR")"
@@ -1210,8 +1526,19 @@ docker_env_setup() {
   export AG_ACP_BACKEND="$BACKEND_NORM"
   export AG_PORT="$PORT"
   [[ -n "$ZED_ACP_SHA256" ]] && export ZED_ACP_SHA256
-  export ZED_ACP_VERSION
+  if [[ "$ZED_ACP_VERSION_SET" == "1" ]]; then
+    export ZED_ACP_VERSION
+  fi
   [[ "$INSECURE_SKIP_VERIFY" == "1" ]] && export AG_INSECURE_SKIP_VERIFY=1
+  if [[ -z "${AG_BIND:-}" ]]; then
+    if [[ -f "$ROOT_DIR/deploy/.env" ]]; then
+      AG_BIND="$(awk -F= '$1=="AG_BIND"{print $2; exit}' "$ROOT_DIR/deploy/.env" | tr -d "\"'[:space:]" || true)"
+    fi
+    if [[ -z "${AG_BIND:-}" ]] && command -v docker >/dev/null 2>&1 && docker inspect antigravity-gateway >/dev/null 2>&1; then
+      AG_BIND="$(docker inspect antigravity-gateway --format '{{with index .HostConfig.PortBindings "8080/tcp"}}{{with index . 0}}{{.HostIp}}{{end}}{{end}}' 2>/dev/null || true)"
+    fi
+    [[ -n "${AG_BIND:-}" ]] && export AG_BIND
+  fi
   if [[ -z "${AG_BIND:-}" ]]; then
     msg ">>> 端口仅绑定 127.0.0.1:${PORT}；如需对外开放请显式设置 AG_BIND=0.0.0.0" \
         ">>> Port is published on 127.0.0.1:${PORT} only; set AG_BIND=0.0.0.0 explicitly to expose it"
@@ -1247,15 +1574,36 @@ deploy_docker() {
     cp -f "$ACP_BIN" "$ROOT_DIR/bin/$base_name"
     chmod 0755 "$ROOT_DIR/bin/$base_name"
     export AG_ACP_BINARY_PATH="/opt/antigravity-acp/$base_name"
+  elif [[ "$ACTION" == "update" && "$OS_NAME" == "Linux" ]]; then
+    if [[ -f "$ROOT_DIR/bin/agy" || -f "$ROOT_DIR/bin/agy_acp_server.par" || -f "$ROOT_DIR/bin/agy_acp_server" ]]; then
+      update_acp_backend
+    fi
   fi
-  if [[ "$BACKEND_NORM" == "zed" && -z "$ZED_ACP_SHA256" && "$INSECURE_SKIP_VERIFY" != "1" ]]; then
-    die "Docker 构建 Zed 后端需要 ZED_ACP_SHA256 (或 --zed-sha256)" "Building the Zed backend image requires ZED_ACP_SHA256 (or --zed-sha256)"
+  if [[ "$ACTION" == "update" ]]; then
+    export AG_ACP_CACHE_BUST
+    local docker_cli_arch="amd64" remote_acp_key=""
+    case "$ARCH_NAME" in
+      arm64|aarch64) docker_cli_arch="arm64" ;;
+    esac
+    if [[ "$BACKEND_NORM" != "zed" ]]; then
+      local cli_ver_probe
+      cli_ver_probe="$(curl -fsSL --retry 2 -A "Antigravity-Gateway-Deploy/1.6" "${CLI_MANIFEST_BASE}/linux_${docker_cli_arch}.json" 2>/dev/null | awk -F'"' '/"version"[ \t]*:/ {print $4; exit}' || true)"
+      [[ -n "$cli_ver_probe" ]] && remote_acp_key="cli-$(normalize_version "$cli_ver_probe")"
+    fi
+    if [[ "$BACKEND_NORM" == "zed" || "$BACKEND_NORM" == "auto" ]]; then
+      local zed_ver_probe
+      zed_ver_probe="$(curl -fsSL --retry 2 -A "Antigravity-Gateway-Deploy/1.6" "$ZED_ACP_REGISTRY_URL" 2>/dev/null | awk '/"id"[ \t]*:[ \t]*"antigravity-acp"/ { in_a=1; next } in_a && /"id"[ \t]*:/ { in_a=0 } in_a && !v && /"version"[ \t]*:/ { l=$0; sub(/^.*"version"[ \t]*:[ \t]*"/, "", l); sub(/".*$/, "", l); v=l } END { print v }' || true)"
+      [[ -n "$zed_ver_probe" ]] && remote_acp_key="${remote_acp_key:+$remote_acp_key+}zed-$(normalize_version "$zed_ver_probe")"
+    fi
+    AG_ACP_CACHE_BUST="${remote_acp_key:-$(date +%s)}"
+    msg ">>> [Docker 更新] 目标 ACP 后端版本标识: ${AG_ACP_CACHE_BUST} (相同版本将直接复用镜像缓存)..." \
+        ">>> [Docker Update] Target ACP backend version key: ${AG_ACP_CACHE_BUST} (reuses Docker layer cache if unchanged)..."
   fi
   docker_env_setup
 
   msg ">>> 使用 Docker Compose 构建并启动容器 (AG_ACP_BACKEND=${AG_ACP_BACKEND}, PORT=${AG_PORT})..." \
       ">>> Building and starting container via Docker Compose (AG_ACP_BACKEND=${AG_ACP_BACKEND}, PORT=${AG_PORT})..."
-  docker compose -f "$COMPOSE_FILE" up -d --build
+  docker compose -f "$COMPOSE_FILE" up -d --build --force-recreate
   docker_wait_and_banner
 }
 
@@ -1303,11 +1651,12 @@ lifecycle() {
 }
 
 case "$ACTION" in
-  install-acp)
-    if [[ "$BACKEND_NORM" == "zed" ]]; then
-      install_zed_backend "$ROOT_DIR/bin"
-    else
-      install_cli_backend "$ROOT_DIR/bin"
+  install-acp|update-acp)
+    update_acp_backend
+    if [[ "$MODE" == "service" && "$OS_NAME" == "Linux" ]]; then
+      install_service_acp_binary
+      msg ">>> 已同步更新系统服务 ACP 二进制: $SERVICE_ACP_PATH" \
+          ">>> Updated systemd service ACP binary: $SERVICE_ACP_PATH"
     fi
     ;;
   build-all)
@@ -1317,6 +1666,20 @@ case "$ACTION" in
     build_local_binaries
     ensure_acp_backend
     apply_local_config
+    ;;
+  update)
+    if [[ "$MODE" == "docker" ]]; then
+      deploy_docker
+    elif [[ "$MODE" == "service" ]]; then
+      build_local_binaries
+      update_acp_backend
+      install_service
+    else
+      build_local_binaries
+      update_acp_backend
+      apply_local_config
+      start_local
+    fi
     ;;
   install)
     if [[ "$MODE" == "docker" ]]; then

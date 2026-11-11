@@ -9,9 +9,10 @@ services:
       dockerfile: deploy/Dockerfile
       args:
         AG_ACP_BACKEND: ${AG_ACP_BACKEND:-cli}
-        ZED_ACP_VERSION: ${ZED_ACP_VERSION:-1.4.5}
+        ZED_ACP_VERSION: ${ZED_ACP_VERSION:-}
         ZED_ACP_SHA256: ${ZED_ACP_SHA256:-}
         AG_INSECURE_SKIP_VERIFY: ${AG_INSECURE_SKIP_VERIFY:-0}
+        AG_ACP_CACHE_BUST: ${AG_ACP_CACHE_BUST:-}
     container_name: antigravity-gateway
     restart: unless-stopped
     ports:

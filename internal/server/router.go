@@ -24,6 +24,8 @@ import (
 	"antigravity-gateway/internal/acp"
 	"antigravity-gateway/internal/config"
 	"antigravity-gateway/internal/storage"
+	"antigravity-gateway/internal/updater"
+	"antigravity-gateway/internal/version"
 )
 
 type ctxKey string
@@ -73,6 +75,8 @@ type GatewayServer struct {
 	// verifiedTokenSHA caches sha256 of the admin token after it matched the stored
 	// PBKDF2 hash, so per-request bearer checks don't pay the KDF cost.
 	verifiedTokenSHA string
+	updater          *updater.Updater
+	restartFn        func(execPath string)
 }
 
 func NewGatewayServer(
@@ -91,6 +95,7 @@ func NewGatewayServer(
 		hub:                hub,
 		staticFS:           staticFS,
 		loopbackBaseURL:    fmt.Sprintf("http://127.0.0.1:%d", cfg.Server.Port),
+		updater:            updater.NewUpdater(cfg.Server.DataDir, store),
 		accountCheckAt:     make(map[string]string),
 		accountCheckMsg:    make(map[string]string),
 		accountQuotaGroups: make(map[string][]storage.ModelQuotaGroup),
@@ -156,7 +161,10 @@ func (gs *GatewayServer) Handler() http.Handler {
 
 	// Health check
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status":  "ok",
+			"version": version.Version,
+		})
 	})
 
 	// Internal loopback MCP server for tool parking & resuming
@@ -232,6 +240,8 @@ func (gs *GatewayServer) Handler() http.Handler {
 	mux.HandleFunc("/api/admin/api-keys", gs.withAdminAuth(gs.handleAdminKeys))
 	mux.HandleFunc("/api/admin/api-keys/", gs.withAdminAuth(gs.handleAdminKeyDelete))
 	mux.HandleFunc("/api/admin/logs", gs.withAdminAuth(gs.handleAdminLogs))
+	mux.HandleFunc("/api/admin/update/status", gs.withAdminAuth(gs.handleAdminUpdateStatus))
+	mux.HandleFunc("/api/admin/update/apply", gs.withAdminAuth(gs.handleAdminUpdateApply))
 	if gs.hub != nil {
 		mux.HandleFunc("/api/admin/ws/wiretap", gs.withAdminAuth(gs.hub.ServeHTTP))
 	}

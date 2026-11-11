@@ -701,6 +701,34 @@ func (mp *MultiAccountPool) RestartIdleWorkers() int {
 	return killed
 }
 
+// UpdateACPBinary updates the pool's active ACP binary path, bumps subpool generations so
+// in-flight workers retire gracefully on Release, closes idle workers immediately, and
+// invalidates cached model discovery metadata.
+func (mp *MultiAccountPool) UpdateACPBinary(backendType, binaryPath string) int {
+	mp.mu.Lock()
+	defer mp.mu.Unlock()
+	if strings.TrimSpace(backendType) != "" {
+		mp.poolCfg.BackendType = strings.TrimSpace(backendType)
+	}
+	if strings.TrimSpace(binaryPath) != "" {
+		mp.poolCfg.BinaryPath = strings.TrimSpace(binaryPath)
+	}
+	mp.modelsCachedAt = time.Time{}
+	retired := 0
+	for _, sp := range mp.subPools {
+		sp.gen++
+		sp.modelsCachedAt = time.Time{}
+		for id, w := range sp.workers {
+			if w.TryMarkBusy() {
+				delete(sp.workers, id)
+				go func(w *WorkerClient) { _ = w.Close() }(w)
+				retired++
+			}
+		}
+	}
+	return retired
+}
+
 func (mp *MultiAccountPool) MarkAccountAuthRequired(accountID string) {
 	mp.mu.Lock()
 	defer mp.mu.Unlock()

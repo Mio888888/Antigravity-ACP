@@ -178,6 +178,12 @@ func (c *Config) GetACPBinaryPath() string {
 	return c.ACPPool.BinaryPath
 }
 
+func (c *Config) SetACPBinaryPath(path string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ACPPool.BinaryPath = path
+}
+
 func (c *Config) GetACPPool() ACPPoolConfig {
 	c.mu.RLock()
 	defer c.mu.RUnlock()

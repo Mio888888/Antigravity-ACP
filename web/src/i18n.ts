@@ -823,6 +823,74 @@ const ZH_TO_EN_EXACT: Record<string, string> = {
   模块名称与分类: 'Module & category',
   '模块 Token 占用': 'Module token usage',
   占上下文窗口比例: 'Share of context window',
+
+  // System Update Modal & Top Bar
+  系统更新: 'Updates',
+  有可用更新: 'Update Available',
+  系统版本与在线更新: 'System Version & Online Update',
+  '从 GitHub Releases 下载并校验网关预编译二进制包，或免重启热更新底层 ACP 后端引擎':
+    'Download SHA-256 verified prebuilt gateway releases from GitHub Releases, or hot-update the ACP backend engine without restarting',
+  'SHA-256 / SHA-512 强校验保护': 'Protected by SHA-256 / SHA-512 verification',
+  重新检查: 'Check Again',
+  '正在检查...': 'Checking...',
+  一键全部更新并重启: 'Update All & Restart',
+  '正在全量更新...': 'Updating All...',
+  关闭窗口: 'Close',
+  网关正在平滑重启并加载新版本: 'Gateway is restarting gracefully to load the new version',
+  '已完成 GitHub Releases 预编译包 SHA-256 校验与原子替换，正在等待 /healthz 恢复就绪，完成后页面将自动刷新...':
+    'SHA-256 verification and atomic binary replacement succeeded. Waiting for /healthz readiness — page will reload automatically...',
+  更新已完成: 'Update Completed',
+  更新操作失败: 'Update Failed',
+  获取更新状态失败: 'Failed to Check Update Status',
+  网关主程序与管理控制台: 'Gateway Binary & Web Console',
+  '通过 GitHub Releases 下载带内嵌 WebUI 的预编译包并执行 SHA-256 校验替换':
+    'Downloads prebuilt archive with embedded WebUI from GitHub Releases and replaces binary after SHA-256 check',
+  '暂无 Release': 'No Release Yet',
+  发现新版本: 'New Version',
+  已是最新: 'Up to Date',
+  可在线同步: 'Sync Available',
+  待检查: 'Pending',
+  当前版本: 'Current Version',
+  '最新 Release': 'Latest Release',
+  运行平台: 'Platform',
+  部署模式: 'Deploy Mode',
+  '查看 Release 说明': 'Release Notes',
+  '检查 GitHub Release 异常': 'GitHub Release Check Error',
+  远程仓库尚未发布预编译: 'No prebuilt release published yet',
+  '远程仓库尚未发布预编译 Release': 'No Prebuilt GitHub Release Published Yet',
+  '推送版本标签（如 git tag v1.6.1 && git push origin v1.6.1）触发 GitHub Actions 发布后，即可在此一键下载更新。':
+    'Push a version tag (e.g. git tag v1.6.1 && git push origin v1.6.1) to trigger GitHub Actions release builds for one-click updates.',
+  当前运行环境不支持原地覆盖网关二进制:
+    'In-place gateway binary replacement is not supported in this runtime',
+  终端更新命令: 'Terminal Update Command',
+  '更新后网关将自动平滑重启，连接恢复后页面自动刷新':
+    'Gateway restarts gracefully after update and reloads the console once ready',
+  '正在下载校验并替换...': 'Downloading & Verifying...',
+  当前已是最新版本: 'Already Up to Date',
+  底层: 'Underlying',
+  '底层 ACP 后端引擎': 'ACP Backend Engine',
+  '从官方清单下载最新 CLI / Zed ACP 引擎，校验哈希后平滑轮换空闲 Worker 进程（无需重启网关）':
+    'Downloads latest official CLI / Zed ACP package with hash verification and rotates idle workers without gateway restart',
+  引擎类型: 'Engine Flavor',
+  未记录: 'Unrecorded',
+  官方最新版: 'Latest Official',
+  '生效路径:': 'Active Binary:',
+  '检查 ACP 后端清单异常': 'ACP Manifest Check Error',
+  'ACP 目录不可写': 'ACP Directory Not Writable',
+  热更新不会中断正在生成的对话请求: 'Hot update will not interrupt in-flight generation requests',
+  '正在下载并热更新...': 'Downloading & Hot-Updating...',
+  重新校验并同步最新版: 'Re-verify & Sync Latest',
+  '等待网关重启超时，请检查服务运行状态后手动刷新页面':
+    'Timed out waiting for gateway restart. Please check service status and refresh manually.',
+  '网关二进制已完成替换，请手动重启服务使新版本生效':
+    'Gateway binary replaced. Please restart the service manually to load the new version.',
+  '暂未获取到官方 ACP 引擎版本清单': 'No Official ACP Manifest Loaded Yet',
+  '点击右侧重新检查以从官方发布源同步最新 CLI / Zed ACP 版本信息。':
+    'Click Check Again to fetch the latest CLI / Zed ACP version metadata from the official source.',
+  '当前运行在 Docker 容器内，容器镜像文件系统不支持持久化原地更新主程序；请在宿主机执行下方命令重建容器镜像。':
+    'Running inside a Docker container — container rootfs cannot persist in-place binary updates. Run the command below on the host to rebuild the container image.',
+  '已有更新任务正在执行，请等待当前更新完成':
+    'An update is already in progress. Please wait for it to finish.',
 }
 
 const ZH_TO_EN_PATTERNS: [RegExp, (...m: string[]) => string][] = [
@@ -1221,6 +1289,47 @@ const ZH_TO_EN_PATTERNS: [RegExp, (...m: string[]) => string][] = [
   [
     /^当前窗口容量\s*([0-9.]+[KMB]?)$/,
     (_, cap) => `Window Capacity ${cap}`,
+  ],
+  [
+    /^上次检查:\s*(.+)$/,
+    (_, t) => `Last checked: ${translateAgoEn(t)}`,
+  ],
+  [
+    /^仓库:\s*(.+?)(?:\s*·\s*产物:\s*(.+))?$/,
+    (_, repo, asset) => `Repo: ${repo}${asset ? ` · Asset: ${asset}` : ''}`,
+  ],
+  [
+    /^立即更新至\s*(.+?)\s*并重启$/,
+    (_, ver) => `Update to ${ver} & Restart`,
+  ],
+  [
+    /^热更新至\s*(.+)$/,
+    (_, ver) => `Hot-Update to ${ver}`,
+  ],
+  [
+    /^已将底层 ACP 引擎热更新至\s*(.+?)，并轮换\s*(\d+)\s*个空闲进程$/,
+    (_, ver, n) => `Hot-updated ACP engine to ${ver} and rotated ${n} idle worker(s)`,
+  ],
+  [
+    /^当前底层 ACP 引擎已是最新版本\s*\((.+?)\)，无需重复更新$/,
+    (_, ver) => `ACP backend engine is already at ${ver}; no update needed`,
+  ],
+  [
+    /^网关主程序已是最新版本\s*\((.+?)\)，底层 ACP 引擎已热更新至\s*(.+)$/,
+    (_, gwVer, acpVer) => `Gateway is already at ${gwVer}; hot-updated ACP engine to ${acpVer}`,
+  ],
+  [
+    /^当前已是最新版本\s*\((.+?)\)，无需重复更新$/,
+    (_, ver) => `Already at the latest version (${ver}); no update needed`,
+  ],
+  [
+    /^Release\s*(.+?)\s*中未包含当前平台产物\s*\((.+?)\)$/,
+    (_, tag, asset) => `Release ${tag} does not include an archive for this platform (${asset})`,
+  ],
+  [
+    /^当前进程对网关程序目录\s*\((.+?)\)\s*无写入权限\s*\((.+?)\).*$/,
+    (_, dir, err) =>
+      `No write permission to gateway binary directory (${dir}: ${err}) — typically restricted by systemd sandbox or root ownership. Run the terminal update command below.`,
   ],
 ]
 

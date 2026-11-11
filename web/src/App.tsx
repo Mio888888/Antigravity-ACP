@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Activity,
+  ArrowUpCircle,
   Cpu,
+  ExternalLink,
   Eye,
   EyeOff,
   FolderGit2,
@@ -26,10 +28,13 @@ import {
   ModelQuotaGroup,
   OverviewResponse,
   PromptPolicyConfig,
+  SystemUpdateStatusResponse,
   TerminalLoginStatus,
   UnauthorizedError,
+  adminApplySystemUpdate,
   adminChangePassword,
   adminCheckSession,
+  adminGetSystemUpdateStatus,
   adminLogin,
   adminLogout,
   adminTerminalLoginStatus,
@@ -276,6 +281,14 @@ function formatRelativeAgo(iso?: string): string {
   return `${days} 天前`
 }
 
+function formatAssetBytes(bytes?: number): string {
+  if (!bytes || bytes <= 0) return ''
+  const mb = bytes / (1024 * 1024)
+  if (mb >= 1) return `${mb.toFixed(1)} MB`
+  const kb = bytes / 1024
+  return `${kb.toFixed(0)} KB`
+}
+
 function formatProxySubtitle(acc: AccountRecord): string {
   if (acc.network_mode === 'proxy' && acc.proxy_url) {
     return acc.proxy_url
@@ -384,6 +397,18 @@ export function App() {
   const [newAdminTokenInput, setNewAdminTokenInput] = useState<string>('')
   const [changingPassword, setChangingPassword] = useState<boolean>(false)
   const [passwordModalError, setPasswordModalError] = useState<string>('')
+
+  // System update modal state
+  const [showUpdateModal, setShowUpdateModal] = useState<boolean>(false)
+  const [updateStatus, setUpdateStatus] = useState<SystemUpdateStatusResponse | null>(null)
+  const [checkingUpdate, setCheckingUpdate] = useState<boolean>(false)
+  const [updateCheckError, setUpdateCheckError] = useState<string>('')
+  const [applyingUpdateTarget, setApplyingUpdateTarget] = useState<'' | 'gateway' | 'acp' | 'all'>('')
+  const [updateModalError, setUpdateModalError] = useState<string>('')
+  const [updateModalNotice, setUpdateModalNotice] = useState<string>('')
+  const [restartingGateway, setRestartingGateway] = useState<boolean>(false)
+  const restartingGatewayRef = useRef<boolean>(false)
+  const restartPollTimerRef = useRef<number | null>(null)
 
   const [overview, setOverview] = useState<OverviewResponse | null>(null)
   const [accounts, setAccounts] = useState<AccountSnapshot[]>([])
@@ -630,6 +655,9 @@ export function App() {
   }, [noticeMsg])
 
   const refreshTelemetrySilently = useCallback(async () => {
+    if (restartingGatewayRef.current) {
+      return
+    }
     if (inFlightTelemetryRef.current) {
       pendingTelemetryFollowUpRef.current = true
       return
@@ -978,7 +1006,182 @@ export function App() {
     }
   }
 
+  const clearRestartPollTimer = useCallback(() => {
+    if (restartPollTimerRef.current !== null) {
+      window.clearInterval(restartPollTimerRef.current)
+      restartPollTimerRef.current = null
+    }
+  }, [])
+
+  useEffect(() => {
+    return () => {
+      clearRestartPollTimer()
+    }
+  }, [clearRestartPollTimer])
+
+  const fetchUpdateStatus = useCallback(
+    async (forceCheck: boolean, silent = false) => {
+      if (!silent) {
+        setCheckingUpdate(true)
+        setUpdateCheckError('')
+      }
+      try {
+        const status = await adminGetSystemUpdateStatus(forceCheck)
+        setUpdateStatus(status)
+        if (!silent) {
+          setUpdateCheckError('')
+        }
+      } catch (err) {
+        if (silent) return
+        const msg = resolveInlineError(err, '获取更新状态失败')
+        if (msg) setUpdateCheckError(msg)
+      } finally {
+        if (!silent) {
+          setCheckingUpdate(false)
+        }
+      }
+    },
+    [resolveInlineError]
+  )
+
+  useEffect(() => {
+    if (authState !== 'authenticated') return
+    const controller = new AbortController()
+    adminGetSystemUpdateStatus(false, controller.signal)
+      .then((status) => {
+        if (!controller.signal.aborted) {
+          setUpdateStatus(status)
+        }
+      })
+      .catch(() => {
+        // non-blocking initial badge check
+      })
+    return () => controller.abort()
+  }, [authState])
+
+  const hasAvailableUpdate = useMemo<boolean>(() => {
+    if (!updateStatus) return false
+    const gwUpdate = Boolean(updateStatus.gateway.update_available)
+    const acpUpdate = Boolean(
+      updateStatus.acp.update_available &&
+        updateStatus.acp.current_version &&
+        updateStatus.acp.can_hot_update
+    )
+    return gwUpdate || acpUpdate
+  }, [updateStatus])
+
+  const canApplyBothUpdates = useMemo<boolean>(() => {
+    if (!updateStatus) return false
+    return Boolean(
+      updateStatus.gateway.can_self_update &&
+        updateStatus.gateway.release_available &&
+        !updateStatus.gateway.check_error &&
+        updateStatus.gateway.update_available &&
+        updateStatus.acp.can_hot_update &&
+        !updateStatus.acp.check_error &&
+        updateStatus.acp.update_available
+    )
+  }, [updateStatus])
+
+  const openUpdateModal = () => {
+    setUpdateModalError('')
+    setUpdateModalNotice('')
+    setShowUpdateModal(true)
+    void fetchUpdateStatus(!updateStatus)
+  }
+
+  const closeUpdateModal = () => {
+    if (applyingUpdateTarget || restartingGateway) return
+    setShowUpdateModal(false)
+    setUpdateModalError('')
+    setUpdateModalNotice('')
+  }
+
+  const handleApplyUpdate = async (target: 'gateway' | 'acp' | 'all') => {
+    if (applyingUpdateTarget || restartingGateway) return
+    setApplyingUpdateTarget(target)
+    setUpdateModalError('')
+    setUpdateModalNotice('')
+    try {
+      const res = await adminApplySystemUpdate(target)
+      setApplyingUpdateTarget('')
+      if (target === 'acp') {
+        setUpdateModalNotice(
+          res.updated_acp
+            ? `已将底层 ACP 引擎热更新至 ${res.acp_version || 'vlatest'}，并轮换 ${res.retired_workers || 0} 个空闲进程`
+            : `当前底层 ACP 引擎已是最新版本 (${res.acp_version || 'vlatest'})，无需重复更新`
+        )
+        await Promise.all([fetchUpdateStatus(true), refreshAll()])
+        return
+      }
+      if (!res.updated_gateway && !res.restarting) {
+        setUpdateModalNotice(
+          res.updated_acp
+            ? `网关主程序已是最新版本 (${res.gateway_version || 'vlatest'})，底层 ACP 引擎已热更新至 ${res.acp_version || 'vlatest'}`
+            : `当前已是最新版本 (${res.gateway_version || 'vlatest'})，无需重复更新`
+        )
+        await Promise.all([fetchUpdateStatus(true), refreshAll()])
+        return
+      }
+      if (res.restarting) {
+        restartingGatewayRef.current = true
+        setRestartingGateway(true)
+        clearRestartPollTimer()
+        const expectedVersion = res.gateway_version || ''
+        const startedAt = Date.now()
+        const maxWaitMs = 45_000
+        let pollBusy = false
+        restartPollTimerRef.current = window.setInterval(() => {
+          const elapsed = Date.now() - startedAt
+          if (elapsed < 1200) return
+          if (elapsed > maxWaitMs) {
+            clearRestartPollTimer()
+            restartingGatewayRef.current = false
+            setRestartingGateway(false)
+            setUpdateModalError('等待网关重启超时，请检查服务运行状态后手动刷新页面')
+            return
+          }
+          if (pollBusy) return
+          pollBusy = true
+          fetch('/healthz', { cache: 'no-store' })
+            .then(async (resp) => {
+              if (!resp.ok) return
+              const body = (await resp.json().catch(() => null)) as {
+                status?: string
+                version?: string
+              } | null
+              if (
+                body?.status === 'ok' &&
+                (!expectedVersion ||
+                  !body.version ||
+                  body.version === expectedVersion ||
+                  elapsed > 5000)
+              ) {
+                clearRestartPollTimer()
+                window.location.reload()
+              }
+            })
+            .catch(() => {
+              // expected while listener is restarting
+            })
+            .finally(() => {
+              pollBusy = false
+            })
+        }, 1000)
+      } else {
+        setUpdateModalNotice('网关二进制已完成替换，请手动重启服务使新版本生效')
+        await fetchUpdateStatus(true)
+      }
+    } catch (err) {
+      setApplyingUpdateTarget('')
+      const msg = resolveInlineError(err, '更新操作失败')
+      if (msg) setUpdateModalError(msg)
+    }
+  }
+
   const handleLogout = async () => {
+    clearRestartPollTimer()
+    restartingGatewayRef.current = false
     await adminLogout()
     setOverview(null)
     setAccounts([])
@@ -986,6 +1189,12 @@ export function App() {
     setApiKeys([])
     setAuditLogs([])
     setLoginState({})
+    setShowUpdateModal(false)
+    setUpdateStatus(null)
+    setApplyingUpdateTarget('')
+    setRestartingGateway(false)
+    setUpdateModalError('')
+    setUpdateModalNotice('')
     setErrorMsg('')
     setNoticeMsg('')
     setLoginError('')
@@ -2403,6 +2612,13 @@ export function App() {
                 <h1 className="text-sm font-semibold tracking-tight text-foreground">
                   Antigravity ACP Gateway
                 </h1>
+                {(overview?.gateway_version || updateStatus?.gateway.current_version) && (
+                  <span translate="no">
+                    <Badge variant="outline">
+                      {overview?.gateway_version || updateStatus?.gateway.current_version}
+                    </Badge>
+                  </span>
+                )}
                 <Badge variant="info-light">Responses / Chat / Claude</Badge>
                 <Badge variant="success-light">
                   {`${fleetUsageSummary.readyCount}/${accounts.length} 账户正常`}
@@ -2415,6 +2631,11 @@ export function App() {
           </div>
 
           <div className="flex items-center gap-2">
+            {hasAvailableUpdate && <Badge variant="warning-light">有可用更新</Badge>}
+            <Button variant="outline" size="sm" onClick={openUpdateModal}>
+              <ArrowUpCircle />
+              系统更新
+            </Button>
             <Badge variant={overview?.credentials_locked ? 'success-light' : 'warning-light'}>
               {overview?.credentials_locked ? '已登录 · 密码已固定' : '已登录 · 动态密码'}
             </Badge>
@@ -2452,6 +2673,426 @@ export function App() {
           </div>
         </div>
       </header>
+
+      <DialogModal
+        open={showUpdateModal}
+        onClose={closeUpdateModal}
+        maxWidthClass="max-w-2xl"
+        title="系统版本与在线更新"
+        description="从 GitHub Releases 下载并校验网关预编译二进制包，或免重启热更新底层 ACP 后端引擎"
+        footer={
+          <>
+            <span className="text-xs text-muted-foreground">
+              {updateStatus?.checked_at
+                ? `上次检查: ${formatRelativeAgo(updateStatus.checked_at)}`
+                : 'SHA-256 / SHA-512 强校验保护'}
+            </span>
+            <div className="flex items-center gap-2">
+              {canApplyBothUpdates && (
+                <Button
+                  size="sm"
+                  variant="default"
+                  disabled={
+                    checkingUpdate ||
+                    Boolean(applyingUpdateTarget) ||
+                    restartingGateway ||
+                    Boolean(updateStatus?.updating)
+                  }
+                  onClick={() => void handleApplyUpdate('all')}
+                >
+                  {applyingUpdateTarget === 'all' ? '正在全量更新...' : '一键全部更新并重启'}
+                </Button>
+              )}
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={checkingUpdate || Boolean(applyingUpdateTarget) || restartingGateway}
+                onClick={() => void fetchUpdateStatus(true)}
+              >
+                <RefreshCw />
+                {checkingUpdate ? '正在检查...' : '重新检查'}
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={Boolean(applyingUpdateTarget) || restartingGateway}
+                onClick={closeUpdateModal}
+              >
+                关闭窗口
+              </Button>
+            </div>
+          </>
+        }
+      >
+        <div className="flex flex-col gap-4">
+          {restartingGateway && (
+            <Alert variant="info">
+              <div className="flex-1 min-w-0">
+                <AlertTitle>网关正在平滑重启并加载新版本</AlertTitle>
+                <AlertDescription>
+                  已完成 GitHub Releases 预编译包 SHA-256 校验与原子替换，正在等待 /healthz 恢复就绪，完成后页面将自动刷新...
+                </AlertDescription>
+              </div>
+            </Alert>
+          )}
+          {updateModalNotice && (
+            <Alert variant="success">
+              <div className="flex-1 min-w-0">
+                <AlertTitle>更新已完成</AlertTitle>
+                <AlertDescription>{updateModalNotice}</AlertDescription>
+              </div>
+            </Alert>
+          )}
+          {updateModalError && (
+            <Alert variant="destructive">
+              <div className="flex-1 min-w-0">
+                <AlertTitle>更新操作失败</AlertTitle>
+                <AlertDescription>{updateModalError}</AlertDescription>
+              </div>
+            </Alert>
+          )}
+
+          {checkingUpdate && !updateStatus && (
+            <div className="flex flex-col gap-4">
+              <Frame>
+                <FrameHeader>
+                  <Skeleton className="h-4 w-44" />
+                  <Skeleton className="h-5 w-20" />
+                </FrameHeader>
+                <FramePanel>
+                  <div className="flex flex-col gap-3">
+                    <Skeleton className="h-4 w-full" />
+                    <Skeleton className="h-4 w-3/4" />
+                    <Skeleton className="h-8 w-40" />
+                  </div>
+                </FramePanel>
+              </Frame>
+              <Frame>
+                <FrameHeader>
+                  <Skeleton className="h-4 w-40" />
+                  <Skeleton className="h-5 w-20" />
+                </FrameHeader>
+                <FramePanel>
+                  <div className="flex flex-col gap-3">
+                    <Skeleton className="h-4 w-full" />
+                    <Skeleton className="h-4 w-2/3" />
+                  </div>
+                </FramePanel>
+              </Frame>
+            </div>
+          )}
+
+          {updateCheckError && !updateStatus && (
+            <InlineError
+              title="获取更新状态失败"
+              message={updateCheckError}
+              retrying={checkingUpdate}
+              onRetry={() => void fetchUpdateStatus(true)}
+            />
+          )}
+
+          {updateStatus && (
+            <div className="flex flex-col gap-4">
+              {updateCheckError && (
+                <InlineError
+                  title="获取更新状态失败"
+                  message={updateCheckError}
+                  retrying={checkingUpdate}
+                  onRetry={() => void fetchUpdateStatus(true)}
+                />
+              )}
+
+              <Frame>
+                <FrameHeader>
+                  <div className="flex flex-col gap-1">
+                    <FrameTitle>网关主程序与管理控制台</FrameTitle>
+                    <FrameDescription>
+                      通过 GitHub Releases 下载带内嵌 WebUI 的预编译包并执行 SHA-256 校验替换
+                    </FrameDescription>
+                  </div>
+                  {!updateStatus.gateway.release_available && !updateStatus.gateway.check_error ? (
+                    <Badge variant="outline">暂无 Release</Badge>
+                  ) : updateStatus.gateway.check_error ? (
+                    <Badge variant="warning-light">待检查</Badge>
+                  ) : updateStatus.gateway.update_available ? (
+                    <Badge variant="warning-light">发现新版本</Badge>
+                  ) : (
+                    <Badge variant="success-light">已是最新</Badge>
+                  )}
+                </FrameHeader>
+                <FramePanel>
+                  <div className="flex flex-col gap-3">
+                    <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+                      <div className="flex flex-col gap-1">
+                        <span className="text-xs text-muted-foreground">当前版本</span>
+                        <span
+                          translate="no"
+                          className="text-sm font-mono font-semibold text-foreground"
+                        >
+                          {updateStatus.gateway.current_version || '—'}
+                        </span>
+                      </div>
+                      <div className="flex flex-col gap-1">
+                        <span className="text-xs text-muted-foreground">最新 Release</span>
+                        <span
+                          translate="no"
+                          className="text-sm font-mono font-semibold text-foreground"
+                        >
+                          {updateStatus.gateway.latest_version || '—'}
+                        </span>
+                      </div>
+                      <div className="flex flex-col gap-1">
+                        <span className="text-xs text-muted-foreground">运行平台</span>
+                        <span translate="no" className="text-sm font-mono text-foreground">
+                          {`${updateStatus.runtime.os}/${updateStatus.runtime.arch}`}
+                        </span>
+                      </div>
+                      <div className="flex flex-col gap-1">
+                        <span className="text-xs text-muted-foreground">部署模式</span>
+                        <span translate="no" className="text-sm font-mono text-foreground">
+                          {updateStatus.runtime.deploy_mode}
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
+                      <span>
+                        {`仓库: ${updateStatus.gateway.repo}${
+                          updateStatus.gateway.asset_name
+                            ? ` · 产物: ${updateStatus.gateway.asset_name}${
+                                updateStatus.gateway.asset_size
+                                  ? ` (${formatAssetBytes(updateStatus.gateway.asset_size)})`
+                                  : ''
+                              }`
+                            : ''
+                        }`}
+                      </span>
+                      {updateStatus.gateway.release_url && (
+                        <a
+                          href={updateStatus.gateway.release_url}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="inline-flex items-center gap-1 text-foreground underline underline-offset-4 transition-colors hover:text-muted-foreground"
+                        >
+                          <span>查看 Release 说明</span>
+                          <ExternalLink className="size-3.5" />
+                        </a>
+                      )}
+                    </div>
+
+                    {updateStatus.gateway.check_error ? (
+                      <InlineError
+                        title="检查 GitHub Release 异常"
+                        message={updateStatus.gateway.check_error}
+                        retrying={checkingUpdate}
+                        onRetry={() => void fetchUpdateStatus(true)}
+                      />
+                    ) : !updateStatus.gateway.release_available ? (
+                      <Alert variant="default">
+                        <div className="flex w-full flex-wrap items-center justify-between gap-3">
+                          <div className="flex-1 min-w-0">
+                            <AlertTitle>远程仓库尚未发布预编译 Release</AlertTitle>
+                            <AlertDescription>
+                              推送版本标签（如 git tag v1.6.1 && git push origin v1.6.1）触发 GitHub Actions 发布后，即可在此一键下载更新。
+                            </AlertDescription>
+                          </div>
+                          <Button
+                            size="xs"
+                            variant="outline"
+                            disabled={checkingUpdate}
+                            onClick={() => void fetchUpdateStatus(true)}
+                          >
+                            {checkingUpdate ? '正在检查...' : '重新检查'}
+                          </Button>
+                        </div>
+                      </Alert>
+                    ) : null}
+
+                    {!updateStatus.gateway.can_self_update && (
+                      <div className="flex flex-col gap-3">
+                        <Alert variant="warning">
+                          <div className="flex-1 min-w-0">
+                            <AlertTitle>当前运行环境不支持原地覆盖网关二进制</AlertTitle>
+                            <AlertDescription>
+                              {updateStatus.gateway.blocked_reason}
+                            </AlertDescription>
+                          </div>
+                        </Alert>
+                        {updateStatus.gateway.manual_command && (
+                          <CodeBlock
+                            title="终端更新命令"
+                            language={
+                              updateStatus.runtime.os === 'windows' ? 'powershell' : 'bash'
+                            }
+                            code={updateStatus.gateway.manual_command}
+                          />
+                        )}
+                      </div>
+                    )}
+
+                    {updateStatus.gateway.can_self_update &&
+                      updateStatus.gateway.release_available &&
+                      !updateStatus.gateway.check_error && (
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <span className="text-xs text-muted-foreground">
+                            更新后网关将自动平滑重启，连接恢复后页面自动刷新
+                          </span>
+                          <Button
+                            size="sm"
+                            variant={updateStatus.gateway.update_available ? 'default' : 'outline'}
+                            disabled={
+                              !updateStatus.gateway.update_available ||
+                              Boolean(applyingUpdateTarget) ||
+                              restartingGateway ||
+                              updateStatus.updating
+                            }
+                            onClick={() => void handleApplyUpdate('gateway')}
+                          >
+                            {applyingUpdateTarget === 'gateway'
+                              ? '正在下载校验并替换...'
+                              : updateStatus.gateway.update_available
+                                ? `立即更新至 ${updateStatus.gateway.latest_version} 并重启`
+                                : '当前已是最新版本'}
+                          </Button>
+                        </div>
+                      )}
+                  </div>
+                </FramePanel>
+              </Frame>
+
+              <Frame>
+                <FrameHeader>
+                  <div className="flex flex-col gap-1">
+                    <FrameTitle>底层 ACP 后端引擎</FrameTitle>
+                    <FrameDescription>
+                      从官方清单下载最新 CLI / Zed ACP 引擎，校验哈希后平滑轮换空闲 Worker 进程（无需重启网关）
+                    </FrameDescription>
+                  </div>
+                  {updateStatus.acp.check_error ? (
+                    <Badge variant="warning-light">待检查</Badge>
+                  ) : updateStatus.acp.update_available ? (
+                    <Badge variant="info-light">
+                      {updateStatus.acp.current_version ? '发现新版本' : '可在线同步'}
+                    </Badge>
+                  ) : (
+                    <Badge variant="success-light">已是最新</Badge>
+                  )}
+                </FrameHeader>
+                <FramePanel>
+                  <div className="flex flex-col gap-3">
+                    <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                      <div className="flex flex-col gap-1">
+                        <span className="text-xs text-muted-foreground">引擎类型</span>
+                        <span
+                          translate="no"
+                          className="text-sm font-mono font-semibold text-foreground"
+                        >
+                          {updateStatus.acp.flavor === 'zed'
+                            ? 'Zed ACP (agy_acp_server)'
+                            : 'Antigravity CLI (agy)'}
+                        </span>
+                      </div>
+                      <div className="flex flex-col gap-1">
+                        <span className="text-xs text-muted-foreground">当前版本</span>
+                        {updateStatus.acp.current_version ? (
+                          <span
+                            translate="no"
+                            className="text-sm font-mono font-semibold text-foreground"
+                          >
+                            {updateStatus.acp.current_version}
+                          </span>
+                        ) : (
+                          <span className="text-sm text-muted-foreground">未记录</span>
+                        )}
+                      </div>
+                      <div className="flex flex-col gap-1">
+                        <span className="text-xs text-muted-foreground">官方最新版</span>
+                        <span
+                          translate="no"
+                          className="text-sm font-mono font-semibold text-foreground"
+                        >
+                          {updateStatus.acp.latest_version || '—'}
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                      <span>生效路径:</span>
+                      <code translate="no" className="font-mono text-foreground break-all">
+                        {updateStatus.acp.binary_path || updateStatus.acp.target_install_dir || '—'}
+                      </code>
+                    </div>
+
+                    {updateStatus.acp.check_error ? (
+                      <InlineError
+                        title="检查 ACP 后端清单异常"
+                        message={updateStatus.acp.check_error}
+                        retrying={checkingUpdate}
+                        onRetry={() => void fetchUpdateStatus(true)}
+                      />
+                    ) : !updateStatus.acp.latest_version ? (
+                      <Alert variant="default">
+                        <div className="flex w-full flex-wrap items-center justify-between gap-3">
+                          <div className="flex-1 min-w-0">
+                            <AlertTitle>暂未获取到官方 ACP 引擎版本清单</AlertTitle>
+                            <AlertDescription>
+                              点击右侧重新检查以从官方发布源同步最新 CLI / Zed ACP 版本信息。
+                            </AlertDescription>
+                          </div>
+                          <Button
+                            size="xs"
+                            variant="outline"
+                            disabled={checkingUpdate}
+                            onClick={() => void fetchUpdateStatus(true)}
+                          >
+                            {checkingUpdate ? '正在检查...' : '重新检查'}
+                          </Button>
+                        </div>
+                      </Alert>
+                    ) : null}
+
+                    {!updateStatus.acp.can_hot_update && updateStatus.acp.blocked_reason && (
+                      <Alert variant="warning">
+                        <div className="flex-1 min-w-0">
+                          <AlertTitle>ACP 目录不可写</AlertTitle>
+                          <AlertDescription>{updateStatus.acp.blocked_reason}</AlertDescription>
+                        </div>
+                      </Alert>
+                    )}
+
+                    {updateStatus.acp.can_hot_update &&
+                      !updateStatus.acp.check_error &&
+                      Boolean(updateStatus.acp.latest_version) && (
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <span className="text-xs text-muted-foreground">
+                            热更新不会中断正在生成的对话请求
+                          </span>
+                          <Button
+                            size="sm"
+                            variant={updateStatus.acp.update_available ? 'default' : 'outline'}
+                            disabled={
+                              !updateStatus.acp.update_available ||
+                              Boolean(applyingUpdateTarget) ||
+                              restartingGateway ||
+                              updateStatus.updating
+                            }
+                            onClick={() => void handleApplyUpdate('acp')}
+                          >
+                            {applyingUpdateTarget === 'acp'
+                              ? '正在下载并热更新...'
+                              : updateStatus.acp.update_available
+                                ? `热更新至 ${updateStatus.acp.latest_version}`
+                                : '当前已是最新版本'}
+                          </Button>
+                        </div>
+                      )}
+                  </div>
+                </FramePanel>
+              </Frame>
+            </div>
+          )}
+        </div>
+      </DialogModal>
 
       <DialogModal
         open={showPasswordModal}

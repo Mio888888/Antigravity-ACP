@@ -11,6 +11,7 @@ import (
 	"antigravity-gateway/internal/acp"
 	"antigravity-gateway/internal/config"
 	"antigravity-gateway/internal/storage"
+	"antigravity-gateway/internal/version"
 )
 
 func (gs *GatewayServer) setAccountCheckMeta(accountID, msg string, groups []storage.ModelQuotaGroup) {
@@ -184,6 +185,7 @@ func (gs *GatewayServer) handleAdminOverview(w http.ResponseWriter, r *http.Requ
 		"session_mode":         sessionMode,
 		"public_base_url":      gs.cfg.Server.PublicBaseURL,
 		"credentials_locked":   gs.isAdminCredentialsLocked(),
+		"gateway_version":      version.Version,
 	}
 	if r.URL.Query().Get("include_logs") == "1" && gs.store != nil {
 		logsLimit, _ := strconv.Atoi(r.URL.Query().Get("logs_limit"))

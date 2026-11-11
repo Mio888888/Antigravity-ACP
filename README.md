@@ -17,7 +17,7 @@
 
 2. **双 ACP 后端引擎可选，一键自动下载安装（默认 `cli`）**
    - **`cli` 模式（默认）**：驱动官方 Antigravity CLI（`agy acp` / `antigravity acp`），支持 `--process-per-session` 等完整 CLI 参数；一键部署时若本机未安装，将自动按当前系统与架构（`darwin/linux/windows`，`amd64/arm64`）从官方清单下载并做 **SHA-512 校验**安装。校验**默认失败即中止**：清单缺少哈希、本机没有哈希工具或清单获取失败都会报错，哈希不匹配始终报错。
-   - **`zed` / `zen` 模式**：直接驱动 Zed 的 Antigravity ACP 独立后端包（`agy_acp_server.par` / `agy_acp_server`）。自动下载时必须通过 `ZED_ACP_SHA256`（或 `--zed-sha256`）提供**固定的 SHA-256**，否则脚本拒绝安装。
+   - **`zed` / `zen` 模式**：直接驱动 Zed 的 Antigravity ACP 独立后端包（`agy_acp_server.par` / `agy_acp_server`）。脚本默认从官方 ACP Registry 自动查询最新版本与 **SHA-256** 校验和，也支持通过 `ZED_ACP_SHA256`（或 `--zed-sha256`）手动固定哈希。
    - **`auto` 自动探测模式**：跨 macOS、Windows、Linux 与 Docker 自动探测本机已安装的 `agy` CLI 或 Zed ACP 扩展包，并内置二进制文件头（ELF / Mach-O / PE）跨系统防冲突校验。
 
 3. **四层粘性会话（Sticky Session）与进程亲和性（Worker Affinity）**
@@ -30,8 +30,9 @@
    - 每个账户拥有独立的 `GEMINI_CLI_HOME` 容器目录（`data/accounts/<id>/.gemini`）与独立 Worker 子进程池。
    - 支持 **Direct 直连**、**SOCKS5 / HTTP 代理**、**源网卡 IP 绑定（Bind IP）** 与 **Linux Network Namespace（NetNS）** 四种网络隔离模式，支持无头浏览器 OAuth 登录引导与周期模型配额监控。
 
-5. **中英双语 ReUI 实时可观测控制台**
+5. **中英双语 ReUI 实时可观测控制台与在线自更新**
    - 顶栏一键切换 **`中文 / EN`**，全界面实时翻译同步。
+   - **在线版本更新（`系统更新`）**：控制台内置双通道在线更新面板——支持直接从 **GitHub Releases** 拉取全平台预编译网关包（`SHA256SUMS` 强校验 + ELF/Mach-O/PE 架构头验证 + 原地平滑重启并自动刷新页面），同时支持免重启热更新底层 **Antigravity CLI / Zed ACP 引擎**（平滑轮换空闲 Worker，不中断正在生成的会话；Docker 或只读 systemd 环境自动识别并给出宿主机更新命令）。
    - **运行总览（Overview）**：单请求端到端路由追踪、四段式耗时拆解（网关 / 网络 / 供应商 TTFB / 流式输出）、纯输出 TPS 速率计算、1M/200K 上下文窗口 2D 矩形树图（Treemap）与点阵图、底部实时请求选择器（按请求 / 按会话聚合）以及**底层进程与绑定会话**实时监控面板。
 
 ---
@@ -62,7 +63,7 @@
 赋予部署脚本执行权限：
 
 ```bash
-chmod +x deploy/deploy.sh
+chmod +x deploy/deploy.sh deploy/update.sh
 ```
 
 #### 1. 本地一键编译并后台启动（最简方式）
@@ -106,13 +107,26 @@ sudo cat /var/lib/antigravity-gateway/data/admin_credentials.txt   # 查看动�
 
 macOS 下 `--mode service` 会在 `~/Library/LaunchAgents/com.antigravity.gateway.plist`（权限 `0600`）注册当前用户的 launchd 服务。
 
-#### 3. 切换或单独下载/更新 ACP 后端引擎
-```bash
-# 仅下载或更新默认 CLI 后端 (./bin/agy)
-./deploy/deploy.sh --action install-acp --backend cli
+#### 3. 一键拉取最新代码并同步更新 CLI / Zed ACP 后端包（`deploy/update.sh`）
+无论当前运行在 `local`、`service`（systemd / launchd）还是 `docker` 模式，直接运行 `./deploy/update.sh`（或 `./deploy/deploy.sh --action update`）即可完成全链路更新：
+1. 自动暂存本地未提交改动并执行 `git pull --ff-only` 拉取最新源码（若目录是从压缩包解压部署、尚未初始化 `.git`，会自动关联官方远程仓库同步至最新提交），如脚本自身有更新会自动重载；
+2. 自动识别当前活跃运行模式（`docker` / `service` / `local`）与后端类型；
+3. **同步更新 ACP 后端包**：按当前模式或 `--backend` 参数重新从官方源拉取最新版本的 **Antigravity CLI（`agy`）** 或 **Zed ACP 独立后端包（`agy_acp_server.par`）** 并完成哈希校验（Docker 模式通过 `AG_ACP_CACHE_BUST` 强制刷新镜像内 ACP 后端层）；
+4. 重新构建前端与 Go 网关并平滑重启，轮询 `/healthz` 确认健康。
 
-# 切换使用 Zed/Zen 的 ACP 独立后端包：必须提供可信来源的固定 SHA-256
-ZED_ACP_SHA256="<agy-acp-server-1.4.5-<os>-<arch>.zip 的 sha256>" ./deploy/deploy.sh --mode local --backend zed
+```bash
+# 一键拉取最新代码 + 更新当前已启用/已安装的 ACP 后端包 + 重新编译并重启服务
+./deploy/update.sh
+
+# 一键更新代码并指定更新（或切换为）Antigravity CLI / Zed ACP 独立后端包 / 同时更新两者
+./deploy/update.sh --backend cli
+./deploy/update.sh --backend zed
+./deploy/update.sh --backend both
+
+# 仅下载或更新 ACP 后端包到最新版本（不拉代码、不重启网关）
+./deploy/update.sh --action update-acp --backend cli
+./deploy/update.sh --action update-acp --backend zed
+./deploy/update.sh --action update-acp --backend both
 
 # 离线环境部署（手动指定已有二进制路径并跳过自动下载）
 ./deploy/deploy.sh --mode local --backend cli --acp-bin "/path/to/agy" --no-download
@@ -120,7 +134,7 @@ ZED_ACP_SHA256="<agy-acp-server-1.4.5-<os>-<arch>.zip 的 sha256>" ./deploy/depl
 
 下载完整性校验规则（`deploy.sh`、`deploy.ps1`、`Dockerfile` 一致）：
 - **CLI**：使用官方清单中的 SHA-512。清单获取失败、缺少哈希或本机无哈希工具时直接报错；仅当显式传入 `--insecure-skip-verify` 时才允许“缺少哈希/工具”的情况继续。
-- **Zed 包**：必须通过 `ZED_ACP_SHA256` 环境变量或 `--zed-sha256` 提供预期 SHA-256（可从 ACP Registry 中 `antigravity-acp` 条目的 `distribution.binary.<平台>.sha256` 等可信来源获取），否则报错；版本号可用 `ZED_ACP_VERSION` 覆盖（默认 `1.4.5`）。
+- **Zed 包**：默认自动查询官方 ACP Registry（`https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json` 中 `antigravity-acp` 条目的 `distribution.binary.<平台>.sha256`）获取最新版本与 SHA-256；也可通过 `ZED_ACP_SHA256` 环境变量或 `--zed-sha256`、`--zed-version` 手动固定。
 - **哈希不匹配始终是致命错误**，不会回退到其他下载方式。
 - 官方安装脚本 `https://antigravity.google/cli/install.sh` 仅在显式传入 `--allow-install-script` 且清单不可用时使用：脚本先下载到临时文件并完整展示（交互终端下需确认），绝不 `curl | bash`。
 
@@ -139,15 +153,17 @@ ZED_ACP_SHA256="<agy-acp-server-1.4.5-<os>-<arch>.zip 的 sha256>" ./deploy/depl
 
 | 参数 | 可选值 | 默认值 | 说明 |
 | :--- | :--- | :--- | :--- |
-| `--action` | `install` \| `install-acp` \| `start` \| `stop` \| `restart` \| `status` \| `build` \| `build-all` | `install` | 执行动作（`install-acp` 仅下载 ACP 后端，`build-all` 交叉编译全平台包） |
-| `--mode` | `local` \| `service` \| `docker` | `local` | 部署方式：本地后台进程、系统开机自启服务、Docker 容器；启停与状态动作同样按此路由 |
-| `--backend` | `cli` \| `zed` \| `zen` \| `auto` | 沿用 `config.yaml` | ACP 后端引擎类型（仓库默认 `cli`） |
+| `--action` | `install` \| `update` \| `install-acp` \| `update-acp` \| `start` \| `stop` \| `restart` \| `status` \| `build` \| `build-all` | `install`（`update.sh` 为 `update`） | 执行动作（`update` 拉取最新代码+更新 ACP 包+重启；`update-acp` 仅更新 ACP 后端） |
+| `--mode` | `local` \| `service` \| `docker` | `local`（`update` 自动识别） | 部署方式：本地后台进程、系统开机自启服务、Docker 容器；启停与状态动作同样按此路由 |
+| `--backend` | `cli` \| `zed` \| `zen` \| `auto` \| `both` | 沿用 `config.yaml` | ACP 后端引擎类型（仓库默认 `cli`；`both` 同时更新 CLI 与 Zed ACP 包） |
 | `--acp-bin` | 文件路径 | 空（自动发现/下载） | 显式指定 `agy` 或 `agy_acp_server.par` 路径 |
-| `--no-download` | 无参数标志 | 关闭（默认自动下载） | 禁用缺失 ACP 后端时的自动下载 |
+| `--no-download` | 无参数标志 | 关闭（默认自动下载） | 禁用自动下载/更新 ACP 后端 |
+| `--no-git` / `--skip-git` | 无参数标志 | 关闭 | 在 `--action update` 时跳过 `git pull` 代码拉取 |
 | `--port` | 端口号 | `AG_PORT`，否则 `config.yaml`（docker 为 `8080`） | 本地/服务模式为监听端口；docker 模式仅为宿主机映射端口（容器内固定监听 `8080`） |
 | `--admin-password-stdin` | 无参数标志 | 关闭 | 从标准输入或交互提示读取初始管理员密码（至少 8 位） |
 | `--admin-password` | 字符串 | 空（自动生成） | 同上但直接写在命令行（不推荐）；仅在控制台修改密码前生效 |
-| `--zed-sha256` | 64 位十六进制 | `ZED_ACP_SHA256` | Zed ACP 压缩包的预期 SHA-256 |
+| `--zed-version` | 版本号 | 官方 ACP Registry 最新版 | 指定 Zed ACP 压缩包版本（或设置 `ZED_ACP_VERSION`） |
+| `--zed-sha256` | 64 位十六进制 | 自动从 ACP Registry 解析 | Zed ACP 压缩包的预期 SHA-256（或设置 `ZED_ACP_SHA256`） |
 | `--insecure-skip-verify` | 无参数标志 | 关闭 | 允许在缺少预期哈希或哈希工具时继续（哈希不匹配仍会失败） |
 | `--allow-install-script` | 无参数标志 | 关闭 | 清单不可用时允许下载并执行官方安装脚本（先展示内容） |
 | `--lang` | `zh` \| `en` | `zh` | 脚本终端输出语言 |
@@ -242,11 +258,13 @@ cat data/admin_credentials.txt   # 查看本次动态生成的管理凭证
 # 方式 A：本地一键编译并后台启动（默认 cli 模式，缺失时自动下载 agy.exe 并完成 SHA-512 校验）
 .\deploy\deploy.ps1 -Mode local -Port 8080 -AdminPasswordStdin
 
-# 方式 B：指定使用 Zed/Zen ACP 独立包（必须提供固定 SHA-256）
-.\deploy\deploy.ps1 -Mode local -Backend zed -ZedSha256 "<agy-acp-server-1.4.5-windows-<arch>.zip 的 sha256>"
+# 方式 B：一键拉取最新代码并同步更新 CLI / Zed ACP 后端包（.\deploy\update.ps1）
+.\deploy\update.ps1
+.\deploy\update.ps1 -Backend zed
+.\deploy\update.ps1 -Backend both
 
 # 方式 C：仅下载/更新 ACP 后端可执行文件到 .\bin
-.\deploy\deploy.ps1 -Action install-acp -Backend cli
+.\deploy\deploy.ps1 -Action update-acp -Backend cli
 
 # 方式 D：注册为开机启动的 Windows 计划任务（需在管理员 PowerShell 中执行）
 .\deploy\deploy.ps1 -Mode service -Port 8080 -AdminPasswordStdin

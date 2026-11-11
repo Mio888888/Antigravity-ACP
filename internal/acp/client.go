@@ -83,15 +83,15 @@ func isCompatibleExecutable(path string) bool {
 
 func discoverZedACPBinary() string {
 	var candidates []string
-	// 1. Local project / container paths
+	// 1. Local project / container / service paths
 	candidates = append(candidates,
 		"./bin/agy_acp_server.par",
 		"./bin/agy_acp_server",
 		"./bin/agy_acp_server.exe",
-		"/usr/local/bin/agy_acp_server.par",
-		"/usr/local/bin/agy_acp_server",
 		"/opt/antigravity-acp/agy_acp_server.par",
 		"/opt/antigravity-acp/agy_acp_server",
+		"/usr/local/bin/agy_acp_server.par",
+		"/usr/local/bin/agy_acp_server",
 	)
 
 	home, _ := os.UserHomeDir()
@@ -126,7 +126,7 @@ func discoverZedACPBinary() string {
 			sort.Strings(matches)
 			// Prefer newest version (last in lexical sort)
 			for i := len(matches) - 1; i >= 0; i-- {
-				candidates = append([]string{matches[i]}, candidates...)
+				candidates = append(candidates, matches[i])
 			}
 		}
 	}
@@ -149,6 +149,31 @@ func discoverZedACPBinary() string {
 }
 
 func discoverCLIACPBinary() string {
+	var primaryCandidates []string
+	if runtime.GOOS == "windows" {
+		primaryCandidates = []string{
+			`.\bin\agy.exe`,
+			`.\bin\antigravity.exe`,
+		}
+	} else {
+		primaryCandidates = []string{
+			"./bin/agy",
+			"./bin/antigravity",
+			"/opt/antigravity-acp/agy",
+			"/opt/antigravity-acp/antigravity",
+			"/usr/local/bin/agy",
+			"/usr/local/bin/antigravity",
+		}
+	}
+	for _, c := range primaryCandidates {
+		if isCompatibleExecutable(c) {
+			if abs, err := filepath.Abs(c); err == nil {
+				return abs
+			}
+			return c
+		}
+	}
+
 	for _, binName := range []string{"agy", "antigravity", "agy.exe", "antigravity.exe"} {
 		if p, err := exec.LookPath(binName); err == nil && p != "" && isCompatibleExecutable(p) {
 			return p
@@ -171,18 +196,10 @@ func discoverCLIACPBinary() string {
 			)
 		}
 		candidates = append(candidates,
-			`.\bin\agy.exe`,
-			`.\bin\antigravity.exe`,
 			`C:\Program Files\Google\antigravity-cli\agy.exe`,
 		)
 	} else {
 		candidates = append(candidates,
-			"./bin/agy",
-			"./bin/antigravity",
-			"/usr/local/bin/agy",
-			"/usr/local/bin/antigravity",
-			"/opt/antigravity-acp/agy",
-			"/opt/antigravity-acp/antigravity",
 			"/opt/homebrew/bin/agy",
 			"/opt/homebrew/bin/antigravity",
 		)

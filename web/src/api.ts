@@ -172,7 +172,65 @@ export interface OverviewResponse {
   session_mode: string
   public_base_url: string
   credentials_locked?: boolean
+  gateway_version?: string
   logs?: AuditLogRecord[]
+}
+
+export interface UpdateRuntimeInfo {
+  os: string
+  arch: string
+  deploy_mode: string
+  executable_path: string
+}
+
+export interface GatewayUpdateStatus {
+  repo: string
+  current_version: string
+  commit?: string
+  latest_version: string
+  release_available: boolean
+  update_available: boolean
+  can_self_update: boolean
+  blocked_reason?: string
+  manual_command?: string
+  asset_name?: string
+  asset_size?: number
+  release_url?: string
+  published_at?: string
+  release_notes?: string
+  check_error?: string
+}
+
+export interface ACPUpdateStatus {
+  backend_type: string
+  flavor: 'cli' | 'zed' | string
+  binary_path: string
+  target_install_dir: string
+  current_version: string
+  latest_version: string
+  update_available: boolean
+  can_hot_update: boolean
+  blocked_reason?: string
+  check_error?: string
+}
+
+export interface SystemUpdateStatusResponse {
+  checked_at: string
+  updating: boolean
+  runtime: UpdateRuntimeInfo
+  gateway: GatewayUpdateStatus
+  acp: ACPUpdateStatus
+}
+
+export interface SystemUpdateApplyResponse {
+  updated_gateway: boolean
+  gateway_version?: string
+  executable_path?: string
+  updated_acp: boolean
+  acp_version?: string
+  acp_binary_path?: string
+  retired_workers?: number
+  restarting: boolean
 }
 
 export interface TerminalLoginStatus {
@@ -237,14 +295,19 @@ export class NetworkError extends Error {
   }
 }
 
+export interface ApiFetchOptions extends RequestInit {
+  timeoutMs?: number
+}
+
 // Admin calls authenticate solely via the HttpOnly `ag_admin_session` cookie.
-export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
+export async function apiFetch<T>(path: string, init?: ApiFetchOptions): Promise<T> {
   const headers = new Headers(init?.headers || {})
   if (init?.body !== undefined && !headers.has('Content-Type')) {
     headers.set('Content-Type', 'application/json')
   }
+  const timeoutMs = init?.timeoutMs && init.timeoutMs > 0 ? init.timeoutMs : API_TIMEOUT_MS
   const controller = new AbortController()
-  const timer = window.setTimeout(() => controller.abort(), API_TIMEOUT_MS)
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs)
   const outerSignal = init?.signal
   const onOuterAbort = () => controller.abort()
   if (outerSignal) {
@@ -340,4 +403,25 @@ export async function adminTerminalLoginStatus(
     `/api/admin/accounts/${encodeURIComponent(accountId)}/login/status`,
     { signal }
   )
+}
+
+export async function adminGetSystemUpdateStatus(
+  forceCheck = false,
+  signal?: AbortSignal
+): Promise<SystemUpdateStatusResponse> {
+  const qs = forceCheck ? '?check=1' : ''
+  return apiFetch<SystemUpdateStatusResponse>(`/api/admin/update/status${qs}`, {
+    signal,
+    timeoutMs: 30_000,
+  })
+}
+
+export async function adminApplySystemUpdate(
+  target: 'gateway' | 'acp' | 'all'
+): Promise<SystemUpdateApplyResponse> {
+  return apiFetch<SystemUpdateApplyResponse>('/api/admin/update/apply', {
+    method: 'POST',
+    body: JSON.stringify({ target }),
+    timeoutMs: 300_000,
+  })
 }

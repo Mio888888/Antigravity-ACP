@@ -1,0 +1,139 @@
+# Release Prebuilt Binaries Workflow / 预编译全平台发行包自动发布工作流
+# Triggered on pushing a version tag `v*` (e.g. `git tag v1.6.1 && git push origin v1.6.1`)
+# or manually via workflow_dispatch.
+# Cross-compiles all 6 OS/Arch targets with embedded WebUI (`-tags webui`), packages
+# `.tar.gz` (macOS/Linux) and `.zip` (Windows), generates `SHA256SUMS`, and publishes
+# to GitHub Releases so the Admin Console's one-click updater can verify & install.
+
+name: Release / 发布预编译二进制包
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build and publish (e.g. v1.6.1)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build & Publish Prebuilt Release Archives / 编译并发布全平台预编译包
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository / 检出代码
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Setup Node.js / 配置 Node.js 环境
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: "web/package-lock.json"
+
+      - name: Setup Go / 配置 Go 环境
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build Web Console / 构建内嵌前端控制台 (web/dist)
+        working-directory: ./web
+        run: |
+          npm ci
+          npm run build
+
+      - name: Run Verification Tests / 执行发布前静态检查与单元测试
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          go vet -tags webui ./...
+          go test -race -tags webui ./...
+
+      - name: Cross-Compile & Package All Platforms / 交叉编译全平台二进制并生成 SHA256SUMS
+        env:
+          CGO_ENABLED: "0"
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+          COMMIT_SHA: ${{ github.sha }}
+          REPO_NAME: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          RELEASE_TAG="${INPUT_TAG:-$REF_NAME}"
+          if [[ "$RELEASE_TAG" != v* ]]; then
+            echo "ERROR: Release tag must start with 'v' (got: $RELEASE_TAG)" >&2
+            exit 1
+          fi
+
+          mkdir -p release-assets staging
+          TARGETS=(
+            "darwin/arm64"
+            "darwin/amd64"
+            "linux/amd64"
+            "linux/arm64"
+            "windows/amd64"
+            "windows/arm64"
+          )
+
+          LDFLAGS="-s -w -X antigravity-gateway/internal/version.Version=${RELEASE_TAG} -X antigravity-gateway/internal/version.Commit=${COMMIT_SHA} -X antigravity-gateway/internal/version.Repo=${REPO_NAME}"
+
+          for target in "${TARGETS[@]}"; do
+            goos="${target%/*}"
+            goarch="${target#*/}"
+            ext=""
+            [[ "$goos" == "windows" ]] && ext=".exe"
+
+            pkg_name="antigravity-gateway-${goos}-${goarch}"
+            pkg_dir="staging/${pkg_name}"
+            rm -rf "$pkg_dir"
+            mkdir -p "$pkg_dir/config" "$pkg_dir/deploy"
+
+            echo ">>> Building ${pkg_name} (${RELEASE_TAG})..."
+            GOOS="$goos" GOARCH="$goarch" go build -tags webui -trimpath -ldflags="$LDFLAGS" \
+              -o "${pkg_dir}/antigravity-gateway${ext}" ./cmd/gateway
+            GOOS="$goos" GOARCH="$goarch" go build -trimpath -ldflags="$LDFLAGS" \
+              -o "${pkg_dir}/antigravity-probe${ext}" ./cmd/probe
+
+            cp config/config.yaml "$pkg_dir/config/config.yaml"
+            cp deploy/deploy.sh deploy/update.sh deploy/deploy.ps1 deploy/update.ps1 \
+               deploy/Dockerfile deploy/docker-compose.yml deploy/antigravity-gateway.service \
+               deploy/gateway.env.example "$pkg_dir/deploy/"
+            cp README.md README_EN.md LICENSE "$pkg_dir/"
+
+            if [[ "$goos" == "windows" ]]; then
+              (cd staging && zip -qr "../release-assets/${pkg_name}.zip" "${pkg_name}")
+            else
+              tar -C staging -czf "release-assets/${pkg_name}.tar.gz" "${pkg_name}"
+            fi
+          done
+
+          (cd release-assets && sha256sum antigravity-gateway-* > SHA256SUMS)
+          cat release-assets/SHA256SUMS
+
+      - name: Publish GitHub Release / 发布 GitHub Release 与校验文件
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          RELEASE_TAG="${INPUT_TAG:-$REF_NAME}"
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release-assets/* --clobber
+          else
+            gh release create "$RELEASE_TAG" release-assets/* \
+              --target "$COMMIT_SHA" \
+              --title "Antigravity ACP Gateway ${RELEASE_TAG}" \
+              --generate-notes
+          fi

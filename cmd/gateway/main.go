@@ -17,9 +17,12 @@ import (
 	"antigravity-gateway/internal/config"
 	"antigravity-gateway/internal/server"
 	"antigravity-gateway/internal/storage"
+	"antigravity-gateway/internal/updater"
+	"antigravity-gateway/internal/version"
 )
 
 func main() {
+	updater.CleanupStaleExecutableArtifacts("")
 	cfgPath := flag.String("config", "config/config.yaml", "Path to gateway config.yaml")
 	backendFlag := flag.String("backend", "", "ACP backend type override: auto | zed | zen | cli")
 	acpBinFlag := flag.String("acp-bin", "", "Explicit path to ACP backend binary (agy_acp_server.par or agy)")
@@ -51,6 +54,12 @@ func main() {
 	}
 	defer store.Close()
 
+	if *acpBinFlag == "" && os.Getenv("AG_ACP_BINARY_PATH") == "" {
+		if overrideBin := updater.ResolveStartupACPOverride(store, cfg.ACPPool.BackendType, cfg.ACPPool.BinaryPath); overrideBin != "" {
+			cfg.ACPPool.BinaryPath = overrideBin
+		}
+	}
+
 	if *syncOnlyFlag {
 		server.SyncTranscriptTokens(cfg.Server.DataDir, store, 10000)
 		ticker := time.NewTicker(1000 * time.Millisecond)
@@ -67,12 +76,18 @@ func main() {
 		}
 	}
 
+	bgStopCh := make(chan struct{})
 	go func() {
 		server.SyncTranscriptTokens(cfg.Server.DataDir, store, 120)
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
-		for range ticker.C {
-			server.SyncTranscriptTokens(cfg.Server.DataDir, store, 30)
+		for {
+			select {
+			case <-ticker.C:
+				server.SyncTranscriptTokens(cfg.Server.DataDir, store, 30)
+			case <-bgStopCh:
+				return
+			}
 		}
 	}()
 
@@ -107,6 +122,13 @@ func main() {
 	}
 
 	gw := server.NewGatewayServer(cfg, store, pool, sm, hub, staticFS)
+	restartCh := make(chan string, 1)
+	gw.SetRestartFunc(func(execPath string) {
+		select {
+		case restartCh <- execPath:
+		default:
+		}
+	})
 	gw.LogStartupAdminCredentials()
 
 	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
@@ -121,7 +143,7 @@ func main() {
 	}
 
 	go func() {
-		log.Printf("Antigravity ACP Gateway v1.6.0 listening on http://%s (ReUI Admin Console + /v1/responses + /v1/chat/completions + /v1/messages + /v1/models + /v1/acp/ws)", addr)
+		log.Printf("Antigravity ACP Gateway %s listening on http://%s (ReUI Admin Console + /v1/responses + /v1/chat/completions + /v1/messages + /v1/models + /v1/acp/ws)", version.Version, addr)
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("HTTP server error: %v", err)
 		}
@@ -129,10 +151,24 @@ func main() {
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	<-sigCh
-
-	log.Println("Shutting down Antigravity ACP Gateway gracefully...")
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	_ = httpSrv.Shutdown(ctx)
+	select {
+	case <-sigCh:
+		log.Println("Shutting down Antigravity ACP Gateway gracefully...")
+		close(bgStopCh)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = httpSrv.Shutdown(ctx)
+	case targetBin := <-restartCh:
+		log.Printf("Shutting down Antigravity ACP Gateway for in-place update restart -> %s ...", targetBin)
+		close(bgStopCh)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		_ = httpSrv.Shutdown(ctx)
+		cancel()
+		sm.Close()
+		pool.Close()
+		_ = store.Close()
+		if err := updater.ExecOrSpawnSelf(targetBin, os.Args, os.Environ()); err != nil {
+			log.Fatalf("Failed to restart updated binary %s: %v", targetBin, err)
+		}
+	}
 }
