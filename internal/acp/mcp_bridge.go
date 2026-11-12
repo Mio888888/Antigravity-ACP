@@ -36,8 +36,7 @@ func MCPBridgeHandler(sm *SessionManager, wiretap WiretapCallback) http.Handler 
 			return
 		}
 
-		bridgeID := strings.TrimPrefix(r.URL.Path, "/mcp/sessions/")
-		bridgeID = strings.Trim(bridgeID, "/")
+		bridgeID, gen, _ := strings.Cut(strings.Trim(strings.TrimPrefix(r.URL.Path, "/mcp/sessions/"), "/"), "/")
 		sess, ok := sm.GetSessionByBridgeID(bridgeID)
 		if !ok {
 			http.Error(w, "session bridge not found", http.StatusNotFound)
@@ -61,6 +60,15 @@ func MCPBridgeHandler(sm *SessionManager, wiretap WiretapCallback) http.Handler 
 		}
 
 		w.Header().Set("Content-Type", "application/json")
+
+		if !sess.isCurrentBridgeGeneration(gen) {
+			if req.ID == nil {
+				w.WriteHeader(http.StatusAccepted)
+				return
+			}
+			writeMCPError(w, req.ID, -32000, "client_tools bridge retired: the gateway replaced this ACP session, so its tool calls are no longer delivered")
+			return
+		}
 
 		switch req.Method {
 		case "initialize":

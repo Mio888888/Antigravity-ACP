@@ -1,9 +1,11 @@
 package acp
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -34,21 +36,23 @@ type ParkedToolCall struct {
 }
 
 type ManagedSession struct {
-	mu                 sync.RWMutex
-	BridgeID           string
-	AccountID          string
-	ExplicitKey        string
-	HistoryHash        string
-	explicitKeys       []string
-	historyHashes      []string
+	mu            sync.RWMutex
+	BridgeID      string
+	AccountID     string
+	ExplicitKey   string
+	HistoryHash   string
+	explicitKeys  []string
+	historyHashes []string
 	// recentHashes lists raw history hashes in the order they were last recorded.
 	recentHashes []string
-	ACPSessionID       string
-	WorkspaceDir       string
-	Worker             *WorkerClient
-	Tools              []ToolDefinition
-	SystemPrompt       string
-	SessionTitle       string
+	// bridgeGen identifies the client_tools bridge URL handed to the current ACP session.
+	bridgeGen                 string
+	ACPSessionID              string
+	WorkspaceDir              string
+	Worker                    *WorkerClient
+	Tools                     []ToolDefinition
+	SystemPrompt              string
+	SessionTitle              string
 	LastMode                  string
 	LastModel                 string
 	LastThinkingLevel         string
@@ -268,6 +272,22 @@ func (ms *ManagedSession) SetACPSession(acpSessionID string, lastStep int) {
 	ms.mu.Unlock()
 }
 
+// NewBridgeGeneration starts a client_tools bridge generation for the ACP session about
+// to be created and returns its MCP path. Requests on an earlier generation's path come
+// from a retired ACP session and are rejected by MCPBridgeHandler.
+func (ms *ManagedSession) NewBridgeGeneration() string {
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	ms.bridgeGen = randomHex(6)
+	return "/mcp/sessions/" + ms.BridgeID + "/" + ms.bridgeGen
+}
+
+func (ms *ManagedSession) isCurrentBridgeGeneration(gen string) bool {
+	ms.mu.RLock()
+	defer ms.mu.RUnlock()
+	return gen != "" && gen == ms.bridgeGen
+}
+
 func (ms *ManagedSession) GetLastTranscriptStep() int {
 	if ms == nil {
 		return -1
@@ -429,9 +449,12 @@ func (sm *SessionManager) recordKeyIndexLocked(indexMap map[string]*ManagedSessi
 		return
 	}
 	indexMap[indexedKey] = sess
-	for _, k := range *slicePtr {
+	// Keys are evicted least-recently-recorded first, so a conversation key re-recorded
+	// every turn is never evicted by the per-response keys recorded alongside it.
+	for i, k := range *slicePtr {
 		if k == indexedKey {
-			return
+			*slicePtr = append((*slicePtr)[:i], (*slicePtr)[i+1:]...)
+			break
 		}
 	}
 	*slicePtr = append(*slicePtr, indexedKey)
@@ -663,6 +686,36 @@ func (sm *SessionManager) BindExplicitKey(sess *ManagedSession, explicitKey stri
 	sess.UpdatedAt = time.Now()
 	sm.recordExplicitKeyLocked(sess, explicitKey)
 	sess.mu.Unlock()
+}
+
+// RetireACPSession ends the session's current ACP session on its worker: it cancels the
+// running turn, closes the ACP session (which also stops its backend process), and
+// retires the bridge generation so any request still in flight from it is rejected.
+func (sm *SessionManager) RetireACPSession(sess *ManagedSession) {
+	if sess == nil {
+		return
+	}
+	sess.mu.Lock()
+	worker := sess.Worker
+	acpSessID := sess.ACPSessionID
+	sess.bridgeGen = ""
+	sess.mu.Unlock()
+	sess.SetACPSession("", -1)
+	closeACPSession(worker, acpSessID)
+}
+
+const acpSessionCloseTimeout = 5 * time.Second
+
+func closeACPSession(worker *WorkerClient, acpSessID string) {
+	if worker == nil || acpSessID == "" {
+		return
+	}
+	_ = worker.CancelSession(acpSessID)
+	ctx, cancel := context.WithTimeout(context.Background(), acpSessionCloseTimeout)
+	defer cancel()
+	if err := worker.CloseSession(ctx, acpSessID); err != nil {
+		log.Printf("[session] session/close %s on worker pid=%d failed: %v", acpSessID, worker.PID, err)
+	}
 }
 
 func (sm *SessionManager) UpdateSessionHash(sess *ManagedSession, newHash string) {
@@ -1053,6 +1106,11 @@ func (sm *SessionManager) gcLoop() {
 				resultCh chan ToolResultPayload
 			}
 			var cleanups []expiredCleanup
+			type expiredACPSession struct {
+				worker  *WorkerClient
+				acpSess string
+			}
+			var expiredSessions []expiredACPSession
 
 			sm.mu.Lock()
 			activeBridges := make(map[string]bool)
@@ -1085,6 +1143,7 @@ func (sm *SessionManager) gcLoop() {
 				sess.mu.RLock()
 				updatedAt := sess.UpdatedAt
 				boundWorker := sess.Worker
+				boundACPSess := sess.ACPSessionID
 				ekList := append([]string(nil), sess.explicitKeys...)
 				hhList := append([]string(nil), sess.historyHashes...)
 				sess.mu.RUnlock()
@@ -1092,6 +1151,7 @@ func (sm *SessionManager) gcLoop() {
 					if boundWorker != nil {
 						boundWorker.AddBoundSession(-1)
 					}
+					expiredSessions = append(expiredSessions, expiredACPSession{worker: boundWorker, acpSess: boundACPSess})
 					delete(sm.byBridgeID, bridgeID)
 					for _, k := range ekList {
 						if sm.byExplicitKey[k] == sess {
@@ -1107,6 +1167,9 @@ func (sm *SessionManager) gcLoop() {
 			}
 			sm.mu.Unlock()
 
+			for _, item := range expiredSessions {
+				go closeACPSession(item.worker, item.acpSess)
+			}
 			for _, item := range cleanups {
 				select {
 				case item.resultCh <- ToolResultPayload{

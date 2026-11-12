@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"database/sql"
@@ -567,6 +568,9 @@ func parseCompactionHistory(canReq *adapter.CanonicalRequest) []compactionHistor
 	sys := stripTurnContextBlocks(canReq.SystemPrompt)
 	if idx := strings.Index(sys, "**Conversation History:**"); idx >= 0 {
 		sys = sys[idx+len("**Conversation History:**"):]
+		if end := strings.Index(sys, "\n## What to keep\n"); end >= 0 {
+			sys = sys[:end]
+		}
 	}
 	curRole := ""
 	var cur strings.Builder
@@ -652,43 +656,47 @@ func extractToolArgPaths(args string) []string {
 	return out
 }
 
-// BuildLocalClientCompactionSummary answers a client compaction request locally in
-// well under a millisecond: it extracts the user's messages, the files read/modified
-// through tool calls, the latest assistant progress, and recent tool results from the
-// history, and renders them as a `# Handoff Summary` without spawning an ACP session.
-func BuildLocalClientCompactionSummary(canReq *adapter.CanonicalRequest) string {
+type localToolActivity struct {
+	name, args, result string
+	host               bool
+}
+
+// localHandoffFacts is what a local handoff can recover from the compaction history.
+type localHandoffFacts struct {
+	userMessages  []string
+	priorHandoff  string
+	readFiles     []string
+	modifiedFiles []string
+	lastAssistant string
+	activity      []localToolActivity
+	identifiers   []string
+}
+
+func gatherLocalHandoffFacts(canReq *adapter.CanonicalRequest) localHandoffFacts {
 	entries := parseCompactionHistory(canReq)
 
-	var userMessages []string
-	var priorHandoff string
+	var f localHandoffFacts
 	seenUser := make(map[string]bool)
-	var readFiles, modifiedFiles []string
 	seenRead := make(map[string]bool)
 	seenModified := make(map[string]bool)
-	lastAssistant := ""
-	type toolActivity struct {
-		name, args, result string
-		host               bool
-	}
-	var activity []toolActivity
 
 	for _, e := range entries {
 		switch e.role {
 		case "user":
 			if strings.Contains(e.content, "# Handoff Summary") {
-				priorHandoff = e.content
+				f.priorHandoff = e.content
 				continue
 			}
 			msg := truncateUTF8Middle(e.content, 1200, "\n...[truncated]...\n")
 			if !seenUser[msg] {
 				seenUser[msg] = true
-				userMessages = append(userMessages, msg)
+				f.userMessages = append(f.userMessages, msg)
 			}
 		case "assistant":
-			lastAssistant = e.content
+			f.lastAssistant = e.content
 		case "tool_call":
 			if mentionsHostEnvironment(e.content) {
-				activity = append(activity, toolActivity{name: e.toolName, host: true})
+				f.activity = append(f.activity, localToolActivity{name: e.toolName, host: true})
 				continue
 			}
 			for _, p := range extractToolArgPaths(e.content) {
@@ -698,42 +706,257 @@ func BuildLocalClientCompactionSummary(canReq *adapter.CanonicalRequest) string 
 				if isMutatingToolName(e.toolName) {
 					if !seenModified[p] {
 						seenModified[p] = true
-						modifiedFiles = append(modifiedFiles, p)
+						f.modifiedFiles = append(f.modifiedFiles, p)
 					}
 				} else if !seenRead[p] {
 					seenRead[p] = true
-					readFiles = append(readFiles, p)
+					f.readFiles = append(f.readFiles, p)
 				}
 			}
-			activity = append(activity, toolActivity{name: e.toolName, args: e.content})
+			f.identifiers = append(f.identifiers, extractToolArgIdentifiers(e.content)...)
+			f.activity = append(f.activity, localToolActivity{name: e.toolName, args: e.content})
 		case "tool_result":
-			if n := len(activity); n > 0 && activity[n-1].result == "" {
-				activity[n-1].result = e.content
+			if n := len(f.activity); n > 0 && f.activity[n-1].result == "" {
+				f.activity[n-1].result = e.content
 			} else {
-				activity = append(activity, toolActivity{name: "tool_result", result: e.content})
+				f.activity = append(f.activity, localToolActivity{name: "tool_result", result: e.content})
 			}
-			if n := len(activity); mentionsHostEnvironment(e.content) {
-				activity[n-1].host = true
+			if n := len(f.activity); mentionsHostEnvironment(e.content) {
+				f.activity[n-1].host = true
 			}
 		}
 	}
-	kept := activity[:0]
-	for _, a := range activity {
+	kept := f.activity[:0]
+	for _, a := range f.activity {
 		if !a.host {
 			kept = append(kept, a)
 		}
 	}
-	activity = kept
+	f.activity = kept
 
-	if len(userMessages) > 12 {
-		userMessages = append(userMessages[:1], userMessages[len(userMessages)-11:]...)
+	// Merge the working set carried in the prior handoff so it accumulates across
+	// compactions instead of resetting to only the files touched since the last resume —
+	// otherwise each new ACP session cannot tell what was already reviewed and re-reads it.
+	if f.priorHandoff != "" {
+		f.readFiles = append(parseHandoffFileList(f.priorHandoff, reviewedFilesLabel), f.readFiles...)
+		f.modifiedFiles = append(parseHandoffFileList(f.priorHandoff, modifiedFilesLabel), f.modifiedFiles...)
+		f.identifiers = append(parseHandoffIdentifiers(f.priorHandoff), f.identifiers...)
 	}
-	if len(readFiles) > 60 {
-		readFiles = readFiles[len(readFiles)-60:]
+	f.readFiles = dedupeKeepLast(f.readFiles)
+	f.modifiedFiles = dedupeKeepLast(f.modifiedFiles)
+	if len(f.modifiedFiles) > 0 {
+		mod := make(map[string]bool, len(f.modifiedFiles))
+		for _, p := range f.modifiedFiles {
+			mod[p] = true
+		}
+		kept := f.readFiles[:0]
+		for _, p := range f.readFiles {
+			if !mod[p] {
+				kept = append(kept, p)
+			}
+		}
+		f.readFiles = kept
 	}
-	if len(activity) > 8 {
-		activity = activity[len(activity)-8:]
+
+	if len(f.userMessages) > 12 {
+		f.userMessages = append(f.userMessages[:1], f.userMessages[len(f.userMessages)-11:]...)
 	}
+	if len(f.readFiles) > maxHandoffReadFiles {
+		f.readFiles = f.readFiles[len(f.readFiles)-maxHandoffReadFiles:]
+	}
+	if len(f.modifiedFiles) > maxHandoffReadFiles {
+		f.modifiedFiles = f.modifiedFiles[len(f.modifiedFiles)-maxHandoffReadFiles:]
+	}
+	if len(f.activity) > 8 {
+		f.activity = f.activity[len(f.activity)-8:]
+	}
+	f.identifiers = dedupeKeepLast(f.identifiers)
+	if len(f.identifiers) > 20 {
+		f.identifiers = f.identifiers[len(f.identifiers)-20:]
+	}
+	return f
+}
+
+// dedupeKeepLast removes duplicates, keeping each value at its last position.
+func dedupeKeepLast(values []string) []string {
+	seen := make(map[string]bool, len(values))
+	out := make([]string, 0, len(values))
+	for i := len(values) - 1; i >= 0; i-- {
+		if !seen[values[i]] {
+			seen[values[i]] = true
+			out = append(out, values[i])
+		}
+	}
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out
+}
+
+// extractToolArgIdentifiers returns `key=value` pairs for the ID-like string arguments of a
+// tool call (review_id, session, ...), which a resumed turn needs verbatim to continue.
+func extractToolArgIdentifiers(args string) []string {
+	var obj map[string]any
+	if json.Unmarshal([]byte(args), &obj) != nil {
+		return nil
+	}
+	keys := make([]string, 0, len(obj))
+	for k := range obj {
+		lower := strings.ToLower(k)
+		if lower == "id" || lower == "session" || strings.HasSuffix(lower, "_id") || strings.HasSuffix(k, "Id") {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	var out []string
+	for _, k := range keys {
+		if s, ok := obj[k].(string); ok {
+			if s = strings.TrimSpace(s); s != "" && len(s) <= 128 {
+				out = append(out, k+"="+s)
+			}
+		}
+	}
+	return out
+}
+
+// Stable section labels used in every handoff (markdown and the structured current_work).
+// They let the next compaction recover and merge the cumulative working set instead of each
+// handoff resetting to only the files touched since the last resume.
+const (
+	reviewedFilesLabel  = "Files already read:"
+	modifiedFilesLabel  = "Files modified:"
+	identifiersLabel    = "Active identifiers (reuse verbatim):"
+	maxHandoffReadFiles = 150
+)
+
+// parseHandoffFileList recovers the "- path" lines under label from a prior handoff.
+func parseHandoffFileList(text, label string) []string {
+	idx := strings.Index(text, label)
+	if idx < 0 {
+		return nil
+	}
+	var out []string
+	started := false
+	for _, ln := range strings.Split(text[idx+len(label):], "\n") {
+		t := strings.TrimSpace(ln)
+		if !strings.HasPrefix(t, "- ") {
+			if !started && t == "" {
+				continue
+			}
+			break
+		}
+		started = true
+		p := strings.TrimSpace(t[2:])
+		if p == "" || strings.HasPrefix(p, "(") || strings.HasPrefix(p, "...") {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// parseHandoffIdentifiers recovers the `key=value` identifiers line from a prior handoff.
+func parseHandoffIdentifiers(text string) []string {
+	idx := strings.Index(text, identifiersLabel)
+	if idx < 0 {
+		return nil
+	}
+	line := text[idx+len(identifiersLabel):]
+	if nl := strings.IndexByte(line, '\n'); nl >= 0 {
+		line = line[:nl]
+	}
+	var out []string
+	for _, part := range strings.Split(line, ",") {
+		if p := strings.TrimSpace(part); p != "" && strings.Contains(p, "=") {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// handoffToolName drops the `plugin_<id>_` prefix client tool names carry.
+func handoffToolName(name string) string {
+	if rest, ok := strings.CutPrefix(name, "plugin_"); ok {
+		if i := strings.IndexByte(rest, '_'); i >= 0 {
+			return rest[i+1:]
+		}
+	}
+	return name
+}
+
+// truncateUTF8Head keeps the head of s (where the cumulative working set lives) within
+// maxBytes, trimming the tail on a rune boundary.
+func truncateUTF8Head(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	cut := maxBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return strings.TrimRight(s[:cut], " \n") + "\n...[handoff truncated]..."
+}
+
+// handoffStateBody renders the durable "state" of a handoff: the cumulative working set and
+// identifiers first (these must survive the client re-rendering the handoff into its next
+// turn), then the latest progress and the most recent tool calls. Tool-call results are
+// omitted on purpose — they are large and already reflected in the file lists above, and
+// embedding them is what let earlier handoffs balloon without carrying real progress.
+func handoffStateBody(f localHandoffFacts) string {
+	var sb strings.Builder
+	if len(f.modifiedFiles) > 0 {
+		sb.WriteString(modifiedFilesLabel + "\n")
+		for _, p := range f.modifiedFiles {
+			sb.WriteString("- " + p + "\n")
+		}
+		sb.WriteString("\n")
+	}
+	if len(f.readFiles) > 0 {
+		sb.WriteString(reviewedFilesLabel + "\n")
+		for _, p := range f.readFiles {
+			sb.WriteString("- " + p + "\n")
+		}
+		sb.WriteString("\n")
+	}
+	if len(f.identifiers) > 0 {
+		sb.WriteString(identifiersLabel + " " + strings.Join(f.identifiers, ", ") + "\n\n")
+	}
+	if f.lastAssistant != "" {
+		sb.WriteString("Latest progress:\n")
+		sb.WriteString(truncateUTF8Middle(f.lastAssistant, 2500, "\n...[truncated]...\n"))
+		sb.WriteString("\n\n")
+	} else {
+		sb.WriteString("In progress: mid tool loop when compacted; no assistant conclusion yet.\n\n")
+	}
+	if len(f.activity) > 0 {
+		sb.WriteString("Most recent tool calls (continue after these; do not repeat them):\n")
+		for _, a := range f.activity {
+			line := "- " + handoffToolName(a.name)
+			if args := strings.TrimSpace(a.args); args != "" {
+				line += " " + truncateUTF8Middle(args, 180, " ... ")
+			}
+			sb.WriteString(line + "\n")
+		}
+	}
+	return strings.TrimSpace(sb.String())
+}
+
+// BuildLocalClientCompactionSummary answers a client compaction request locally in
+// well under a millisecond: it extracts the user's messages, the files read/modified
+// through tool calls, the latest assistant progress, and recent tool results from the
+// history, and renders them without spawning an ACP session — as the structured JSON
+// handoff when the client's prompt demands one, otherwise as a `# Handoff Summary`.
+func BuildLocalClientCompactionSummary(canReq *adapter.CanonicalRequest) string {
+	f := gatherLocalHandoffFacts(canReq)
+	if wantsStructuredJSONHandoff(canReq) {
+		return renderStructuredJSONHandoff(f)
+	}
+	return renderMarkdownHandoff(f)
+}
+
+func renderMarkdownHandoff(f localHandoffFacts) string {
+	userMessages, lastAssistant, activity := f.userMessages, f.lastAssistant, f.activity
+	readFiles, modifiedFiles, identifiers := f.readFiles, f.modifiedFiles, f.identifiers
 
 	var sb strings.Builder
 	sb.WriteString("# Handoff Summary\n\n")
@@ -775,21 +998,6 @@ func BuildLocalClientCompactionSummary(canReq *adapter.CanonicalRequest) string 
 		sb.WriteString("No assistant conclusion yet; the task was mid tool loop when compacted.\n\n")
 	}
 
-	if len(activity) > 0 {
-		sb.WriteString("## Recent tool activity\n")
-		for _, a := range activity {
-			line := "- " + a.name
-			if args := strings.TrimSpace(a.args); args != "" {
-				line += " " + truncateUTF8Middle(args, 300, " ... ")
-			}
-			sb.WriteString(line + "\n")
-			if res := strings.TrimSpace(a.result); res != "" {
-				sb.WriteString("  result: " + strings.ReplaceAll(truncateUTF8Middle(res, 700, " ... "), "\n", "\n  ") + "\n")
-			}
-		}
-		sb.WriteString("\n")
-	}
-
 	sb.WriteString("## Working set\n")
 	if len(modifiedFiles) > 0 {
 		sb.WriteString("Files modified:\n")
@@ -808,17 +1016,129 @@ func BuildLocalClientCompactionSummary(canReq *adapter.CanonicalRequest) string 
 	}
 	sb.WriteString("\n")
 
+	if len(identifiers) > 0 {
+		sb.WriteString(identifiersLabel + " " + strings.Join(identifiers, ", ") + "\n\n")
+	}
+
+	if len(activity) > 0 {
+		sb.WriteString("## Recent tool calls\n")
+		sb.WriteString("Continue after these; do not repeat them. Results are already reflected in the working set above.\n")
+		for _, a := range activity {
+			line := "- " + handoffToolName(a.name)
+			if args := strings.TrimSpace(a.args); args != "" {
+				line += " " + truncateUTF8Middle(args, 180, " ... ")
+			}
+			sb.WriteString(line + "\n")
+		}
+		sb.WriteString("\n")
+	}
+
 	sb.WriteString("## Constraints\n")
 	sb.WriteString("- Files in the working set were already read in this session; do not re-read them unless exact current lines are needed for an edit.\n")
 	sb.WriteString("- Do not re-run discovery (find_files / git_status / search) already reflected above.\n")
 
-	if priorHandoff != "" {
-		sb.WriteString("\n## Prior handoff\n")
-		sb.WriteString(truncateUTF8Middle(strings.TrimSpace(strings.Replace(priorHandoff, "# Handoff Summary", "", 1)), 8*1024, "\n...[truncated]...\n"))
-		sb.WriteString("\n")
+	return truncateUTF8Middle(strings.TrimSpace(sb.String()), maxLocalHandoffBytes, "\n...[handoff truncated]...\n")
+}
+
+// wantsStructuredJSONHandoff reports whether the client's compaction prompt demands the
+// handoff as one ```json block with its handoff schema. Sailry validates that output and
+// fails the whole turn ("compaction summary was not a structured handoff") on anything else.
+func wantsStructuredJSONHandoff(canReq *adapter.CanonicalRequest) bool {
+	if canReq == nil {
+		return false
+	}
+	spec := canReq.SystemPrompt
+	for _, b := range canReq.PromptBlocks {
+		spec += "\n" + b.Text
+	}
+	return strings.Contains(spec, "```json") && strings.Contains(spec, `"user_intent"`) && strings.Contains(spec, `"current_work"`)
+}
+
+type structuredHandoffFile struct {
+	Path    string `json:"path"`
+	Summary string `json:"summary"`
+}
+
+// structuredHandoff mirrors the JSON handoff schema Sailry requests for compaction.
+type structuredHandoff struct {
+	UserIntent        []string                `json:"user_intent,omitempty"`
+	PendingTasks      []string                `json:"pending_tasks,omitempty"`
+	UserMessages      []string                `json:"user_messages,omitempty"`
+	CurrentWork       string                  `json:"current_work,omitempty"`
+	ProblemSolving    []string                `json:"problem_solving,omitempty"`
+	NextStep          string                  `json:"next_step,omitempty"`
+	Files             []structuredHandoffFile `json:"files,omitempty"`
+	ErrorsAndFixes    []string                `json:"errors_and_fixes,omitempty"`
+	TechnicalConcepts []string                `json:"technical_concepts,omitempty"`
+}
+
+// Bounds keep the structured handoff inside the client's compaction output budget (Sailry
+// asks for 8,000 tokens and 3,000–6,000 in practice). maxStructuredHandoffFiles follows the
+// schema's "usually no more than 15" guidance; further read paths go inline in current_work.
+const (
+	maxStructuredHandoffFiles      = 15
+	maxStructuredUserMessagesBytes = 8 * 1024
+	maxStructuredCurrentWorkBytes  = 20 * 1024
+)
+
+func renderStructuredJSONHandoff(f localHandoffFacts) string {
+	var h structuredHandoff
+
+	latestGoal := "the current task"
+	switch len(f.userMessages) {
+	case 0:
+		h.UserIntent = []string{"Continue the current task."}
+	case 1:
+		h.UserIntent = []string{f.userMessages[0]}
+		latestGoal = truncateUTF8Middle(f.userMessages[0], 400, " ... ")
+	default:
+		last := f.userMessages[len(f.userMessages)-1]
+		h.UserIntent = []string{"Latest request: " + last, "Original request: " + f.userMessages[0]}
+		latestGoal = truncateUTF8Middle(last, 400, " ... ")
+		used := 0
+		for i := len(f.userMessages) - 1; i >= 0; i-- {
+			m := truncateUTF8Middle(f.userMessages[i], 800, " ...[truncated]... ")
+			if used+len(m) > maxStructuredUserMessagesBytes && i > 0 {
+				continue
+			}
+			used += len(m)
+			h.UserMessages = append([]string{m}, h.UserMessages...)
+		}
+	}
+	h.PendingTasks = []string{"Continue the latest user request from the current state: " + latestGoal}
+
+	// current_work is the one field the client reliably carries into its next turn, so the
+	// full cumulative working set lives here (head-truncated to keep the file lists, which
+	// sit first). The prior handoff is not embedded verbatim — its lists were already merged
+	// into f — which stops the recursive "earlier progress" nesting seen before.
+	h.CurrentWork = truncateUTF8Head(handoffStateBody(f), maxStructuredCurrentWorkBytes)
+
+	h.NextStep = "Continue " + latestGoal + " from the state in current_work without restarting completed steps; reuse the listed identifiers and do not re-read files listed as already read unless exact current lines are needed."
+
+	for _, p := range f.modifiedFiles {
+		if len(h.Files) >= maxStructuredHandoffFiles {
+			break
+		}
+		h.Files = append(h.Files, structuredHandoffFile{Path: p, Summary: "Modified in this session."})
+	}
+	readStart := len(f.readFiles) - (maxStructuredHandoffFiles - len(h.Files))
+	if readStart < 0 {
+		readStart = 0
+	}
+	for _, p := range f.readFiles[readStart:] {
+		h.Files = append(h.Files, structuredHandoffFile{Path: p, Summary: "Already read in this session; re-read only if exact current lines are needed."})
 	}
 
-	return truncateUTF8Middle(strings.TrimSpace(sb.String()), maxLocalHandoffBytes, "\n...[handoff truncated]...\n")
+	h.TechnicalConcepts = append(h.TechnicalConcepts, f.identifiers...)
+
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(h); err != nil {
+		return "```json\n{\"pending_tasks\":[\"Continue the current task.\"]}\n```"
+	}
+	return "```json\n" + strings.TrimSpace(buf.String()) + "\n```"
 }
 
 // respondLocalClientCompaction writes the locally built handoff in the client's protocol.
@@ -2074,6 +2394,12 @@ func (gs *GatewayServer) executeNorthboundTurn(w http.ResponseWriter, r *http.Re
 	var sysDelta string
 	sameWorker := false
 
+	effectiveSessionKey := strings.TrimSpace(canReq.SessionHeader)
+	if effectiveSessionKey == "" && strings.TrimSpace(canReq.ClientSessionID) != "" {
+		effectiveSessionKey = strings.TrimSpace(canReq.ClientSessionID)
+	}
+	effectiveSessionKey = canReq.ScopedSessionKey(effectiveSessionKey)
+
 	// Priority 1: If this request carries tool_results, check parked tool call session!
 	if len(canReq.ToolResults) > 0 {
 		var parkedSess *acp.ManagedSession
@@ -2134,9 +2460,7 @@ func (gs *GatewayServer) executeNorthboundTurn(w http.ResponseWriter, r *http.Re
 					resumedSess.SetSessionTitle(canReq.SessionTitle)
 				}
 				gs.sm.UpdateSessionHash(resumedSess, canReq.ScopedSessionKey(canReq.HistoryHashFull))
-				if canReq.Protocol == "openai_responses" {
-					gs.sm.BindExplicitKey(resumedSess, canReq.ScopedSessionKey(reqID))
-				}
+				gs.bindConversationKeys(resumedSess, canReq, effectiveSessionKey, reqID)
 				if v, ok := activeReqTurnMeta.Load(reqID); ok {
 					if m, ok2 := v.(reqTurnMeta); ok2 {
 						m.prepMs = time.Since(startTime).Milliseconds()
@@ -2149,8 +2473,9 @@ func (gs *GatewayServer) executeNorthboundTurn(w http.ResponseWriter, r *http.Re
 			}
 
 			// New tools were dynamically unlocked or the session crossed the compaction
-			// watermark. Wait briefly for the cancelled prompt to exit and drain any leftover
-			// events, then start a fresh ACP session from BuildPromptBlocksWithHistory.
+			// watermark. Wait briefly for the cancelled prompt to exit, close the old ACP
+			// session and drain any leftover events, then start a fresh ACP session from
+			// BuildPromptBlocksWithHistory.
 			if pCh := resumedSess.GetPromptDoneCh(); pCh != nil {
 				select {
 				case <-pCh:
@@ -2158,6 +2483,7 @@ func (gs *GatewayServer) executeNorthboundTurn(w http.ResponseWriter, r *http.Re
 				}
 			}
 			rWorker := resumedSess.GetWorker()
+			gs.sm.RetireACPSession(resumedSess)
 			for {
 				select {
 				case <-rWorker.Events():
@@ -2166,7 +2492,6 @@ func (gs *GatewayServer) executeNorthboundTurn(w http.ResponseWriter, r *http.Re
 				}
 			}
 		drainedParkedEvents:
-			resumedSess.SetACPSession("", -1)
 			if needLocalCompaction {
 				resumedSess.ResetTokenUsage()
 			}
@@ -2180,11 +2505,6 @@ func (gs *GatewayServer) executeNorthboundTurn(w http.ResponseWriter, r *http.Re
 	}
 
 	// Priority 2: Lookup existing session affinity (controlled by per-key sessionMode)
-	effectiveSessionKey := strings.TrimSpace(canReq.SessionHeader)
-	if effectiveSessionKey == "" && strings.TrimSpace(canReq.ClientSessionID) != "" {
-		effectiveSessionKey = strings.TrimSpace(canReq.ClientSessionID)
-	}
-	effectiveSessionKey = canReq.ScopedSessionKey(effectiveSessionKey)
 	scopedHashBefore := canReq.ScopedSessionKey(canReq.HistoryHashBefore)
 	scopedHashFull := canReq.ScopedSessionKey(canReq.HistoryHashFull)
 	// If the client initiated context compaction (or sent a new non-tool-result turn while
@@ -2197,10 +2517,11 @@ func (gs *GatewayServer) executeNorthboundTurn(w http.ResponseWriter, r *http.Re
 		}
 		// Without an identified prior session, aborting by account would cancel other
 		// clients' tool calls, so only the matched session is touched.
+		// The prior ACP session holds the pre-compaction history the client is discarding.
 		if priorSess != nil {
 			gs.sm.AbortParkedCallsForSession(priorSess, priorSess.AccountID, "Error: tool call aborted because client initiated context compaction")
+			gs.sm.RetireACPSession(priorSess)
 			if isPostCompactionResume {
-				priorSess.SetACPSession("", -1)
 				priorSess.ResetTokenUsage()
 			}
 		}
@@ -2257,7 +2578,7 @@ func (gs *GatewayServer) executeNorthboundTurn(w http.ResponseWriter, r *http.Re
 			if isPostCompactionResume || clientTruncatedHistory || forkedHistory {
 				// The live ACP session holds turns the client no longer has; rebuild it
 				// from the client's history.
-				sess.SetACPSession("", -1)
+				gs.sm.RetireACPSession(sess)
 				sysDelta = ""
 				if isPostCompactionResume || clientTruncatedHistory {
 					sess.ResetTokenUsage()
@@ -2270,7 +2591,7 @@ func (gs *GatewayServer) executeNorthboundTurn(w http.ResponseWriter, r *http.Re
 			if toolsAdded || !sameWorker || needLocalCompaction {
 				// If new tools were added, the session moved to a different worker process,
 				// or the session needs local compaction, start a fresh ACP session.
-				sess.SetACPSession("", -1)
+				gs.sm.RetireACPSession(sess)
 				sysDelta = ""
 			}
 			if needLocalCompaction {
@@ -2284,23 +2605,16 @@ func (gs *GatewayServer) executeNorthboundTurn(w http.ResponseWriter, r *http.Re
 			gs.sm.UpdateSessionHash(sess, scopedHashFull)
 		}
 	} else {
-		if effectiveSessionKey != "" {
-			gs.sm.BindExplicitKey(sess, effectiveSessionKey)
-		}
 		gs.sm.UpdateSessionHash(sess, scopedHashFull)
 	}
 
 	if canReq.SessionTitle != "" && sess != nil {
 		sess.SetSessionTitle(canReq.SessionTitle)
 	}
-	if canReq.Protocol == "openai_responses" {
-		gs.sm.BindExplicitKey(sess, canReq.ScopedSessionKey(reqID))
-	}
+	gs.bindConversationKeys(sess, canReq, effectiveSessionKey, reqID)
 	loopbackBase := gs.getLoopbackBaseURL(r)
-	mcpServers := gs.buildSessionMCPServers(loopbackBase, sess.BridgeID)
 	eagerServers := []string{"client_tools"}
 	if isClientCompaction {
-		mcpServers = []acp.MCPServerEndpoint{}
 		eagerServers = []string{}
 	}
 
@@ -2326,6 +2640,7 @@ func (gs *GatewayServer) executeNorthboundTurn(w http.ResponseWriter, r *http.Re
 	// in agy_acp_server.par reloads transcript.jsonl from disk and wipes _meta.antigravity.systemPrompt.append!
 	if sess.GetACPSessionID() == "" {
 		isNewACPSession = true
+		mcpServers := gs.buildSessionMCPServers(loopbackBase, sess, isClientCompaction)
 		var sessionRes *acp.NewSessionResult
 		sessionRes, err = worker.NewSession(ctx, acp.NewSessionParams{
 			Cwd:                   sess.WorkspaceDir,
@@ -2345,10 +2660,8 @@ func (gs *GatewayServer) executeNorthboundTurn(w http.ResponseWriter, r *http.Re
 				sess = gs.sm.RegisterOrMatchSession(acc.ID, effectiveSessionKey, "", worker, "", canReq.Tools)
 				_, _ = gs.sm.UpdateSessionToolsAndSystem(sess, canReq.Tools, acpSessionSys)
 				gs.sm.UpdateSessionHash(sess, scopedHashFull)
-				if canReq.Protocol == "openai_responses" {
-					gs.sm.BindExplicitKey(sess, canReq.ScopedSessionKey(reqID))
-				}
-				mcpServers = gs.buildSessionMCPServers(loopbackBase, sess.BridgeID)
+				gs.bindConversationKeys(sess, canReq, effectiveSessionKey, reqID)
+				mcpServers = gs.buildSessionMCPServers(loopbackBase, sess, isClientCompaction)
 				sessionRes, err = worker.NewSession(ctx, acp.NewSessionParams{
 					Cwd:                   sess.WorkspaceDir,
 					AdditionalDirectories: allowedDirs,
@@ -2445,15 +2758,33 @@ func (gs *GatewayServer) executeNorthboundTurn(w http.ResponseWriter, r *http.Re
 	gs.streamOrCollectWorkerOutput(ctx, w, reqID, startTime, canReq, sess, promptDoneCh)
 }
 
-func (gs *GatewayServer) buildSessionMCPServers(loopbackBase, bridgeID string) []acp.MCPServerEndpoint {
+// buildSessionMCPServers returns the MCP servers for the ACP session about to be created,
+// starting a new bridge generation so the bridge accepts calls from that session only.
+func (gs *GatewayServer) buildSessionMCPServers(loopbackBase string, sess *acp.ManagedSession, isClientCompaction bool) []acp.MCPServerEndpoint {
+	if isClientCompaction {
+		return []acp.MCPServerEndpoint{}
+	}
 	return []acp.MCPServerEndpoint{
 		{
 			Name:    "client_tools",
 			Type:    "http",
-			URL:     fmt.Sprintf("%s/mcp/sessions/%s", strings.TrimRight(loopbackBase, "/"), bridgeID),
+			URL:     strings.TrimRight(loopbackBase, "/") + sess.NewBridgeGeneration(),
 			Headers: acp.MCPHeaders{},
 		},
 	}
+}
+
+// bindConversationKeys indexes the session under this request's keys. The conversation's
+// own keys are re-recorded every turn so per-response keys never evict them, which keeps
+// compaction and resume requests matched to the ACP session they replace.
+func (gs *GatewayServer) bindConversationKeys(sess *acp.ManagedSession, canReq *adapter.CanonicalRequest, effectiveSessionKey, reqID string) {
+	if canReq.Protocol == "openai_responses" {
+		gs.sm.BindExplicitKey(sess, canReq.ScopedSessionKey(reqID))
+	}
+	if clientSessID := strings.TrimSpace(canReq.ClientSessionID); clientSessID != "" {
+		gs.sm.BindExplicitKey(sess, canReq.ScopedSessionKey(clientSessID))
+	}
+	gs.sm.BindExplicitKey(sess, effectiveSessionKey)
 }
 
 const (

@@ -134,10 +134,11 @@ func TestLoopbackMCPBridgeParkResumeAndTimeoutGC(t *testing.T) {
 
 	mcpSrv := httptest.NewServer(acp.MCPBridgeHandler(sm, nil))
 	defer mcpSrv.Close()
+	bridgeURL := mcpSrv.URL + sess.NewBridgeGeneration()
 
 	// 1. Test tools/list
 	listReq := `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`
-	resp, err := http.Post(fmt.Sprintf("%s/mcp/sessions/%s", mcpSrv.URL, sess.BridgeID), "application/json", strings.NewReader(listReq))
+	resp, err := http.Post(bridgeURL, "application/json", strings.NewReader(listReq))
 	if err != nil {
 		t.Fatalf("MCP tools/list POST failed: %v", err)
 	}
@@ -160,7 +161,7 @@ func TestLoopbackMCPBridgeParkResumeAndTimeoutGC(t *testing.T) {
 	callDone := make(chan callResp, 1)
 	go func() {
 		callBody := `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read_local_file","arguments":{"path":"main.go"}}}`
-		r, err := http.Post(fmt.Sprintf("%s/mcp/sessions/%s", mcpSrv.URL, sess.BridgeID), "application/json", bytes.NewBufferString(callBody))
+		r, err := http.Post(bridgeURL, "application/json", bytes.NewBufferString(callBody))
 		if err != nil {
 			return
 		}
@@ -335,5 +336,69 @@ func TestValidateProbeURLAndParallelAutoResume(t *testing.T) {
 	sm.CancelParkedToolCall(pUndispatched.CallID)
 	if sm.ParkedCount() != 0 {
 		t.Fatalf("expected 0 remaining parked calls, got %d", sm.ParkedCount())
+	}
+}
+
+func TestConversationKeySurvivesManyResponseKeys(t *testing.T) {
+	sm := acp.NewSessionManager(t.TempDir(), 5*time.Second)
+	defer sm.Close()
+
+	sess := sm.RegisterOrMatchSession("default", "conv-1", "", nil, "acp-1", nil)
+	for i := 0; i < 200; i++ {
+		sm.BindExplicitKey(sess, fmt.Sprintf("resp_%04d", i))
+		sm.BindExplicitKey(sess, "conv-1")
+	}
+	got, ok := sm.LookupSession("default", "conv-1", "")
+	if !ok || got != sess {
+		t.Fatalf("conversation key re-bound every turn was evicted by response keys: got=%v ok=%v", got, ok)
+	}
+	if got, ok := sm.LookupSession("default", "resp_0199", ""); !ok || got != sess {
+		t.Fatalf("latest response key not indexed: got=%v ok=%v", got, ok)
+	}
+	if _, ok := sm.LookupSession("default", "resp_0000", ""); ok {
+		t.Fatalf("expected the oldest response key to be evicted")
+	}
+}
+
+func TestRetiredBridgeGenerationRejectsToolCalls(t *testing.T) {
+	sm := acp.NewSessionManager(t.TempDir(), 5*time.Second)
+	defer sm.Close()
+	tools := []acp.ToolDefinition{{Name: "read_file", InputSchema: map[string]any{"type": "object"}}}
+	sess := sm.RegisterOrMatchSession("default", "conv-gen", "", nil, "acp-old", tools)
+
+	mcpSrv := httptest.NewServer(acp.MCPBridgeHandler(sm, nil))
+	defer mcpSrv.Close()
+	post := func(url, body string) string {
+		t.Helper()
+		resp, err := http.Post(url, "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("POST %s failed: %v", url, err)
+		}
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(resp.Body)
+		return string(raw)
+	}
+	callBody := `{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"a"}}}`
+
+	oldURL := mcpSrv.URL + sess.NewBridgeGeneration()
+	sm.RetireACPSession(sess)
+	if sess.GetACPSessionID() != "" {
+		t.Fatalf("expected retired session to drop its ACP session id")
+	}
+	for _, url := range []string{oldURL, mcpSrv.URL + "/mcp/sessions/" + sess.BridgeID} {
+		if out := post(url, callBody); !strings.Contains(out, "bridge retired") {
+			t.Fatalf("expected retired-generation call on %s to fail immediately, got %s", url, out)
+		}
+	}
+	if sm.ParkedCount() != 0 {
+		t.Fatalf("retired-generation call must not be parked, got %d parked", sm.ParkedCount())
+	}
+
+	newURL := mcpSrv.URL + sess.NewBridgeGeneration()
+	if out := post(oldURL, callBody); !strings.Contains(out, "bridge retired") {
+		t.Fatalf("expected previous generation to stay rejected after a new one starts, got %s", out)
+	}
+	if out := post(newURL, `{"jsonrpc":"2.0","id":8,"method":"tools/list","params":{}}`); !strings.Contains(out, "read_file") {
+		t.Fatalf("expected current generation to serve tools/list, got %s", out)
 	}
 }
